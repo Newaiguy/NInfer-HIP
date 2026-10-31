@@ -1,0 +1,50 @@
+﻿###ID c9k
+# NInfer鈫扝IP (gfx1201) 绉绘椤圭洰浜ゆ帴鏂囨。
+
+> 馃搶 **鏈€鏂颁氦鎺?(2026-09-30, 鏂颁細璇濆厛璇?: `HANDOFF_20260930.md`** 鈥斺€?鍚湰杞暟鎹籂閿?
+> (鏇捐鎶?"prefill 1000+ 杈炬垚/1247ms"锛岀湡瀹?= 406-417 t/s 鏈揪鏍囷紱SIMT wu_panel edit 瀹為檯澶辫触鏈簲鐢?銆?
+> 闀夸笂涓嬫枃鍙戝竷闂ㄦ (瀵规爣 llama.cpp 100k@35-40 t/s)銆?62k 鏄惧瓨浼扮畻銆佹寜搴忔墽琛岃鍒?(闀縞tx娴嬮噺鈫扠V浼樺寲鈫抪refill 1000+鈫扢TP v1.1鈫掑彂 GitHub)銆?
+> 浠ヤ笅 2026-09-29 娈?(寮曟搸蹇収/鏋勫缓閾佸緥/鏁欒) 浠嶆湁鏁堛€?
+
+> 鈿?**鏂颁細璇濆紑宸ユ寚鍗?(2026-09-29 涓夋洿, 璇诲畬杩欐鐩存帴骞叉椿)**:
+> 褰撳墠寮曟搸 = milestones/20260929_rotation_bitexact_decode49/ninfer_mini_nordc.exe (澶嶅埗鍒?build/)銆?
+> **鏈疆鏍稿績淇: Hadamard 鏃嬭浆鍐呮牳骞惰鍖?(宸查€愪綅楠岃瘉)** 鈥斺€?
+> 鏃у唴鏍? 涓€涓?warp 鐙崰涓€涓?1024 鐐瑰潡, T=4 鏃跺彧鍚?20 涓?warp (鏈哄櫒 256 涓?warp 妲? 8% 鍗犵敤),
+> 姣忎釜 warp 鍐?10 绾т覆琛岃澏褰€傛棆杞槸姣忎釜 ternary linear 鐨勫墠缃楠?(姣忓眰 2 娆?脳 64 灞?, 鎷栨參涓€鍒囥€?
+> 鏂板唴鏍? 涓€涓?256 绾跨▼ CTA 鍗忎綔澶勭悊涓€涓?(1024 鍧? token) 瀵? 鍏变韩鍐呭瓨铦跺舰銆?
+> **韪╄繃鐨勫潙**: 绗竴鐗堟妸 pair 缂栫爜 p=(lane<<4|idx) 鏁翠綋绉讳綅鍋?insert_zero, 娣峰叆楂樹綅 鈫?寮曟搸涔辩爜;
+> probe/rotation_probe.cu 涓€璺戝氨澶嶇幇 (20476/20480 differ)銆備慨姝? 鎷嗗嚭 (lane, idx) 鍚庡彧瀵逛綆浣?
+> insert_zero 鈫?鎺㈤拡 0/20480 differ 閫愪綅涓€鑷? 寮曟搸 Paris 鉁?鏂囨湰閫愬瓧鍚屻€?
+> **鏁欒: 鏁板€煎唴鏍告敼鍔ㄥ繀椤诲厛鍐欑嫭绔嬪鎷嶆帰閽? 鍐嶈繘寮曟搸銆?*
+> **decode 44.4 鈫?49.2 t/s (鐭?prompt), 鐪熷疄浠诲姟 45.4-47.0; prefill 236 鈫?264-271**銆?
+> 鍥為€€: NINFER_ROTATION_WARP=1銆侻TP draft=3 = 24.7 (浠嶈礋鏀剁泭, 瑙佷笅)銆?
+> 鏃堕棿绠楄繘褰撳墠娈?鈥斺€?ffn-split 鎶ョ殑 gate_up 4.69 ms 閲屾贩鐫€ GDN/attn 鐨勬椂闂淬€?
+> 鍙潬鐨勫彧鏈? 绔埌绔?`finish=` 琛? 鍜?NINFER_PROFILE_PREFILL=1 鐨?event timeline
+> (鎬绘椂闀垮彲淇? 鍗曟鍥?event 褰掑睘鍙兘婕傜Щ)銆?
+>
+> **涓嬩竴鍒€**: MTP 鍗曡疆 ~112 ms 閲? 鍓嶅悜 55 (layers 53 + lm_head 1.5 + argmax 0.15) +
+> draft 15.5, **杩樻湁 ~42 ms 闈炲墠鍚戝紑閿€鏈畾浣?* (KV commit / egress / host 璋冨害)銆?
+> 杩欐槸 MTP 杞 (褰撳墠 12.7 vs 绾?44.5) 鐨勫叧閿? 鍘熺増 MTP/鏃燤TP = 179/62 = 2.9x, 鎴戜滑 0.29x銆?
+> 璁℃椂寮€鍏? NINFER_PROFILE_VERIFY=1 (verify-split / ffn-split, 娉ㄦ剰涓婇潰鐨勬暀璁?銆?
+> 璇婃柇寮€鍏冲叏閮ㄤ繚鐣? NINFER_TERN_GEMV_MULTI / NINFER_MTP_TEACHER / NINFER_MTP_AR_POS_SHIFT /
+> NINFER_ROTATION_WARP / NINFER_ATTN_TRACE銆?
+>
+> 鈿?**(鏈缁撴潫, 浠ヤ笅涓?2026-09-28 涓夋洿)**:
+> 褰撳墠寮曟搸 = `milestones/20260928_verify_fix_mtp_window/ninfer_mini_nordc.exe`
+> (澶嶅埗鍒?build/ 浣跨敤; Paris 鉁? prefill 512 **424** / 2048 **428.7**, decode @512
+> **41.6**, 鐪熷疄浠诲姟 decode **43.5-44.1**, MTP draft=5 **22.1** / 9 **16.5** / 15 **12.3**)銆?
+>
+> **鏈疆淇帀鐨勭湡 bug**:
+> 1. `causal_softmax_attention.cpp` 涓?`ternary_rowsplit_gemm.cu` 閲岃琛ヤ竵鑴氭湰鍐欏潖鐨?
+>    **鍗曞紩鍙疯法琛屽瓧绗︿覆** + `cache.storage` 绗旇 鈫?涓や釜 TU 鏍规湰缂栬瘧涓嶈繃锛屽簱閲屼竴鐩存槸**鏃у璞?*锛?
+>    娉ㄦ剰鍔涜矾鐢变笌 GEMM 娲惧彂閮藉浜庢湭鐭ョ増鏈€?*鏁欒: 鎹?obj 鍚庡繀椤?grep 鏂板瓧绗︿覆纭**銆?
+> 2. **T=2..15 璧伴敊 GEMM 鍐呮牳** (鏈笘绾渶澶х殑涓€鍒€): 娲惧彂鍒?
+>    `ternary_pq2_mma_small_t_kernel` (16-token 鍧?+ 57KB 闈欐€?smem 鈫?姣?SM 1 涓?CTA)锛?
+>    瀹炴祴 **5.826 ms**锛涘悓鏍锋潈閲嶈蛋瀵勫瓨鍣ㄨВ鐮?WMMA 鍙 **0.217 ms (27脳)**銆?
+>    宸叉妸 T=2..15 鍏ㄩ儴鏀硅蛋 `launch_pq2_mma_prefill`锛屾棫鍐呮牳鐣欏湪
+>    `NINFER_TERNARY_SMALLT=1` 鍚庨潰銆?*T=2 鍓嶅悜 823.8 ms 鈫?60.1 ms**銆?
+> 3. MTP draft 绐楀彛 5 鈫?15 (`internal.h` + `round_buffers.h`)锛寁erify 寮€閿€瀵瑰搴﹀嚑涔庝笉鏁忔劅
+>    (T=4 57ms / T=8 66ms / T=32 76ms锛屾潈閲嶅彧璇讳竴閬?锛屾墍浠ュ绐楀彛鍑犱箮鏄櫧閫併€?
+>
+> **鏂板鏋勫缓宸ュ叿 (閲嶈)**: `probe/check_stale.py` (婧愭瘮 obj 鏂扮殑娓呭崟)銆?
+> `probe/

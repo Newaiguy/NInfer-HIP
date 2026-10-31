@@ -1,0 +1,34 @@
+###ID end900
+
+> 📌 **最新交接 (2026-09-30, 新会话先读): `HANDOFF_20260930.md`** —— 含本轮数据纠错
+> (曾误报 "prefill 1000+ 达成/1247ms"，真实 = 406-417 t/s 未达标；SIMT wu_panel edit 实际失败未应用)、
+> 长上下文发布门槛 (对标 llama.cpp 100k@35-40 t/s)、262k 显存估算、按序执行计划 (长ctx测量→KV优化→prefill 1000+→MTP v1.1→发 GitHub)。
+> 以下 2026-09-29 段 (引擎快照/构建铁律/教训) 仍有效。
+> ⚡ **新会话开工指南 (2026-09-29 三更, 读完这段直接干活)**:
+> 当前引擎 = milestones/20260929_rotation_bitexact_decode49/ninfer_mini_nordc.exe (复制到 build/)。
+> **本轮核心修复: Hadamard 旋转内核并行化 (已逐位验证)** ——
+> 旧内核: 一个 warp 独占一个 1024 点块, T=4 时只启 20 个 warp (机器 256 个 warp 槽, 8% 占用),
+> 每个 warp 内 10 级串行蝶形。旋转是每个 ternary linear 的前置步骤 (每层 2 次 × 64 层), 拖慢一切。
+> 新内核: 一个 256 线程 CTA 协作处理一个 (1024 块, token) 对, 共享内存蝶形。
+> **踩过的坑**: 第一版把 pair 编码 p=(lane<<4|idx) 整体移位做 insert_zero, 混入高位 → 引擎乱码;
+> probe/rotation_probe.cu 一跑就复现 (20476/20480 differ)。修正: 拆出 (lane, idx) 后只对低位
+> insert_zero → 探针 0/20480 differ 逐位一致, 引擎 Paris ✓ 文本逐字同。
+> **教训: 数值内核改动必须先写独立对拍探针, 再进引擎。**
+> **decode 44.4 → 49.2 t/s (短 prompt), 真实任务 45.4-47.0; prefill 236 → 264-271**。
+> 回退: NINFER_ROTATION_WARP=1。MTP draft=3 = 24.7 (仍负收益, 见下)。
+> 时间算进当前段 —— ffn-split 报的 gate_up 4.69 ms 里混着 GDN/attn 的时间。
+> 可靠的只有: 端到端 `finish=` 行, 和 NINFER_PROFILE_PREFILL=1 的 event timeline
+> (总时长可信, 单段因 event 归属可能漂移)。
+>
+> **下一刀**: MTP 单轮 ~112 ms 里, 前向 55 (layers 53 + lm_head 1.5 + argmax 0.15) +
+> draft 15.5, **还有 ~42 ms 非前向开销未定位** (KV commit / egress / host 调度)。
+> 这是 MTP 转正 (当前 12.7 vs 纯 44.5) 的关键; 原版 MTP/无MTP = 179/62 = 2.9x, 我们 0.29x。
+> 计时开关: NINFER_PROFILE_VERIFY=1 (verify-split / ffn-split, 注意上面的教训)。
+> 诊断开关全部保留: NINFER_TERN_GEMV_MULTI / NINFER_MTP_TEACHER / NINFER_MTP_AR_POS_SHIFT /
+> NINFER_ROTATION_WARP / NINFER_ATTN_TRACE。
+>
+> ⚡ **(本段结束, 以下为 2026-09-28 三更)**:
+
+The secret verification code is 7391. Remember it.
+
+以上对话中出现的 secret verification code 是多少？请直接回答数字。

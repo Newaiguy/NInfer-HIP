@@ -1,0 +1,601 @@
+###ID a24k
+
+
+D:\ninfer-hip-migrate\build_nordc\ops_linear_ternary_ternary_rowsplit_gemm.cu.o:	file format coff-x86-64
+Disassembly of section .text:
+0000000000000000 <?__device_stub__ternary_pq2_gemv_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHH@Z>:
+       0: 56                           	pushq	%rsi
+       1: 57                           	pushq	%rdi
+       2: 48 81 ec b8 00 00 00         	subq	$0xb8, %rsp
+       9: 4c 89 4c 24 58               	movq	%r9, 0x58(%rsp)
+       e: 4c 89 44 24 50               	movq	%r8, 0x50(%rsp)
+      13: 48 89 54 24 48               	movq	%rdx, 0x48(%rsp)
+      18: 48 89 4c 24 40               	movq	%rcx, 0x40(%rsp)
+      1d: 48 8d 44 24 40               	leaq	0x40(%rsp), %rax
+      22: 48 89 44 24 60               	movq	%rax, 0x60(%rsp)
+      27: 48 8d 44 24 48               	leaq	0x48(%rsp), %rax
+      2c: 48 89 44 24 68               	movq	%rax, 0x68(%rsp)
+      31: 48 8d 44 24 50               	leaq	0x50(%rsp), %rax
+      36: 48 89 44 24 70               	movq	%rax, 0x70(%rsp)
+      3b: 48 8d 44 24 58               	leaq	0x58(%rsp), %rax
+      40: 48 89 44 24 78               	movq	%rax, 0x78(%rsp)
+      45: 48 8d 84 24 f0 00 00 00      	leaq	0xf0(%rsp), %rax
+      4d: 48 89 84 24 80 00 00 00      	movq	%rax, 0x80(%rsp)
+      55: 48 8d 84 24 f8 00 00 00      	leaq	0xf8(%rsp), %rax
+      5d: 48 89 84 24 88 00 00 00      	movq	%rax, 0x88(%rsp)
+      65: 48 8d 84 24 00 01 00 00      	leaq	0x100(%rsp), %rax
+      6d: 48 89 84 24 90 00 00 00      	movq	%rax, 0x90(%rsp)
+      75: 48 8d b4 24 a8 00 00 00      	leaq	0xa8(%rsp), %rsi
+      7d: 48 8d bc 24 98 00 00 00      	leaq	0x98(%rsp), %rdi
+      85: 4c 8d 44 24 38               	leaq	0x38(%rsp), %r8
+      8a: 4c 8d 4c 24 30               	leaq	0x30(%rsp), %r9
+      8f: 48 89 f1                     	movq	%rsi, %rcx
+      92: 48 89 fa                     	movq	%rdi, %rdx
+      95: e8 00 00 00 00               	callq	0x9a <?__device_stub__ternary_pq2_gemv_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHH@Z+0x9a>
+      9a: 48 8b 44 24 38               	movq	0x38(%rsp), %rax
+      9f: 48 8b 4c 24 30               	movq	0x30(%rsp), %rcx
+      a4: 48 89 4c 24 28               	movq	%rcx, 0x28(%rsp)
+      a9: 48 89 44 24 20               	movq	%rax, 0x20(%rsp)
+      ae: 48 8d 0d 00 00 00 00         	leaq	(%rip), %rcx            # 0xb5 <?__device_stub__ternary_pq2_gemv_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHH@Z+0xb5>
+      b5: 4c 8d 4c 24 60               	leaq	0x60(%rsp), %r9
+      ba: 48 89 f2                     	movq	%rsi, %rdx
+      bd: 49 89 f8                     	movq	%rdi, %r8
+      c0: e8 00 00 00 00               	callq	0xc5 <?__device_stub__ternary_pq2_gemv_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHH@Z+0xc5>
+      c5: 90                           	nop
+      c6: 48 81 c4 b8 00 00 00         	addq	$0xb8, %rsp
+      cd: 5f                           	popq	%rdi
+      ce: 5e                           	popq	%rsi
+      cf: c3                           	retq
+00000000000000d0 <?__device_stub__ternary_pq2_mma_small_t_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z>:
+      d0: 56                           	pushq	%rsi
+      d1: 57                           	pushq	%rdi
+      d2: 48 81 ec c8 00 00 00         	subq	$0xc8, %rsp
+      d9: 4c 89 4c 24 58               	movq	%r9, 0x58(%rsp)
+      de: 4c 89 44 24 50               	movq	%r8, 0x50(%rsp)
+      e3: 48 89 54 24 48               	movq	%rdx, 0x48(%rsp)
+      e8: 48 89 4c 24 40               	movq	%rcx, 0x40(%rsp)
+      ed: 48 8d 44 24 40               	leaq	0x40(%rsp), %rax
+      f2: 48 89 44 24 60               	movq	%rax, 0x60(%rsp)
+      f7: 48 8d 44 24 48               	leaq	0x48(%rsp), %rax
+      fc: 48 89 44 24 68               	movq	%rax, 0x68(%rsp)
+     101: 48 8d 44 24 50               	leaq	0x50(%rsp), %rax
+     106: 48 89 44 24 70               	movq	%rax, 0x70(%rsp)
+     10b: 48 8d 44 24 58               	leaq	0x58(%rsp), %rax
+     110: 48 89 44 24 78               	movq	%rax, 0x78(%rsp)
+     115: 48 8d 84 24 00 01 00 00      	leaq	0x100(%rsp), %rax
+     11d: 48 89 84 24 80 00 00 00      	movq	%rax, 0x80(%rsp)
+     125: 48 8d 84 24 08 01 00 00      	leaq	0x108(%rsp), %rax
+     12d: 48 89 84 24 88 00 00 00      	movq	%rax, 0x88(%rsp)
+     135: 48 8d 84 24 10 01 00 00      	leaq	0x110(%rsp), %rax
+     13d: 48 89 84 24 90 00 00 00      	movq	%rax, 0x90(%rsp)
+     145: 48 8d 84 24 18 01 00 00      	leaq	0x118(%rsp), %rax
+     14d: 48 89 84 24 98 00 00 00      	movq	%rax, 0x98(%rsp)
+     155: 48 8d 84 24 20 01 00 00      	leaq	0x120(%rsp), %rax
+     15d: 48 89 84 24 a0 00 00 00      	movq	%rax, 0xa0(%rsp)
+     165: 48 8d b4 24 b8 00 00 00      	leaq	0xb8(%rsp), %rsi
+     16d: 48 8d bc 24 a8 00 00 00      	leaq	0xa8(%rsp), %rdi
+     175: 4c 8d 44 24 38               	leaq	0x38(%rsp), %r8
+     17a: 4c 8d 4c 24 30               	leaq	0x30(%rsp), %r9
+     17f: 48 89 f1                     	movq	%rsi, %rcx
+     182: 48 89 fa                     	movq	%rdi, %rdx
+     185: e8 00 00 00 00               	callq	0x18a <?__device_stub__ternary_pq2_mma_small_t_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z+0xba>
+     18a: 48 8b 44 24 38               	movq	0x38(%rsp), %rax
+     18f: 48 8b 4c 24 30               	movq	0x30(%rsp), %rcx
+     194: 48 89 4c 24 28               	movq	%rcx, 0x28(%rsp)
+     199: 48 89 44 24 20               	movq	%rax, 0x20(%rsp)
+     19e: 48 8d 0d 00 00 00 00         	leaq	(%rip), %rcx            # 0x1a5 <?__device_stub__ternary_pq2_mma_small_t_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z+0xd5>
+     1a5: 4c 8d 4c 24 60               	leaq	0x60(%rsp), %r9
+     1aa: 48 89 f2                     	movq	%rsi, %rdx
+     1ad: 49 89 f8                     	movq	%rdi, %r8
+     1b0: e8 00 00 00 00               	callq	0x1b5 <?__device_stub__ternary_pq2_mma_small_t_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z+0xe5>
+     1b5: 90                           	nop
+     1b6: 48 81 c4 c8 00 00 00         	addq	$0xc8, %rsp
+     1bd: 5f                           	popq	%rdi
+     1be: 5e                           	popq	%rsi
+     1bf: c3                           	retq
+00000000000001c0 <?__device_stub__pq2_rowsplit_wmma_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z>:
+     1c0: 56                           	pushq	%rsi
+     1c1: 57                           	pushq	%rdi
+     1c2: 48 81 ec c8 00 00 00         	subq	$0xc8, %rsp
+     1c9: 4c 89 4c 24 58               	movq	%r9, 0x58(%rsp)
+     1ce: 4c 89 44 24 50               	movq	%r8, 0x50(%rsp)
+     1d3: 48 89 54 24 48               	movq	%rdx, 0x48(%rsp)
+     1d8: 48 89 4c 24 40               	movq	%rcx, 0x40(%rsp)
+     1dd: 48 8d 44 24 40               	leaq	0x40(%rsp), %rax
+     1e2: 48 89 44 24 60               	movq	%rax, 0x60(%rsp)
+     1e7: 48 8d 44 24 48               	leaq	0x48(%rsp), %rax
+     1ec: 48 89 44 24 68               	movq	%rax, 0x68(%rsp)
+     1f1: 48 8d 44 24 50               	leaq	0x50(%rsp), %rax
+     1f6: 48 89 44 24 70               	movq	%rax, 0x70(%rsp)
+     1fb: 48 8d 44 24 58               	leaq	0x58(%rsp), %rax
+     200: 48 89 44 24 78               	movq	%rax, 0x78(%rsp)
+     205: 48 8d 84 24 00 01 00 00      	leaq	0x100(%rsp), %rax
+     20d: 48 89 84 24 80 00 00 00      	movq	%rax, 0x80(%rsp)
+     215: 48 8d 84 24 08 01 00 00      	leaq	0x108(%rsp), %rax
+     21d: 48 89 84 24 88 00 00 00      	movq	%rax, 0x88(%rsp)
+     225: 48 8d 84 24 10 01 00 00      	leaq	0x110(%rsp), %rax
+     22d: 48 89 84 24 90 00 00 00      	movq	%rax, 0x90(%rsp)
+     235: 48 8d 84 24 18 01 00 00      	leaq	0x118(%rsp), %rax
+     23d: 48 89 84 24 98 00 00 00      	movq	%rax, 0x98(%rsp)
+     245: 48 8d 84 24 20 01 00 00      	leaq	0x120(%rsp), %rax
+     24d: 48 89 84 24 a0 00 00 00      	movq	%rax, 0xa0(%rsp)
+     255: 48 8d b4 24 b8 00 00 00      	leaq	0xb8(%rsp), %rsi
+     25d: 48 8d bc 24 a8 00 00 00      	leaq	0xa8(%rsp), %rdi
+     265: 4c 8d 44 24 38               	leaq	0x38(%rsp), %r8
+     26a: 4c 8d 4c 24 30               	leaq	0x30(%rsp), %r9
+     26f: 48 89 f1                     	movq	%rsi, %rcx
+     272: 48 89 fa                     	movq	%rdi, %rdx
+     275: e8 00 00 00 00               	callq	0x27a <?__device_stub__pq2_rowsplit_wmma_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z+0xba>
+     27a: 48 8b 44 24 38               	movq	0x38(%rsp), %rax
+     27f: 48 8b 4c 24 30               	movq	0x30(%rsp), %rcx
+     284: 48 89 4c 24 28               	movq	%rcx, 0x28(%rsp)
+     289: 48 89 44 24 20               	movq	%rax, 0x20(%rsp)
+     28e: 48 8d 0d 00 00 00 00         	leaq	(%rip), %rcx            # 0x295 <?__device_stub__pq2_rowsplit_wmma_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z+0xd5>
+     295: 4c 8d 4c 24 60               	leaq	0x60(%rsp), %r9
+     29a: 48 89 f2                     	movq	%rsi, %rdx
+     29d: 49 89 f8                     	movq	%rdi, %r8
+     2a0: e8 00 00 00 00               	callq	0x2a5 <?__device_stub__pq2_rowsplit_wmma_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z+0xe5>
+     2a5: 90                           	nop
+     2a6: 48 81 c4 c8 00 00 00         	addq	$0xc8, %rsp
+     2ad: 5f                           	popq	%rdi
+     2ae: 5e                           	popq	%rsi
+     2af: c3                           	retq
+00000000000002b0 <?__device_stub__pq2_rowsplit_wmma2_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z>:
+     2b0: 56                           	pushq	%rsi
+     2b1: 57                           	pushq	%rdi
+     2b2: 48 81 ec c8 00 00 00         	subq	$0xc8, %rsp
+     2b9: 4c 89 4c 24 58               	movq	%r9, 0x58(%rsp)
+     2be: 4c 89 44 24 50               	movq	%r8, 0x50(%rsp)
+     2c3: 48 89 54 24 48               	movq	%rdx, 0x48(%rsp)
+     2c8: 48 89 4c 24 40               	movq	%rcx, 0x40(%rsp)
+     2cd: 48 8d 44 24 40               	leaq	0x40(%rsp), %rax
+     2d2: 48 89 44 24 60               	movq	%rax, 0x60(%rsp)
+     2d7: 48 8d 44 24 48               	leaq	0x48(%rsp), %rax
+     2dc: 48 89 44 24 68               	movq	%rax, 0x68(%rsp)
+     2e1: 48 8d 44 24 50               	leaq	0x50(%rsp), %rax
+     2e6: 48 89 44 24 70               	movq	%rax, 0x70(%rsp)
+     2eb: 48 8d 44 24 58               	leaq	0x58(%rsp), %rax
+     2f0: 48 89 44 24 78               	movq	%rax, 0x78(%rsp)
+     2f5: 48 8d 84 24 00 01 00 00      	leaq	0x100(%rsp), %rax
+     2fd: 48 89 84 24 80 00 00 00      	movq	%rax, 0x80(%rsp)
+     305: 48 8d 84 24 08 01 00 00      	leaq	0x108(%rsp), %rax
+     30d: 48 89 84 24 88 00 00 00      	movq	%rax, 0x88(%rsp)
+     315: 48 8d 84 24 10 01 00 00      	leaq	0x110(%rsp), %rax
+     31d: 48 89 84 24 90 00 00 00      	movq	%rax, 0x90(%rsp)
+     325: 48 8d 84 24 18 01 00 00      	leaq	0x118(%rsp), %rax
+     32d: 48 89 84 24 98 00 00 00      	movq	%rax, 0x98(%rsp)
+     335: 48 8d 84 24 20 01 00 00      	leaq	0x120(%rsp), %rax
+     33d: 48 89 84 24 a0 00 00 00      	movq	%rax, 0xa0(%rsp)
+     345: 48 8d b4 24 b8 00 00 00      	leaq	0xb8(%rsp), %rsi
+     34d: 48 8d bc 24 a8 00 00 00      	leaq	0xa8(%rsp), %rdi
+     355: 4c 8d 44 24 38               	leaq	0x38(%rsp), %r8
+     35a: 4c 8d 4c 24 30               	leaq	0x30(%rsp), %r9
+     35f: 48 89 f1                     	movq	%rsi, %rcx
+     362: 48 89 fa                     	movq	%rdi, %rdx
+     365: e8 00 00 00 00               	callq	0x36a <?__device_stub__pq2_rowsplit_wmma2_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z+0xba>
+     36a: 48 8b 44 24 38               	movq	0x38(%rsp), %rax
+     36f: 48 8b 4c 24 30               	movq	0x30(%rsp), %rcx
+     374: 48 89 4c 24 28               	movq	%rcx, 0x28(%rsp)
+     379: 48 89 44 24 20               	movq	%rax, 0x20(%rsp)
+     37e: 48 8d 0d 00 00 00 00         	leaq	(%rip), %rcx            # 0x385 <?__device_stub__pq2_rowsplit_wmma2_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z+0xd5>
+     385: 4c 8d 4c 24 60               	leaq	0x60(%rsp), %r9
+     38a: 48 89 f2                     	movq	%rsi, %rdx
+     38d: 49 89 f8                     	movq	%rdi, %r8
+     390: e8 00 00 00 00               	callq	0x395 <?__device_stub__pq2_rowsplit_wmma2_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z+0xe5>
+     395: 90                           	nop
+     396: 48 81 c4 c8 00 00 00         	addq	$0xc8, %rsp
+     39d: 5f                           	popq	%rdi
+     39e: 5e                           	popq	%rsi
+     39f: c3                           	retq
+00000000000003a0 <?__device_stub__pq2_rowsplit_wmma2_bn16_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z>:
+     3a0: 56                           	pushq	%rsi
+     3a1: 57                           	pushq	%rdi
+     3a2: 48 81 ec c8 00 00 00         	subq	$0xc8, %rsp
+     3a9: 4c 89 4c 24 58               	movq	%r9, 0x58(%rsp)
+     3ae: 4c 89 44 24 50               	movq	%r8, 0x50(%rsp)
+     3b3: 48 89 54 24 48               	movq	%rdx, 0x48(%rsp)
+     3b8: 48 89 4c 24 40               	movq	%rcx, 0x40(%rsp)
+     3bd: 48 8d 44 24 40               	leaq	0x40(%rsp), %rax
+     3c2: 48 89 44 24 60               	movq	%rax, 0x60(%rsp)
+     3c7: 48 8d 44 24 48               	leaq	0x48(%rsp), %rax
+     3cc: 48 89 44 24 68               	movq	%rax, 0x68(%rsp)
+     3d1: 48 8d 44 24 50               	leaq	0x50(%rsp), %rax
+     3d6: 48 89 44 24 70               	movq	%rax, 0x70(%rsp)
+     3db: 48 8d 44 24 58               	leaq	0x58(%rsp), %rax
+     3e0: 48 89 44 24 78               	movq	%rax, 0x78(%rsp)
+     3e5: 48 8d 84 24 00 01 00 00      	leaq	0x100(%rsp), %rax
+     3ed: 48 89 84 24 80 00 00 00      	movq	%rax, 0x80(%rsp)
+     3f5: 48 8d 84 24 08 01 00 00      	leaq	0x108(%rsp), %rax
+     3fd: 48 89 84 24 88 00 00 00      	movq	%rax, 0x88(%rsp)
+     405: 48 8d 84 24 10 01 00 00      	leaq	0x110(%rsp), %rax
+     40d: 48 89 84 24 90 00 00 00      	movq	%rax, 0x90(%rsp)
+     415: 48 8d 84 24 18 01 00 00      	leaq	0x118(%rsp), %rax
+     41d: 48 89 84 24 98 00 00 00      	movq	%rax, 0x98(%rsp)
+     425: 48 8d 84 24 20 01 00 00      	leaq	0x120(%rsp), %rax
+     42d: 48 89 84 24 a0 00 00 00      	movq	%rax, 0xa0(%rsp)
+     435: 48 8d b4 24 b8 00 00 00      	leaq	0xb8(%rsp), %rsi
+     43d: 48 8d bc 24 a8 00 00 00      	leaq	0xa8(%rsp), %rdi
+     445: 4c 8d 44 24 38               	leaq	0x38(%rsp), %r8
+     44a: 4c 8d 4c 24 30               	leaq	0x30(%rsp), %r9
+     44f: 48 89 f1                     	movq	%rsi, %rcx
+     452: 48 89 fa                     	movq	%rdi, %rdx
+     455: e8 00 00 00 00               	callq	0x45a <?__device_stub__pq2_rowsplit_wmma2_bn16_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z+0xba>
+     45a: 48 8b 44 24 38               	movq	0x38(%rsp), %rax
+     45f: 48 8b 4c 24 30               	movq	0x30(%rsp), %rcx
+     464: 48 89 4c 24 28               	movq	%rcx, 0x28(%rsp)
+     469: 48 89 44 24 20               	movq	%rax, 0x20(%rsp)
+     46e: 48 8d 0d 00 00 00 00         	leaq	(%rip), %rcx            # 0x475 <?__device_stub__pq2_rowsplit_wmma2_bn16_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z+0xd5>
+     475: 4c 8d 4c 24 60               	leaq	0x60(%rsp), %r9
+     47a: 48 89 f2                     	movq	%rsi, %rdx
+     47d: 49 89 f8                     	movq	%rdi, %r8
+     480: e8 00 00 00 00               	callq	0x485 <?__device_stub__pq2_rowsplit_wmma2_bn16_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z+0xe5>
+     485: 90                           	nop
+     486: 48 81 c4 c8 00 00 00         	addq	$0xc8, %rsp
+     48d: 5f                           	popq	%rdi
+     48e: 5e                           	popq	%rsi
+     48f: c3                           	retq
+0000000000000490 <?__device_stub__pq2_rowsplit_wmma2_r32c16_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z>:
+     490: 56                           	pushq	%rsi
+     491: 57                           	pushq	%rdi
+     492: 48 81 ec c8 00 00 00         	subq	$0xc8, %rsp
+     499: 4c 89 4c 24 58               	movq	%r9, 0x58(%rsp)
+     49e: 4c 89 44 24 50               	movq	%r8, 0x50(%rsp)
+     4a3: 48 89 54 24 48               	movq	%rdx, 0x48(%rsp)
+     4a8: 48 89 4c 24 40               	movq	%rcx, 0x40(%rsp)
+     4ad: 48 8d 44 24 40               	leaq	0x40(%rsp), %rax
+     4b2: 48 89 44 24 60               	movq	%rax, 0x60(%rsp)
+     4b7: 48 8d 44 24 48               	leaq	0x48(%rsp), %rax
+     4bc: 48 89 44 24 68               	movq	%rax, 0x68(%rsp)
+     4c1: 48 8d 44 24 50               	leaq	0x50(%rsp), %rax
+     4c6: 48 89 44 24 70               	movq	%rax, 0x70(%rsp)
+     4cb: 48 8d 44 24 58               	leaq	0x58(%rsp), %rax
+     4d0: 48 89 44 24 78               	movq	%rax, 0x78(%rsp)
+     4d5: 48 8d 84 24 00 01 00 00      	leaq	0x100(%rsp), %rax
+     4dd: 48 89 84 24 80 00 00 00      	movq	%rax, 0x80(%rsp)
+     4e5: 48 8d 84 24 08 01 00 00      	leaq	0x108(%rsp), %rax
+     4ed: 48 89 84 24 88 00 00 00      	movq	%rax, 0x88(%rsp)
+     4f5: 48 8d 84 24 10 01 00 00      	leaq	0x110(%rsp), %rax
+     4fd: 48 89 84 24 90 00 00 00      	movq	%rax, 0x90(%rsp)
+     505: 48 8d 84 24 18 01 00 00      	leaq	0x118(%rsp), %rax
+     50d: 48 89 84 24 98 00 00 00      	movq	%rax, 0x98(%rsp)
+     515: 48 8d 84 24 20 01 00 00      	leaq	0x120(%rsp), %rax
+     51d: 48 89 84 24 a0 00 00 00      	movq	%rax, 0xa0(%rsp)
+     525: 48 8d b4 24 b8 00 00 00      	leaq	0xb8(%rsp), %rsi
+     52d: 48 8d bc 24 a8 00 00 00      	leaq	0xa8(%rsp), %rdi
+     535: 4c 8d 44 24 38               	leaq	0x38(%rsp), %r8
+     53a: 4c 8d 4c 24 30               	leaq	0x30(%rsp), %r9
+     53f: 48 89 f1                     	movq	%rsi, %rcx
+     542: 48 89 fa                     	movq	%rdi, %rdx
+     545: e8 00 00 00 00               	callq	0x54a <?__device_stub__pq2_rowsplit_wmma2_r32c16_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z+0xba>
+     54a: 48 8b 44 24 38               	movq	0x38(%rsp), %rax
+     54f: 48 8b 4c 24 30               	movq	0x30(%rsp), %rcx
+     554: 48 89 4c 24 28               	movq	%rcx, 0x28(%rsp)
+     559: 48 89 44 24 20               	movq	%rax, 0x20(%rsp)
+     55e: 48 8d 0d 00 00 00 00         	leaq	(%rip), %rcx            # 0x565 <?__device_stub__pq2_rowsplit_wmma2_r32c16_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z+0xd5>
+     565: 4c 8d 4c 24 60               	leaq	0x60(%rsp), %r9
+     56a: 48 89 f2                     	movq	%rsi, %rdx
+     56d: 49 89 f8                     	movq	%rdi, %r8
+     570: e8 00 00 00 00               	callq	0x575 <?__device_stub__pq2_rowsplit_wmma2_r32c16_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z+0xe5>
+     575: 90                           	nop
+     576: 48 81 c4 c8 00 00 00         	addq	$0xc8, %rsp
+     57d: 5f                           	popq	%rdi
+     57e: 5e                           	popq	%rsi
+     57f: c3                           	retq
+0000000000000580 <?__device_stub__pq2_rowsplit_wmma2_r16c16_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z>:
+     580: 56                           	pushq	%rsi
+     581: 57                           	pushq	%rdi
+     582: 48 81 ec c8 00 00 00         	subq	$0xc8, %rsp
+     589: 4c 89 4c 24 58               	movq	%r9, 0x58(%rsp)
+     58e: 4c 89 44 24 50               	movq	%r8, 0x50(%rsp)
+     593: 48 89 54 24 48               	movq	%rdx, 0x48(%rsp)
+     598: 48 89 4c 24 40               	movq	%rcx, 0x40(%rsp)
+     59d: 48 8d 44 24 40               	leaq	0x40(%rsp), %rax
+     5a2: 48 89 44 24 60               	movq	%rax, 0x60(%rsp)
+     5a7: 48 8d 44 24 48               	leaq	0x48(%rsp), %rax
+     5ac: 48 89 44 24 68               	movq	%rax, 0x68(%rsp)
+     5b1: 48 8d 44 24 50               	leaq	0x50(%rsp), %rax
+     5b6: 48 89 44 24 70               	movq	%rax, 0x70(%rsp)
+     5bb: 48 8d 44 24 58               	leaq	0x58(%rsp), %rax
+     5c0: 48 89 44 24 78               	movq	%rax, 0x78(%rsp)
+     5c5: 48 8d 84 24 00 01 00 00      	leaq	0x100(%rsp), %rax
+     5cd: 48 89 84 24 80 00 00 00      	movq	%rax, 0x80(%rsp)
+     5d5: 48 8d 84 24 08 01 00 00      	leaq	0x108(%rsp), %rax
+     5dd: 48 89 84 24 88 00 00 00      	movq	%rax, 0x88(%rsp)
+     5e5: 48 8d 84 24 10 01 00 00      	leaq	0x110(%rsp), %rax
+     5ed: 48 89 84 24 90 00 00 00      	movq	%rax, 0x90(%rsp)
+     5f5: 48 8d 84 24 18 01 00 00      	leaq	0x118(%rsp), %rax
+     5fd: 48 89 84 24 98 00 00 00      	movq	%rax, 0x98(%rsp)
+     605: 48 8d 84 24 20 01 00 00      	leaq	0x120(%rsp), %rax
+     60d: 48 89 84 24 a0 00 00 00      	movq	%rax, 0xa0(%rsp)
+     615: 48 8d b4 24 b8 00 00 00      	leaq	0xb8(%rsp), %rsi
+     61d: 48 8d bc 24 a8 00 00 00      	leaq	0xa8(%rsp), %rdi
+     625: 4c 8d 44 24 38               	leaq	0x38(%rsp), %r8
+     62a: 4c 8d 4c 24 30               	leaq	0x30(%rsp), %r9
+     62f: 48 89 f1                     	movq	%rsi, %rcx
+     632: 48 89 fa                     	movq	%rdi, %rdx
+     635: e8 00 00 00 00               	callq	0x63a <?__device_stub__pq2_rowsplit_wmma2_r16c16_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z+0xba>
+     63a: 48 8b 44 24 38               	movq	0x38(%rsp), %rax
+     63f: 48 8b 4c 24 30               	movq	0x30(%rsp), %rcx
+     644: 48 89 4c 24 28               	movq	%rcx, 0x28(%rsp)
+     649: 48 89 44 24 20               	movq	%rax, 0x20(%rsp)
+     64e: 48 8d 0d 00 00 00 00         	leaq	(%rip), %rcx            # 0x655 <?__device_stub__pq2_rowsplit_wmma2_r16c16_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z+0xd5>
+     655: 4c 8d 4c 24 60               	leaq	0x60(%rsp), %r9
+     65a: 48 89 f2                     	movq	%rsi, %rdx
+     65d: 49 89 f8                     	movq	%rdi, %r8
+     660: e8 00 00 00 00               	callq	0x665 <?__device_stub__pq2_rowsplit_wmma2_r16c16_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z+0xe5>
+     665: 90                           	nop
+     666: 48 81 c4 c8 00 00 00         	addq	$0xc8, %rsp
+     66d: 5f                           	popq	%rdi
+     66e: 5e                           	popq	%rsi
+     66f: c3                           	retq
+0000000000000670 <?__device_stub__pq2_rowsplit_wmma2_r32c32_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z>:
+     670: 56                           	pushq	%rsi
+     671: 57                           	pushq	%rdi
+     672: 48 81 ec c8 00 00 00         	subq	$0xc8, %rsp
+     679: 4c 89 4c 24 58               	movq	%r9, 0x58(%rsp)
+     67e: 4c 89 44 24 50               	movq	%r8, 0x50(%rsp)
+     683: 48 89 54 24 48               	movq	%rdx, 0x48(%rsp)
+     688: 48 89 4c 24 40               	movq	%rcx, 0x40(%rsp)
+     68d: 48 8d 44 24 40               	leaq	0x40(%rsp), %rax
+     692: 48 89 44 24 60               	movq	%rax, 0x60(%rsp)
+     697: 48 8d 44 24 48               	leaq	0x48(%rsp), %rax
+     69c: 48 89 44 24 68               	movq	%rax, 0x68(%rsp)
+     6a1: 48 8d 44 24 50               	leaq	0x50(%rsp), %rax
+     6a6: 48 89 44 24 70               	movq	%rax, 0x70(%rsp)
+     6ab: 48 8d 44 24 58               	leaq	0x58(%rsp), %rax
+     6b0: 48 89 44 24 78               	movq	%rax, 0x78(%rsp)
+     6b5: 48 8d 84 24 00 01 00 00      	leaq	0x100(%rsp), %rax
+     6bd: 48 89 84 24 80 00 00 00      	movq	%rax, 0x80(%rsp)
+     6c5: 48 8d 84 24 08 01 00 00      	leaq	0x108(%rsp), %rax
+     6cd: 48 89 84 24 88 00 00 00      	movq	%rax, 0x88(%rsp)
+     6d5: 48 8d 84 24 10 01 00 00      	leaq	0x110(%rsp), %rax
+     6dd: 48 89 84 24 90 00 00 00      	movq	%rax, 0x90(%rsp)
+     6e5: 48 8d 84 24 18 01 00 00      	leaq	0x118(%rsp), %rax
+     6ed: 48 89 84 24 98 00 00 00      	movq	%rax, 0x98(%rsp)
+     6f5: 48 8d 84 24 20 01 00 00      	leaq	0x120(%rsp), %rax
+     6fd: 48 89 84 24 a0 00 00 00      	movq	%rax, 0xa0(%rsp)
+     705: 48 8d b4 24 b8 00 00 00      	leaq	0xb8(%rsp), %rsi
+     70d: 48 8d bc 24 a8 00 00 00      	leaq	0xa8(%rsp), %rdi
+     715: 4c 8d 44 24 38               	leaq	0x38(%rsp), %r8
+     71a: 4c 8d 4c 24 30               	leaq	0x30(%rsp), %r9
+     71f: 48 89 f1                     	movq	%rsi, %rcx
+     722: 48 89 fa                     	movq	%rdi, %rdx
+     725: e8 00 00 00 00               	callq	0x72a <?__device_stub__pq2_rowsplit_wmma2_r32c32_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z+0xba>
+     72a: 48 8b 44 24 38               	movq	0x38(%rsp), %rax
+     72f: 48 8b 4c 24 30               	movq	0x30(%rsp), %rcx
+     734: 48 89 4c 24 28               	movq	%rcx, 0x28(%rsp)
+     739: 48 89 44 24 20               	movq	%rax, 0x20(%rsp)
+     73e: 48 8d 0d 00 00 00 00         	leaq	(%rip), %rcx            # 0x745 <?__device_stub__pq2_rowsplit_wmma2_r32c32_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z+0xd5>
+     745: 4c 8d 4c 24 60               	leaq	0x60(%rsp), %r9
+     74a: 48 89 f2                     	movq	%rsi, %rdx
+     74d: 49 89 f8                     	movq	%rdi, %r8
+     750: e8 00 00 00 00               	callq	0x755 <?__device_stub__pq2_rowsplit_wmma2_r32c32_kernel@detail@ops@ninfer@@YAXPEIBU__hip_bfloat16@@PEIBE1PEIAU4@HHHHH@Z+0xe5>
+     755: 90                           	nop
+     756: 48 81 c4 c8 00 00 00         	addq	$0xc8, %rsp
+     75d: 5f                           	popq	%rdi
+     75e: 5e                           	popq	%rsi
+     75f: c3                           	retq
+0000000000000760 <?gemv_admits@detail@ops@ninfer@@YA_NAEBUTensor@3@AEBUWeight@3@H@Z>:
+     760: 44 0f b7 4a 18               	movzwl	0x18(%rdx), %r9d
+     765: 41 83 e1 fe                  	andl	$-0x2, %r9d
+     769: 31 c0                        	xorl	%eax, %eax
+     76b: 66 41 83 f9 0a               	cmpw	$0xa, %r9w
+     770: 75 26                        	jne	0x798 <?gemv_admits@detail@ops@ninfer@@YA_NAEBUTensor@3@AEBUWeight@3@H@Z+0x38>
+     772: 48 83 7a 50 00               	cmpq	$0x0, 0x50(%rdx)
+     777: 75 1f                        	jne	0x798 <?gemv_admits@detail@ops@ninfer@@YA_NAEBUTensor@3@AEBUWeight@3@H@Z+0x38>
+     779: 8b 42 64                     	movl	0x64(%rdx), %eax
+     77c: 8b 52 34                     	movl	0x34(%rdx), %edx
+     77f: 31 c2                        	xorl	%eax, %edx
+     781: 83 e0 7f                     	andl	$0x7f, %eax
+     784: 09 d0                        	orl	%edx, %eax
+     786: 75 11                        	jne	0x799 <?gemv_admits@detail@ops@ninfer@@YA_NAEBUTensor@3@AEBUWeight@3@H@Z+0x39>
+     788: 8b 41 10                     	movl	0x10(%rcx), %eax
+     78b: 85 c0                        	testl	%eax, %eax
+     78d: 0f 9f c1                     	setg	%cl
+     790: 44 39 c0                     	cmpl	%r8d, %eax
+     793: 0f 9e c0                     	setle	%al
+     796: 20 c8                        	andb	%cl, %al
+     798: c3                           	retq
+     799: 31 c0                        	xorl	%eax, %eax
+     79b: c3                           	retq
+     79c: 0f 1f 40 00                  	nopl	(%rax)
+00000000000007a0 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z>:
+     7a0: 55                           	pushq	%rbp
+     7a1: 41 57                        	pushq	%r15
+     7a3: 41 56                        	pushq	%r14
+     7a5: 41 55                        	pushq	%r13
+     7a7: 41 54                        	pushq	%r12
+     7a9: 56                           	pushq	%rsi
+     7aa: 57                           	pushq	%rdi
+     7ab: 53                           	pushq	%rbx
+     7ac: 48 81 ec 68 01 00 00         	subq	$0x168, %rsp            # imm = 0x168
+     7b3: 48 8d ac 24 80 00 00 00      	leaq	0x80(%rsp), %rbp
+     7bb: 0f 29 b5 d0 00 00 00         	movaps	%xmm6, 0xd0(%rbp)
+     7c2: 48 c7 85 c8 00 00 00 fe ff ff ff     	movq	$-0x2, 0xc8(%rbp)
+     7cd: 45 89 cf                     	movl	%r9d, %r15d
+     7d0: 4c 89 c3                     	movq	%r8, %rbx
+     7d3: 48 89 d6                     	movq	%rdx, %rsi
+     7d6: 48 89 cf                     	movq	%rcx, %rdi
+     7d9: 4c 8b b5 50 01 00 00         	movq	0x150(%rbp), %r14
+     7e0: 0f b7 4a 18                  	movzwl	0x18(%rdx), %ecx
+     7e4: 83 e1 fe                     	andl	$-0x2, %ecx
+     7e7: 8b 42 64                     	movl	0x64(%rdx), %eax
+     7ea: 66 83 f9 0a                  	cmpw	$0xa, %cx
+     7ee: 0f 85 23 02 00 00            	jne	0xa17 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x277>
+     7f4: 48 83 7e 50 00               	cmpq	$0x0, 0x50(%rsi)
+     7f9: 0f 85 18 02 00 00            	jne	0xa17 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x277>
+     7ff: 8b 4e 34                     	movl	0x34(%rsi), %ecx
+     802: 31 c1                        	xorl	%eax, %ecx
+     804: 89 c2                        	movl	%eax, %edx
+     806: 83 e2 7f                     	andl	$0x7f, %edx
+     809: 09 ca                        	orl	%ecx, %edx
+     80b: 8b 4f 10                     	movl	0x10(%rdi), %ecx
+     80e: 41 89 c8                     	movl	%ecx, %r8d
+     811: 41 83 f0 01                  	xorl	$0x1, %r8d
+     815: 41 09 d0                     	orl	%edx, %r8d
+     818: 0f 85 fc 01 00 00            	jne	0xa1a <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x27a>
+     81e: 8b 05 00 00 00 00            	movl	(%rip), %eax            # 0x824 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x84>
+     824: 8b 0d 00 00 00 00            	movl	(%rip), %ecx            # 0x82a <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x8a>
+     82a: 65 48 8b 14 25 58 00 00 00   	movq	%gs:0x58, %rdx
+     833: 48 8b 0c ca                  	movq	(%rdx,%rcx,8), %rcx
+     837: 3b 81 00 00 00 00            	cmpl	(%rcx), %eax
+     83d: 0f 8f 75 0b 00 00            	jg	0x13b8 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0xc18>
+     843: 80 3d ff ff ff ff 01         	cmpb	$0x1, -0x1(%rip)        # 0x849 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0xa9>
+     84a: 0f 85 14 07 00 00            	jne	0xf64 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x7c4>
+     850: 8b 47 10                     	movl	0x10(%rdi), %eax
+     853: 48 8d 0d 00 00 00 00         	leaq	(%rip), %rcx            # 0x85a <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0xba>
+     85a: 48 89 4d d0                  	movq	%rcx, -0x30(%rbp)
+     85e: 48 8b 4e 60                  	movq	0x60(%rsi), %rcx
+     862: 48 89 4d d8                  	movq	%rcx, -0x28(%rbp)
+     866: 89 45 e0                     	movl	%eax, -0x20(%rbp)
+     869: 8b 05 00 00 00 00            	movl	(%rip), %eax            # 0x86f <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0xcf>
+     86f: 8b 0d 00 00 00 00            	movl	(%rip), %ecx            # 0x875 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0xd5>
+     875: 65 48 8b 14 25 58 00 00 00   	movq	%gs:0x58, %rdx
+     87e: 48 8b 0c ca                  	movq	(%rdx,%rcx,8), %rcx
+     882: 3b 81 00 00 00 00            	cmpl	(%rcx), %eax
+     888: 0f 8f 23 0c 00 00            	jg	0x14b1 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0xd11>
+     88e: 0f b6 05 00 00 00 00         	movzbl	(%rip), %eax            # 0x895 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0xf5>
+     895: 88 45 e4                     	movb	%al, -0x1c(%rbp)
+     898: 48 c7 45 e8 00 00 00 00      	movq	$0x0, -0x18(%rbp)
+     8a0: 3c 01                        	cmpb	$0x1, %al
+     8a2: 75 0a                        	jne	0x8ae <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x10e>
+     8a4: 48 8d 4d e8                  	leaq	-0x18(%rbp), %rcx
+     8a8: ff 15 00 00 00 00            	callq	*(%rip)                 # 0x8ae <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x10e>
+     8ae: 45 31 ff                     	xorl	%r15d, %r15d
+     8b1: 66 83 7e 18 0b               	cmpw	$0xb, 0x18(%rsi)
+     8b6: 41 0f 94 c4                  	sete	%r12b
+     8ba: 8b 46 60                     	movl	0x60(%rsi), %eax
+     8bd: 8d 48 1f                     	leal	0x1f(%rax), %ecx
+     8c0: 83 c0 3e                     	addl	$0x3e, %eax
+     8c3: 85 c9                        	testl	%ecx, %ecx
+     8c5: 0f 49 c1                     	cmovnsl	%ecx, %eax
+     8c8: c1 f8 05                     	sarl	$0x5, %eax
+     8cb: 48 b9 40 00 00 00 01 00 00 00	movabsq	$0x100000040, %rcx      # imm = 0x100000040
+     8d5: 48 89 4d b8                  	movq	%rcx, -0x48(%rbp)
+     8d9: c7 45 c0 01 00 00 00         	movl	$0x1, -0x40(%rbp)
+     8e0: 89 45 c4                     	movl	%eax, -0x3c(%rbp)
+     8e3: 48 b8 01 00 00 00 01 00 00 00	movabsq	$0x100000001, %rax      # imm = 0x100000001
+     8ed: 48 89 45 c8                  	movq	%rax, -0x38(%rbp)
+     8f1: 48 8d 4d c4                  	leaq	-0x3c(%rbp), %rcx
+     8f5: 48 8d 55 b8                  	leaq	-0x48(%rbp), %rdx
+     8f9: 45 31 c0                     	xorl	%r8d, %r8d
+     8fc: 4d 89 f1                     	movq	%r14, %r9
+     8ff: e8 00 00 00 00               	callq	0x904 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x164>
+     904: 85 c0                        	testl	%eax, %eax
+     906: 0f 85 e6 00 00 00            	jne	0x9f2 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x252>
+     90c: 45 88 e7                     	movb	%r12b, %r15b
+     90f: 8b 46 60                     	movl	0x60(%rsi), %eax
+     912: 8b 4e 64                     	movl	0x64(%rsi), %ecx
+     915: 48 8b 13                     	movq	(%rbx), %rdx
+     918: 4c 8b 46 48                  	movq	0x48(%rsi), %r8
+     91c: 4c 8b 4e 58                  	movq	0x58(%rsi), %r9
+     920: 4c 8b 17                     	movq	(%rdi), %r10
+     923: 44 89 7d 58                  	movl	%r15d, 0x58(%rbp)
+     927: 89 45 60                     	movl	%eax, 0x60(%rbp)
+     92a: c7 45 68 01 00 00 00         	movl	$0x1, 0x68(%rbp)
+     931: 89 8d c0 00 00 00            	movl	%ecx, 0xc0(%rbp)
+     937: 89 85 c4 00 00 00            	movl	%eax, 0xc4(%rbp)
+     93d: 48 89 95 80 00 00 00         	movq	%rdx, 0x80(%rbp)
+     944: 4c 89 8d a8 00 00 00         	movq	%r9, 0xa8(%rbp)
+     94b: 4c 89 85 a0 00 00 00         	movq	%r8, 0xa0(%rbp)
+     952: 4c 89 55 40                  	movq	%r10, 0x40(%rbp)
+     956: 48 8d 45 40                  	leaq	0x40(%rbp), %rax
+     95a: 48 89 45 f0                  	movq	%rax, -0x10(%rbp)
+     95e: 48 8d 85 a0 00 00 00         	leaq	0xa0(%rbp), %rax
+     965: 48 89 45 f8                  	movq	%rax, -0x8(%rbp)
+     969: 48 8d 85 a8 00 00 00         	leaq	0xa8(%rbp), %rax
+     970: 48 89 45 00                  	movq	%rax, (%rbp)
+     974: 48 8d 85 80 00 00 00         	leaq	0x80(%rbp), %rax
+     97b: 48 89 45 08                  	movq	%rax, 0x8(%rbp)
+     97f: 48 8d 85 c4 00 00 00         	leaq	0xc4(%rbp), %rax
+     986: 48 89 45 10                  	movq	%rax, 0x10(%rbp)
+     98a: 48 8d 85 c0 00 00 00         	leaq	0xc0(%rbp), %rax
+     991: 48 89 45 18                  	movq	%rax, 0x18(%rbp)
+     995: 48 8d 45 68                  	leaq	0x68(%rbp), %rax
+     999: 48 89 45 20                  	movq	%rax, 0x20(%rbp)
+     99d: 48 8d 45 60                  	leaq	0x60(%rbp), %rax
+     9a1: 48 89 45 28                  	movq	%rax, 0x28(%rbp)
+     9a5: 48 8d 45 58                  	leaq	0x58(%rbp), %rax
+     9a9: 48 89 45 30                  	movq	%rax, 0x30(%rbp)
+     9ad: 48 8d 4d 70                  	leaq	0x70(%rbp), %rcx
+     9b1: 48 8d 95 90 00 00 00         	leaq	0x90(%rbp), %rdx
+     9b8: 4c 8d 45 48                  	leaq	0x48(%rbp), %r8
+     9bc: 4c 8d 4d 50                  	leaq	0x50(%rbp), %r9
+     9c0: e8 00 00 00 00               	callq	0x9c5 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x225>
+     9c5: 48 8b 45 48                  	movq	0x48(%rbp), %rax
+     9c9: 48 8b 4d 50                  	movq	0x50(%rbp), %rcx
+     9cd: 48 89 4c 24 28               	movq	%rcx, 0x28(%rsp)
+     9d2: 48 89 44 24 20               	movq	%rax, 0x20(%rsp)
+     9d7: 48 8d 0d 00 00 00 00         	leaq	(%rip), %rcx            # 0x9de <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x23e>
+     9de: 48 8d 55 70                  	leaq	0x70(%rbp), %rdx
+     9e2: 4c 8d 85 90 00 00 00         	leaq	0x90(%rbp), %r8
+     9e9: 4c 8d 4d f0                  	leaq	-0x10(%rbp), %r9
+     9ed: e8 00 00 00 00               	callq	0x9f2 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x252>
+     9f2: e8 00 00 00 00               	callq	0x9f7 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x257>
+     9f7: 48 8d 15 00 00 00 00         	leaq	(%rip), %rdx            # 0x9fe <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x25e>
+     9fe: 4c 8d 05 00 00 00 00         	leaq	(%rip), %r8             # 0xa05 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x265>
+     a05: 89 c1                        	movl	%eax, %ecx
+     a07: 41 b9 ee 00 00 00            	movl	$0xee, %r9d
+     a0d: e8 00 00 00 00               	callq	0xa12 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x272>
+     a12: e9 29 05 00 00               	jmp	0xf40 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x7a0>
+     a17: 8b 4f 10                     	movl	0x10(%rdi), %ecx
+     a1a: 8b 56 60                     	movl	0x60(%rsi), %edx
+     a1d: 4c 8d 05 00 00 00 00         	leaq	(%rip), %r8             # 0xa24 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x284>
+     a24: 4c 89 45 d0                  	movq	%r8, -0x30(%rbp)
+     a28: 89 55 d8                     	movl	%edx, -0x28(%rbp)
+     a2b: 89 45 dc                     	movl	%eax, -0x24(%rbp)
+     a2e: 89 4d e0                     	movl	%ecx, -0x20(%rbp)
+     a31: 8b 05 00 00 00 00            	movl	(%rip), %eax            # 0xa37 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x297>
+     a37: 8b 0d 00 00 00 00            	movl	(%rip), %ecx            # 0xa3d <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x29d>
+     a3d: 65 48 8b 14 25 58 00 00 00   	movq	%gs:0x58, %rdx
+     a46: 48 8b 0c ca                  	movq	(%rdx,%rcx,8), %rcx
+     a4a: 3b 81 00 00 00 00            	cmpl	(%rcx), %eax
+     a50: 0f 8f 13 09 00 00            	jg	0x1369 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0xbc9>
+     a56: 0f b6 05 00 00 00 00         	movzbl	(%rip), %eax            # 0xa5d <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x2bd>
+     a5d: 88 45 e4                     	movb	%al, -0x1c(%rbp)
+     a60: 48 c7 45 e8 00 00 00 00      	movq	$0x0, -0x18(%rbp)
+     a68: 3c 01                        	cmpb	$0x1, %al
+     a6a: 75 0a                        	jne	0xa76 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x2d6>
+     a6c: 48 8d 4d e8                  	leaq	-0x18(%rbp), %rcx
+     a70: ff 15 00 00 00 00            	callq	*(%rip)                 # 0xa76 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x2d6>
+     a76: 0f b7 46 18                  	movzwl	0x18(%rsi), %eax
+     a7a: 83 f8 0b                     	cmpl	$0xb, %eax
+     a7d: 0f 84 32 03 00 00            	je	0xdb5 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x615>
+     a83: 83 f8 0a                     	cmpl	$0xa, %eax
+     a86: 0f 84 99 01 00 00            	je	0xc25 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x485>
+     a8c: 83 f8 09                     	cmpl	$0x9, %eax
+     a8f: 0f 85 03 09 00 00            	jne	0x1398 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0xbf8>
+     a95: 44 8b 66 64                  	movl	0x64(%rsi), %r12d
+     a99: 41 f6 c4 7f                  	testb	$0x7f, %r12b
+     a9d: 0f 85 8e 09 00 00            	jne	0x1431 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0xc91>
+     aa3: 44 8b 6e 60                  	movl	0x60(%rsi), %r13d
+     aa7: 45 39 ef                     	cmpl	%r13d, %r15d
+     aaa: 0f 8c e1 09 00 00            	jl	0x1491 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0xcf1>
+     ab0: 4d 89 f1                     	movq	%r14, %r9
+     ab3: 49 89 de                     	movq	%rbx, %r14
+     ab6: 8b 5f 10                     	movl	0x10(%rdi), %ebx
+     ab9: 48 b8 80 00 00 00 01 00 00 00	movabsq	$0x100000080, %rax      # imm = 0x100000080
+     ac3: 48 89 85 80 00 00 00         	movq	%rax, 0x80(%rbp)
+     aca: c7 85 88 00 00 00 01 00 00 00	movl	$0x1, 0x88(%rbp)
+     ad4: 44 89 ad a8 00 00 00         	movl	%r13d, 0xa8(%rbp)
+     adb: 89 9d ac 00 00 00            	movl	%ebx, 0xac(%rbp)
+     ae1: c7 85 b0 00 00 00 01 00 00 00	movl	$0x1, 0xb0(%rbp)
+     aeb: 48 8d 8d a8 00 00 00         	leaq	0xa8(%rbp), %rcx
+     af2: 48 8d 95 80 00 00 00         	leaq	0x80(%rbp), %rdx
+     af9: 45 31 c0                     	xorl	%r8d, %r8d
+     afc: e8 00 00 00 00               	callq	0xb01 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x361>
+     b01: 85 c0                        	testl	%eax, %eax
+     b03: 0f 85 f7 00 00 00            	jne	0xc00 <?launch_ternary_gemm_t1@detail@ops@ninfer@@YAXAEBUTensor@3@AEBUWeight@3@AEAU43@HPEAUihipStream_t@@@Z+0x460>
+     b09: 44 89 e0                     	movl	%r12d, %eax
+     b0c: c1 f8 07                     	sarl	$0x7, %eax
+     b0f: 49 8b 0e                     	movq	(%r14), %rcx
+     b12: 48 8b 56 58                  	movq	0x58(%rsi), %rdx
+     b16: 4c 8b 46 48                  	movq	0x48(%rsi), %r8
+     b1a: 4c 8b 4e 50                  	movq	0x50(%rsi), %r9
+     b1e: 4c 8b 17                     	movq	(%rdi), %r10
+     b21: 44 89 bd c0 00 00 00         	movl	%r15d, 0xc0(%rbp)
+     b28: 89 85 c4 00 00 00            	movl	%eax, 0xc4(%rbp)
+     b2e: 89 9d b4 00 00 00            	movl	%ebx, 0xb4(%rbp)
+     b34: 44 89 a5 b8 00 00 00         	movl	%r12d, 0xb8(%rbp)
+     b3b: 44 89 ad bc 00 00 00         	movl	%r13d, 0xbc(%rbp)
+     b42: 48 89 8d a0 00 00 00         	movq	%rcx, 0xa0(%rbp)

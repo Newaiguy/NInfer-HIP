@@ -1,0 +1,9 @@
+###ID pr150
+
+> 📌 **最新交接 (--, 新会话先读): `HANDOFF_.md`** —— 含本轮数据纠错
+> (曾误报 "prefill + 达成/ms"，真实 = - t/s 未达标；SIMT wu_panel edit 实际失败未应用)、
+> 长上下文发布门槛 (对标 llama.cpp k@- t/s)、k 显存估算、按序执行计划 (长ctx测量→KV优化→prefill +→MTP v.→发 GitHub)。
+> 以下 -- 段 (引擎快照/构建铁律/教训) 仍有效。
+> ⚡ **新会话开工指南 (-- 三更, 读完这段直接干活)**:
+
+The secret verification code is 7391. Remember it. What is the secret verification code? Answer with digits only.

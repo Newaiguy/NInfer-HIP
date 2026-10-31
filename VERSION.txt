@@ -1,0 +1,95 @@
+NInfer-HIP 0.1.0-pre-r2
+=====================
+
+名称        : NInfer-HIP（仓库名 ninfer-hip）—— NInfer 引擎的 AMD RDNA4 / HIP 移植版
+许可证      : Apache-2.0（衍生自 https://github.com/Neroued/ninfer，改动见 docs/PATCHLIST.md）
+状态        : 预发布快照（未对外发布，勿分发）
+构建时间    : 2026-10-31
+目标硬件    : AMD Radeon RX 9070 XT 16GB (RDNA4, gfx1201), 640 GB/s
+运行系统    : Windows 11 26200 (25H2) + HIP SDK 7.2.3 (AMD Software 26.8.1)
+模型        : WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3（自足 artifact）
+              E:\ninfer-models\Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer
+              size 15,017,456,896 B（text 11.755GB + vision + mtp + dflash2）
+
+引擎        : bin/ninfer_mini_nordc.exe
+  size      : 193,521,152 B
+  sha256    : 011EBBACB4E702E47FDBBC969CEAB6456E2844E1EDC01E3C0233AD405674FB44
+
+关键指标（graph on，-kv rk4v4-e8 = int4 K / int4 V，--ctx 均贴近实际 prompt 长度）
+  decode AR      : 37.3 @2.8K(ctx8K) · 35.4 @5.8K(ctx16K) · 32.3 @31K(ctx32K)
+                   30.0 @48K(ctx49K) · 28.4 @65K(ctx66K) · 25.2 @96K(ctx98K)
+                   **22.9 @126K(ctx126464)**
+  decode MTP dw2 : 77.8 @2.8K（AR 2.15x） · 64.5 @24K（2.0x）
+                   41.6 @65K（1.47x） · 34.9 @48K（1.16x） · 34.0 @96K（1.35x） · 126K 不可用
+  prefill        : 848 @5.8K · 610 @31K · 505 @48K · 442 @65K · 346 @96K · 294 @126K
+  正确性         : 5.8K / 31K / 48K / 65K / 98K / 126K needle 全命中
+                  （126K = tasks_true128k 126,306 token → K8M2Q9）
+
+本版核心结论（务必先读）
+  --ctx 必须 = prompt + max_new，一个 token 都别多开
+    126K 语料：--ctx 131072 → 10.12 t/s；--ctx 126464 → 22.91 t/s（2.26x，复测 22.93 / 23.01）
+    65K  语料：--ctx 131072 → 15.0  t/s；--ctx 65536  → 28.4  t/s
+  根因：KV 池按 --ctx 一次性全量提交（int4 17920 B/token），越过 Windows 驻留预算
+        （约 12.6~13.6 GiB，当天漂移约 1 GiB）后整池降级到系统内存，按 PCIe ~30 GB/s 读
+  悬崖在“提交量”而非“ctx 值”：同一条 48K 提示，--ctx 65536 上午 30.1 / 下午同命令 30.0；
+        而 --ctx 69632 上午 16.8（越线）、--ctx 122880 下午 29.99（未越线）
+  MTP 的固定开销 = +0.57 GB（mtp 权重 348MB + draft state 190MB + verify 图 73MB）
+        ⇒ 96K 能跑（提交 13.62 GiB）34.0 t/s；126K 越线（14.12 GiB）掉到 10.6 t/s
+
+推荐配置（按真实上下文选，详见 docs/README.md 第 3 节）
+  真实 <=8K      : --ctx 16384  --kv rk4v4-e8 --spec mtp --draft-tokens 2  -> 77.8 t/s（AR 36.2）
+  真实 16-32K    : --ctx 32768  --spec mtp --draft-tokens 2                 -> 64.5 t/s（真实 24K）
+  真实 48K       : --ctx 49152  --spec mtp --draft-tokens 2                 -> 34.9 t/s（AR 30.1）
+  真实 64K       : --ctx 65536  （AR 28.4 / 加 MTP 34.9）
+  真实 96K       : --ctx 98304  --spec mtp --draft-tokens 2                 -> 34.0 t/s（AR 25.2）
+  真实 126K      : --ctx 126464 （必须关 MTP）                               -> 22.9 t/s
+  大容量短对话   : --ctx 81920  --spec mtp --draft-tokens 2                 -> 56.0 t/s（真实 2.8K）
+  规则：ctx 贴紧实际长度；draft-tokens 只用 2；>=100K 真实上下文关 MTP
+
+同卡 llama.cpp 对照（llama build 9548，-ctk q4_0 -ctv q4_0 -fa on）
+  【口径】必须在同一时段背靠背测。早期 llama 值（65K 11.47 / 126K 7.15）是预算偏低时测的，
+         llama 自己也被降级，虚低 43%~56%，已作废。下面是同窗口重测：
+  decode : 247 tok  我们 37.3  vs llama 26.54（1.41x）
+           65,135   我们 28.30 vs llama 20.17（1.40x）；开 MTP dw2 41.58 = 2.06x
+           126,294  我们 22.95 vs llama 16.19（1.42x，llama -c 126464；-c 131072 时 16.32）
+           ⇒ 三档倍数一致 1.4x；MTP 让我们在中长上下文达到 llama 的 2 倍
+           （llama 上游 build 9548 无 MTP；用户脚本 G: 补丁分支 draft-mtp n-max3 同档标称 ~37）
+  prefill: 我们 438 vs 752 @65K · 295 vs 575 @126K（0.5-0.6x，下一版主目标）
+  注      : llama 在 126K 不需要收紧 -c（固定开销小，同上下文只占约 13.1 GiB）；
+           我们固定开销多 573 MB（state 320 + ws 240 + graph 13），所以必须 --ctx 贴紧
+
+本版（相对 pre-r1）
+  1 修 decode attention 写回（o_stage 逐片求和，消除 32-周期性重复）——长上下文垃圾文本的根因
+  2 MTP verify 批量化（grid.z == tokens），48K/126K 不再因 per-token 循环退化
+  3 --ctx 台阶定量到“提交预算”：预算是 12.6~13.6 GiB 且当天漂移，悬崖看提交量不看 ctx 值
+  4 126K 口径纠正：pre-r1 的“23.5 不可复现”与初稿的“10.1”都不对，
+    真值 22.9 t/s @ --ctx 126464；10.1 来自 --ctx 131072 多开 4743 token
+  5 96K 真实上下文从 11.8 提到 25.2（AR）/ 34.0（MTP），同样只是 --ctx 从 131072 收到 98304
+  6 诊断仪器：[mem]/[vram]/[xfer] 探针、NINFER_DUMMY_MB、NINFER_PREALLOC_MB、
+    NINFER_VRAM_CEILING（证明 cudaMalloc 是虚拟超额提交：干净进程可分配 >=24 GiB）、
+    NINFER_KVCAP_DIAG、NINFER_STEP_T、NINFER_KV_DUMP_SEQ（源码级，默认全关）
+  7 生产默认关掉 arena 的 alloc 带宽探针（NINFER_ALLOC_BW，默认 0）
+
+未修（见 docs/PATCHLIST.md 末节）
+  多模态（图像输入）：本版 harness 无入口（artifact 有 vision 组件、引擎有 enable_vision 通路）
+  int8 KV 非确定性 · fp8 KV 的 QK 是 __builtin_trap() 桩 · dflash2 坏路径
+  126K 以上 MTP（差 0.5 GB 预算） · prefill >=64K 落后 llama · 256K 需 KV offload
+  短上下文 45 t/s 未达（AR 37.3，物理上限 54）
+
+重要用法
+  --ctx 必须贴近实际 prompt 长度（126K：ctx126464 → 22.9，ctx131072 → 10.1）
+  MTP 只用 --draft-tokens 2；3 及以上净亏；>=100K 真实上下文关 MTP
+  引擎 exe 不能直接双击：必须 python probe_rebuilt\run_capture.py build\infer_mini_nordc.exe ...
+
+安全铁律
+  绝不对卡在 GPU 上的引擎进程 Stop-Process（会让 GPU 队列永久卡死 → 黑屏硬复位）
+  不要跑 --no-graph + NINFER_PROFILE_* + --spec mtp 组合
+  扫测进行中禁止编译/链接（构建会 taskkill 引擎进程并改写 exe）
+
+文档
+  docs/README.md         能力状态、快速开始、已知坑
+  docs/VALIDATION.md     正确性+速度矩阵、MTP 倍率、llama 对照、物理上限
+  docs/PERF-CAPACITY.md  --ctx 台阶与驻留预算根因（本版核心结论）
+  docs/CHANGELOG.md      pre-r1 / pre-r2 变更与否定结论
+  docs/PATCHLIST.md      逐文件改动 + .bak 回滚点 + 未修技术债
+  docs/BUILD.md          单 TU 构建、跑测外壳、环境变量速查、跑测纪律

@@ -1,0 +1,21 @@
+NInfer-HIP
+==========
+
+This project is a derivative work of NInfer (https://github.com/Neroued/ninfer),
+which is licensed under the Apache License, Version 2.0.
+
+Modifications: substantial portions of the engine have been modified and/or
+rewritten to run on the AMD HIP / ROCm stack (RDNA4 / gfx1201), including the
+attention kernels, KV cache codecs, GGUF quantization bridge, speculative
+decoding (MTP) path and the memory planner. The per-file list of changes, with
+rollback points, is maintained in docs/PATCHLIST.md.
+
+Third-party components bundled under src/infer/third_party keep their own
+licenses (ggml-quants, cpp-httplib, llama-jinja, nlohmann/json, spdlog, utf8proc);
+see the LICENSE files in each subdirectory.
+
+The model weights are NOT included in this repository. The artifact referenced
+in the documentation (Qwen3.8-27B-GSQ-RCO-IQ3_S, WaveCut) is distributed by its
+own authors under their own terms.
+
+Copyright (c) 2026 the NInfer-HIP contributors.

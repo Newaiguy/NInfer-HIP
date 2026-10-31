@@ -1,0 +1,965 @@
+###ID ascii64k
+
+> 输入：原项目分析 `ARCH_ORIGINAL_PROJECT.md`、社区对标 `ARCH_COMMUNITY_BENCHMARK.md`、AMD 硬件研究 `ARCH_AMD_GFX12.md`、实测基线 `ARCH_REVIEW_BASELINE.md`。
+> 目标：decode @100k ≥30 t/s（生死线，no-MTP）+ prefill ≥1000 t/s。本文件是执行总纲，替代单点打补丁。
+
+---
+
+
+**decode 是带宽问题，prefill 是算力问题；两者的共性瓶颈都是"内核没把 DRAM/矩阵单元用满"，而不是缺投机、缺量化、缺特性。** 追 30 t/s 的主线 = 把 bandwidth 效率从 ~26-48% 修到 ≥67%（decode），把矩阵吞吐从 ~35 TFLOPS 校准到可验证的真值（prefill）。
+
+
+| 项 | 值 | 依据 |
+|---|---|---|
+| DRAM 带宽 | 614.8 GB/s（实测 95.5%）| 探针 |
+| 权重/步（t2 三元）| 7.2 GB | 2.125bit |
+| KV/步（bf16，16 FA 层 @100k）| 6.55 GB | 实测 |
+| 每步合计 | 13.75 GB → 22.4ms → **44.6 t/s 上限** | 物理 |
+| KV q8 后 | 10.48 GB → 58.8 t/s 上限 | +31% |
+| 30 t/s 所需效率 | 67%（bf16 KV）/ 51%（q8）| 物理 |
+| llama.cpp 同卡同模型 | **49.4 t/s no-MTP** | 本地实测，就是"可行"铁证 |
+| 矩阵峰值（官方）| FP16 195 / FP8 389 / INT8 389 TFLOPS | AMD 官方 |
+| 矩阵峰值（实测）| 35 TFLOPS（= 官方 18%，待校准）| 反量化+碎片开销 |
+| 社区 prefill | 1500+ t/s（vllm-radiance）/ 1000-1100（llama.cpp）| 调研 |
+
+
+- **attention 内核读 KV 效率 ~18-27%**（@100k 每步 ~60ms vs 理论 10.65ms）：head_dim 256×4kv 布局没吃满 cache line、int8 K 反量化 4× 冗余、split 组织
+- **三元 GEMV 效率 ~30-47%**（llama.cpp 80-100%）：R8W1 深加载 ILP 设计没搬全、ACO 冗余 wait
+- **launch/调度 ~5-10ms/步**：recurrent GDN 已 -46%，继续单内核化
+- 结论：2-4× 差距 = 三个环节都没把 DRAM 用满，非"多读字节"
+
+- **矩阵吞吐 35 vs 195 TFLOPS（官方 18%）**：反量化+碎片构建指令与 WMMA 周期同量级；decode N=1 时 tile 利用率 6%
+- **attention O(T²) 未 flash 化**：@100k prefill 的 attn 段 197→1163ms/chunk 暴涨
+- **GDN chunked launch 风暴**：recurrent 已 -46%
+- 结论：prefill 主战场 = 矩阵单元吞吐（需先校准）+ attention flash 化
+
+1. ~~**"gfx1201 无 int8/fp8 WMMA" 存疑**~~ ❌ **已实锤：硬件支持**。Clang 的 `iu8/fp8/bf8/iu4` gfx12 内置全编译+运行+数值 PASS（`bench_wmma_i8_fp8_gfx12.cu`）。`mma_s8=trap` = 移植层无 CUDA 语义，非硬件。→ int8-KV QK 可走原生 i8（QK MMA 减半）、三元 GEMM 可评估 INT8 中间格式。
+2. ~~**"35 TFLOPS = WMMA 峰值" 口径错**~~ ❌ **已实测：矩阵单元 163.6 TFLOPS（满占用纯 WMMA），流式 bf16（零反量化）39.2 ≈ 引擎 35**（`bench_bf16_gemm_calib.cu`）。墙 = 权重→碎片加载管线（宽位合并读 + LDS + 双 K 融合可解），不是矩阵单元、不是反量化。
+3. **gfx1201 无 cp.async**：软件流水 num_stages=2 上限，别学 CUDA 深流水。
+4. **decode 用 wave64 GEMV 而非 WMMA**：N=1 时 WMMA tile 只有 1/16 列有效。
+
+---
+
+
+**现状**：decode_t1_wmma（bf16 加宽版）@100k ~74ms/step attention，效率 ~18%。
+**目标**：≥70% 效率（~15ms），单项 11.8→~25 t/s。
+**设计**：
+1. 读 KV 布局对齐：4 kv head × head_dim 256 按 cache line（128B）满宽读；参考 llama.cpp fattn-vec / flash-decode
+2. **消除 int8 K 反量化 4× 冗余**：K tile 一次性反量化进 smem 共享（bf16 加宽），各 warp 复用——现在每个 warp 对同一 K 块重复反量化
+3. GQA 特化：24q/4kv 的 GroupSize=6，只算 6 行/head 有效（现状 warp0 干活，4× 浪费）
+4. 用拆分内存计数器 s_waitcnt loadcnt（非全量等待）做软件流水
+5. 权重读 streaming cache hint（th 位），不污染 L2/Infinity
+
+**现状**：int8 decode @92k 正常、@97k NaN（阈值定位中，bf16 无此问题）。KV 减半是 30 线的保险（67%→51% 所需效率）。
+**设计**：二分定位后修根因（怀疑 split 边界/smem 越界/量化误差累积三选一，用 rocprofv2 定位）。
+
+**现状**：三元 GEMV 30-47% 效率。
+**目标**：≥70%（-10ms/步）。
+**设计**：
+1. 照原项目 R8W1：每行一 warp、静态所有权、40-136 独立 16B 组加载在飞行（`t2_rowsplit_gemv.cuh:34-88` 注释是设计圣经）
+2. 照 llama.cpp mmq-config-rdna4：128/256 行 cache-line 对齐 tile + MMQ_ITER_K 主循环 + 2-bit 解码放 LDS→寄存器阶段
+3. **wave64 专编**：decode GEMV 用 wave64（gfx1201 上 DMMV wave64 实测更优），与 WMMA 内核分编译单元
+4. 用 rocprofv2 查 ACO 冗余 s_waitcnt（#21043 同款清单）
+
+写最小纯 bf16 WMMA GEMM（M=34816, N=512, K=5120，直接 bf16 输入不经反量化，wave32，覆盖 64 CU），rocprofv2 测真实时钟+指令：
+- 若 100+ TFLOPS → 矩阵单元没问题，瓶颈在反量化管线 → 按 GPUOpen wide-K 双 K 融合模板重做三元 GEMM
+- 若仍 ~35 → occupancy/时钟/launch 问题
+
+用 `__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12` 写最小探针，验证 i8 路径通不通：
+- 若通 → int8-KV QK 可走原生 i8 WMMA（不用 bf16 加宽，QK MMA 数减半）；三元 GEMM 可评估 INT8 中间格式
+- 若 trap 确认 → 维持 bf16 加宽，但记录结论为"移植层限制"而非"硬件不支持"
+
+mixer-attn O(T²) 是 @100k prefill 大坑（197→1163ms/chunk）。对齐 llama.cpp fattn-mma-f16 / WMMA FA。
+
+底数到 30 后才有意义（放大器）。修 v1.1 round bug。
+
+---
+
+1. **关 GPU ECC**：`amdgpu.ras_enable=0`，+~10% 带宽（推理可接受 bit-flip）
+2. **power state 用 profile_standard/auto，别用 peak**：peak 反而 -23%
+3. 确认 SMU/内核版本匹配（避免锁 2.2G 时钟）
+4. ASPM 对 GPU 内 DRAM 无影响，别折腾
+
+- WMMA 内核（wave32）与 GEMV 内核（wave64）**分编译单元**（LLVM 不能混 wave 大小）
+- 软件流水 num_stages=2 + VGPR 双缓冲 + s_waitcnt loadcnt
+- rocprofv2 --kernel-trace 拿 kernel ns；Navi 计数前设 profile_standard
+- gfx12 WMMA lane 映射文档缺口 → 参考 CK 源码 wmma_gemm.hpp（ROCm#6025）
+
+1. **P0-1 attn 满宽读**（decode 25 t/s 的保证，~2-3 天）
+2. **P2-2 int8/fp8 WMMA 复核**（半天，影响量化全局）
+3. **P2-1 校准探针**（半天，prefill 决策依据）
+4. **P0-2 int8 NaN 修复**（正确性，1 天）
+5. **P1 GEMV 对齐**（decode 30 线补全）
+6. P2-3 prefill attention flash 化（prefill 1000+ 的主要来源）
+7. P3 MTP（放大器）
+
+**预期账（P0+P1 完成后）**：attn 80%（15ms）+ GEMV 80%（14.6ms）+ launch 3ms ≈ 33ms/步 → **30+ t/s（bf16）**；叠 KV q8 → ~45 t/s。**生死线在 P0+P1 内可达，不需要投机。**
+
+- LUT / 双组循环 / 8 行 CTA 微优化（收益被带宽效率掩盖）
+- 用 TFLOPS 追 decode（decode 是带宽瓶颈，算力利用率 <2%）
+- 学 CUDA 深流水 cp.async（gfx1201 无此指令）
+- int8 decode 当前路径（反量化冗余未消除前是负收益）
+
+> 面向 CUDA→HIP 移植的本地 LLM 推理引擎（Ternary-Bonsai-2-27B，ROCm 7.2，HIP）
+> 编制日期：2026-10-07 | 依据：AMD 官方文档/博客为主，可信第三方技术文章为辅
+> 本机实测锚点：见 `ARCH_REVIEW_BASELINE.md`（DRAM 流式 614.8 GB/s = 95.5% 峰值；三元 GEMM 34–35 TFLOPS；decode @100k 11.76 t/s）
+
+---
+
+- [0. 三十秒结论](#0-三十秒结论)
+- [A. RDNA4 矩阵单元与 WMMA（最高优先级）](#a-rdna4-矩阵单元与-wmma最高优先级)
+  - [A.1 gfx1201 WMMA 指令集全景](#a1-gfx1201-wmma-指令集全景)
+  - [A.2 官方 195/389 TFLOPS 的口径定义，与 35 TFLOPS 差在哪（核心问题）](#a2-官方-195389-tflops-的口径定义与-35-tflops-差在哪核心问题)
+  - [A.3 FP8 WMMA 在 gfx1201](#a3-fp8-wmma-在-gfx1201)
+  - [A.4 WMMA vs MFMA（CDNA）架构差异](#a4-wmma-vs-mfmacdna架构差异)
+- [B. 内存系统与带宽](#b-内存系统与带宽)
+  - [B.1 L2/L0/Infinity Cache 容量与带宽](#b1-l2l0infinity-cache-容量与带宽)
+  - [B.2 全局读如何打满 DRAM：GEMV 隐藏延迟与 cache hint](#b2-全局读如何打满-dramgemv-隐藏延迟与-cache-hint)
+  - [B.3 cp.async 在 gfx12 的等价物](#b3-cpasync-在-gfx12-的等价物)
+  - [B.4 LDS 容量/带宽/冲突](#b4-lds-容量带宽冲突)
+  - [B.5 ASPM / 电源管理对 DRAM 带宽的影响](#b5-aspm--电源管理对-dram-带宽的影响)
+- [C. 编程模型与工具](#c-编程模型与工具)
+  - [C.1 hipcc 编译 gfx1201 要点](#c1-hipcc-编译-gfx1201-要点)
+  - [C.2 rocprofv2 拿 kernel 级 GPU 时间](#c2-rocprofv2-拿-kernel-级-gpu-时间)
+  - [C.3 AMD 官方 assembly/intrinsic 文档](#c3-amd-官方-assemblyintrinsic-文档)
+- [D. 社区 RDNA4 内核参考](#d-社区-rdna4-内核参考)
+  - [D.1 llama.cpp mmq-config-rdna4.cuh](#d1-llamacpp-mmq-config-rdna4cuh)
+  - [D.2 llama.cpp WMMA FlashAttention](#d2-llamacpp-wmma-flashattention)
+  - [D.3 Triton 在 gfx1201 的 WMMA 自动生成（vLLM 用）](#d3-triton-在-gfx1201-的-wmma-自动生成vllm-用)
+  - [D.4 线程/块调度新特性](#d4-线程块调度新特性)
+- [E. 给 NInfer 移植的落地建议汇总](#e-给-ninfer-移植的落地建议汇总)
+
+---
+
+
+| 问题 | 结论 |
+|---|---|
+| 官方 195/389 TFLOPS 怎么算的 | **FP16 195 = 64 CU × 1024 FLOPs/clk/CU（每 CU 每时钟 1024 次 FP16 FMA 计数）× 2.97 GHz 升频**。FP8/INT8 389 = 2048 FLOPs/clk/CU × 2.97 GHz。**纯矩阵单元在输入已就位于 VGPR、无停顿、顶频**下的理论峰值。来源：AMD 产品页 + GPUOpen + TechPowerUp 拆解三重验证。 |
+| 我们的 35 vs 195 差 5.6× 在哪 | ①三元权重是 **2-bit 编码**，WMMA 输入必须是 bf16 矩阵 → 每次都要**先反量化再喂矩阵单元**，吞吐按 bf16 矩阵吞吐（峰值也仅 195）算，而 decode 阶段 N=1、prefill GEMM tile 小、寄存器内碎片布局开销吃掉大量周期；②**真实瓶颈是内存带宽与反量化/碎片构建指令，不是矩阵单元**。35 TFLOPS ≠ 矩阵单元只到 18%，而是"有效 FLOPs 口径"下被内存+解码指令限制的水平。可能需要一条专用 fp16 权重换算路径才能逼近矩阵峰值。详见 [A.2](#a2-官方-195389-tflops-的口径定义与-35-tflops-差在哪核心问题)。 |
+| decode @100k ≥30 t/s 可达性 | 物理上限 ~44.6 t/s（7.2G 权重 + 6.55G KV(bf16)/step ÷ 615 GB/s）。**要达到 30 t/s 需要 67% 带宽效率**，本机 DRAM 流式已达 95.5%，所以注意力与 GEMV 内核的"每字节搬运效率"是关键（llama.cpp RDNA4 特化 Q4 内核可到 ~78%）。 |
+| FP8 WMMA | gfx1201 **有**（`__builtin_amdgcn_wmma_i32_16x16x16_fp8_fp8_w32_gfx12` / `bf8`，Clang 官方内置），Triton 可对 gfx1201 自动生成 `v_wmma_f32_16x16x16_fp8_fp8`，vLLM 社区已在 R9700 上跑通 FP8。**✅ 已实锤（B20 探针）**：iu8/fp8/bf8/iu4 四种 gfx12 WMMA 内置在 gfx1201 编译+运行+数值全 PASS；`mma_s8 = trap` 是移植层无 CUDA 语义映射，**不是硬件不支持**。实现要点：neg 标志=符号开关且必须编译期常量；i8 lane 布局与 bf16 实测布局一致。探针 `probe_rebuilt\bench_wmma_i8_fp8_gfx12.cu`。 |
+| cp.async 等价物 | **gfx1201 无 LDS-DMA / cp.async**（GFX9 有 1/2/4B load-to-LDS，gfx1250 才有 8/32/64/128-bit LDS DMA；gfx1201 两者都不是）。流水线只能靠**普通全局 load 提前发射 + s_waitcnt loadcnt 显式等待**（RDNA4 拆分计数器），软件流水深度上限低，`num_stages>2` 无收益（vLLM 实测）。 |
+| ASPM / 电源 | 官方与社区一致：RDNA4 上 `power_dpm_force_performance_level=peak` 反而因功耗墙**掉内存有界负载 ~23%**；GECC（GPU ECC）默认开，关掉白拿 ~10% 带宽/9% tok/s；SMU 固件版本不对会锁 ~2.2 GHz。 |
+| 线程/块新特性 | gfx1201 **没有** thread-block-cluster / 分布式共享内存（cluster 内置是 **gfx1250-insts**）；gfx1201 有的是拆分屏障 `s_barrier_signal/wait`、拆分内存计数器 `loadcnt/kmcnt/dscnt`、乱序内存访问。 |
+
+---
+
+
+
+**结论：gfx1201（RDNA4）的 WMMA 以 wave32 粒度工作，原生支持 16×16×16 tile，输入型别覆盖 FP16 / BF16 / I8(IU8) / I4(IU4) / FP8(E4M3) / BF8(E5M2)，累加器 FP32 / I32 / FP16 / BF16。**
+
+官方（AMD GPUOpen「Using the Matrix Cores of AMD RDNA 4 architecture GPUs」）：
+
+> RDNA4 有第三代 Matrix Cores。WMMA intrinsic 带 `_gfx12` 后缀（gfx11 没有）。A、B、C、D 矩阵格式与 gfx11 不同（**VGPR 布局改了**），必须用新的 gfx12 intrinsic。
+> 官方表：FP16→FP32/FP16 **1024 FLOPs/clk/CU**，BF16→FP32/BF16 **1024**，I8→I32 **2048 ops/clk/CU**。
+> — https://gpuopen.com/learn/using_matrix_core_amd_rdna4
+
+Clang 官方 AMDGPU Builtins（https://clang.llvm.org/docs/AMDGPUBuiltinReference.html，搜索 `wmma`）与 BuiltinsAMDGPU.def（https://codebrowser.dev/llvm/clang/include/clang/Basic/BuiltinsAMDGPU.def.html）列出 gfx12 WMMA 内置的完整签名，例如：
+
+| 内置 | 原型 | Target 约束 |
+|---|---|---|
+| `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` | `V8f V2i V2i V8f` | `gfx12-insts,wavefrontsize32` |
+| `__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12` | 同 | 同 |
+| `__builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12` | `V8f V2i V2i V8f` | 同 |
+| `__builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12` | `V8f V2i V2i V8f` | 同 |
+| `__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12` | `V8i Ibi Ibi V8i` | 同 |
+| `__builtin_amdgcn_wmma_i32_16x16x16_iu4_w32_gfx12` | `V8iIbiIbiV8iIb` | 同 |
+| `__builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12`（FP16→FP16） | — | 同 |
+
+- **wave32 是硬约束**：所有 gfx12 WMMA 内置都要求 `wavefrontsize32`。编译时用 `-mno-wavefrontsize64`（或 `__builtin_amdgcn_wmma_*` 自动推导 wave32 特性）。（Clang Builtins；本机构建脚本也已加 `-mno-wavefrontsize64`）
+- **吞吐**：FP16/BF16 每条 wave32-WMMA 16×16×16 = 16×16×16×2 = **8192 FLOPs**，per-CU 每时钟 1024 FLOPs → 该指令占 SIMD 约 **8 周期吞吐**（8192/1024）；I8 2048 ops/clk/CU 同理。第三方参考（zolotukhin.ai 表格）：`WMMA FP16 16×16×16` 标 "1/32 clk (1024 FMAs)"（即吞吐 32 clk 一条、每时钟 1024 FMA），`WMMA I8` 2048 ops，与官方一致。（https://zolotukhin.ai/zinc/docs/amd-gpu-reference）
+- **每 fragment VGPR 数（wave32）**：FP16/BF16 A/B 各 8 VGPR（每线程 8 个 16-bit 元素）、C/D 8 VGPR；I8 A/B 各 4、C/D 8；I4 A/B 各 2、C/D 8。（同上 zolotukhin 表）→ 一个纯 WMMA 内核 24 VGPR/fragment，≤96 VGPR 可保持 16 wave/SIMD 满占用。
+- **矩阵布局（gfx12，比 gfx11 简化）**：A 列主序、B 行主序、C/D 行主序；**每线程持 8 个连续元素，32 线程 × 8 = 256 元素 = 16×16**；**gfx12 不再需要 gfx11 的 lane 0–15 复制到 16–31 的 shuffle**。（GPUOpen part2 + zolotukhin）
+- **一个坑（官方文档缺口）**：gfx12 WMMA 的**输出 lane→元素映射**没写进 ISA/GPUOpen 文档，社区要扒 CK 源码才确定：`v_wmma_f32_16x16x16_f16` 在 gfx12 是**按列分布**（lane i 持列 i%16、行 (i/16)*8..+7）。写内核前必须先按此布局验证加载/存储。（https://github.com/ROCm/ROCm/issues/6025）
+- **LLVM 调度视角**：gfx12 WMMA 是四条 pass（16-cycle latency，LLVM 按 four-pass 调度）——见 GFX1251（RDNA5）分析里对同族 WMMA 调度的描述；gfx1201 本身的精确每指令延迟建议用 AMD 官方 `amd_matrix_instruction_calculator` 生成（该工具给每条矩阵指令的 FLOPs、execution cycles、FLOPs/CU/cycle、VGPR 占用）。（https://chipsandcheese.com/p/llvm-divination-of-gfx1251s-differences ；https://github.com/ROCm/amd_matrix_instruction_calculator）
+
+**实体布局**：Navi 48 = 4 Shader Engine，每 SE 16 CU × 2（DCU 双 CU），共 64 CU / 4096 SP / **128 个"AI Accelerators"（每 CU 2 个矩阵单元）**；每 DCU 4 个 Matrix Acceleration Engines（= 每 CU 2 个）。来源：HotHardware 深潜 + wccftech（64 CU、64 RA、128 Matrix Acc）https://hothardware.com/reviews/amd-rdna-4-architecture-deep-dive ；https://wccftech.com/amd-rdna-4-architecture-deep-dive-new-compute-units-raytracing-cores-ai-enhancements-path-tracing
+
+
+**官方口径（推荐全部引用）：**
+
+1. **AMD 官方产品页**（"Peak Half Precision (FP16 Matrix) Performance: 195 TFLOPs / FP8 Matrix: 389 TFLOPs / INT8 Matrix: 389 TOPS / FP16 Matrix with Structured Sparsity: 389 / FP8 with Sparsity: 779"）：
+   https://www.amd.com/en/products/graphics/desktops/radeon/9000-series/amd-radeon-rx-9070xt.html
+2. **GPUOpen 官方表**（FLOPS/clk/CU：RDNA2→RDNA3→RDNA4 = FP16 256→512→1024，BF16 N/A→512→1024，I8 512→512→**2048**）：
+   https://gpuopen.com/learn/using_matrix_core_amd_rdna4
+3. **TechPowerUp 数值拆解**（194.6 FP16 TFLOPS、389.3 FP8/INT8 TFLOPS / 389.3 TOPS，列成 1:1 关系）：
+   https://www.techpowerup.com/gpu-specs/radeon-rx-9070-xt.c4229 、 https://www.techpowerup.com/review/amd-radeon-rx-9070-series-technical-deep-dive/3.html
+4. **公式证明**（Reddit LocalLLaMA 帖子，与官方产品页一致）：
+   `64 CU × 1024 FP16 ops/cycle/CU × 2.97 GHz = 194.6 TFLOPS`（含 4:2 结构化稀疏翻倍 → 389）
+   https://www.reddit.com/r/LocalLLaMA/comments/1j088yg/rx_9070_xt_potential_performance_discussion
+
+**所以：195 = 峰值时钟(2.97 GHz boost) × 每 CU 每时钟矩阵单元 FP16 FMA 计数(1024) × CU 数(64)。这是"矩阵核心满发射、输入已在 VGPR、无访存停顿、1.0 效率"的理论值。**
+
+**我们的 35 TFLOPS（= 195 的 18%）差在哪——逐项拆解：**
+
+本机基线里 "35.4 TFLOPS = WMMA2 峰值"，且 `bench_t2_wmma_gemm.cu` 还是**未完成的存根**（注释自述 "this probe is a work-in-progress scaffold; full A-fragment/B-fragment + mma_bf16 chain lands next edit"，且 fragment 布局用的是 **NVIDIA m16n8k16 布局注释**，没有真正调用 gfx12 WMMA intrinsic）。`bench_fma_density.cu` 则是 **纯 FP32 FMA 流探针**（不是矩阵指令）。因此 35 TFLOPS 更可能来自主工程 MLP GEMM 计时（每 chunk 1072ms / 64 层）按 `2·M·N·K/S` 反推，而非矩阵单元饱和测量。差异来源：
+
+1. **数据格式错配（最主要）**：官方 195 假设输入是**原生 bf16/fp16 矩阵**躺在寄存器里。我们的权重是 **2-bit 三元编码（7.2 GB，2.125 bit/值）**。WMMA 的 A/B 输入必须是 bf16 矩阵，所以每一轮 K 循环都要：
+   - 读 2-bit 编码字节（内存）；
+   - **位拆解 + 查表/算术反量化到 bf16（VALU 开销）**；
+   - 组装成 gfx12 A-fragment 的 lane 布局（每线程 8 连续元素，K-major）；
+   - 才能发一条 WMMA。
+   反量化与碎片组装的指令数（decode 每个 2-bit 值至少 2–3 条整数/移位/转换指令）**可与 WMMA 的计算周期同数量级甚至更高** → 有效矩阵吞吐远低于 195。GPUOpen part 2 明确说：**FP8/INT8 每个线程只持 8 个 8-bit 元素 = 64-bit 载荷，打不满 128-bit 内存口，必须双 K 融合才到峰值**；2-bit 的更极端（每线程 8 元素只有 16-bit 载荷）。
+2. **decode 阶段形状（N=1，GEMV）**：单 token 时 M=34816、N=1，WMMA 的 16×16 tile 只有一列有用 → 矩阵单元利用率 ≈ N/16 = 6%；这是**内存带宽受限**问题，不是矩阵吞吐问题。物理上限 ~44.6 t/s（见上）。decode 阶段根本不该用 GEMM 矩阵内核（社区一致：decode 用 wave64 DMMV/GEMV 专用内核，见 zolotukhin 与 llama.cpp）。
+3. **prefill 阶段形状**：M=34816, N=batch（通常 ≤64）, K=5120。N 小 → tile 利用率低；且每 K 步要反量化。即使假设反量化免费，**纯 bf16 GEMM 理论也只有 195 TFLOPS，而内存只喂得动 7.2GB×2（读权重+写激活）/step**——prefill 大 batch 时（如 B=1024）flops/byte = 2·B·K/B/(2.125/8) ≈ 3850 FLOPs/byte，195 TFLOPS 需要 51 GB/s 只读——远小于 615 GB/s，**所以 prefill 大 batch 时理论上是矩阵吞吐受限、可达接近 195 的**。35/195 = 18% 说明离"矩阵受限"还差得远，反量化+碎片构建+调度开销是主因。
+4. **时钟**：官方 2.97 GHz 是峰值 boost。实测 kernel 时钟受功耗墙/SMU 固件影响，典型 ~2.2–2.4 GHz（zolotukhin：SMU 接口版本不对会锁 ~2200 MHz；`RADV_PROFILE_PSTATE=peak` 反而 -23%）。按 2.4 GHz 算峰值只有 ~157，但这也只是 20% 的差异，不是 5.6× 的主因。
+5. **未用满全部 CU**：128 矩阵单元 vs 实际 launch 配置。64 CU 需 ≥64 CTA 且每 CU 多 wave 才能全占用。本机 prefill MLP 若 CTA 划分/occupancy 不足，直接掉吞吐。
+
+**结论（✅ 2026-10-07 B20 探针已实测验证）**：**35 vs 195 主要是"输入搬运/碎片构建路径"的口径差，矩阵单元本身健康。** 纯 bf16 WMMA 校准探针 `probe_rebuilt\bench_bf16_gemm_calib.cu` 实测：
+- **Mode A**（128 线程×2048 CTA 满占用，A/B 碎片寄存器常驻、K=5120 全循环，零内存）：**163.6 TFLOPS** = 官方 195 按实际时钟（~2.5GHz vs 峰值 2.97）折算的上限 → **5.6× 差距不是矩阵单元**
+- **Mode B**（同尺寸 M=34816 N=512 K=5120 流式 bf16 GEMM，每 k-step 从全局 bf16 数组逐 lane 加载碎片，**零反量化**）：**39.2 TFLOPS** ≈ 引擎三元 35 → **反量化不是主因；逐 lane 跨行 16B 非合并读 + 打包指令把吞吐拉下 4×**
+- 结论修正：① 35 TFLOPS 不是"WMMA2 峰值"，是"朴素加载路径峰值"；② prefill 提速的抓手 = GPUOpen wide-K 双 K 融合（128-bit 宽位合并读 + LDS 暂存 + 一次双 K 反量化），目标 60-100+ TFLOPS；③ 引擎三元在 Mode B 同款加载下已近饱和（35/39），**改加载路径才动得了 prefill**。
+
+
+**结论：gfx1201 原生支持 FP8/BF8 WMMA（E4M3/E5M2，同 INT8 吞吐 2048 ops/clk/CU）。**
+
+- **指令/内置存在**：`__builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12` 与 `bf8_bf8` 变体在 Clang 官方内置表（`gfx12-insts,wavefrontsize32`）。
+  https://clang.llvm.org/docs/AMDGPUBuiltinReference.html ；https://codebrowser.dev/llvm/clang/include/clang/Basic/BuiltinsAMDGPU.def.html
+- **硬件能力**：LLVM 对 RDNA4 支持 FP8/BF8 的 WMMA 指令，I8/BF8/FP8 同吞吐（2048 ops/clk/CU）（Chips and Cheese「Examining AMD's RDNA 4 Changes in LLVM」明确写了"RDNA4 adds instructions to support 8-bit floating point formats"；GPUOpen 官方表 I8=2048）。
+  https://chipsandcheese.com/p/examining-amds-rdna-4-changes-in-llvm ；https://gpuopen.com/learn/using_matrix_core_amd_rdna4
+- **社区验证（vLLM/Triton）**：vLLM 在 gfx1201 上跑 FP8 模型（Qwen3-30B / GPT-OSS-20B on R9700）走的路径是 **Triton 自动把 `tl.dot` FP8 编成 `v_wmma_f32_16x16x16_fp8_fp8`**（无需 AITER C++ 内核，需 `VLLM_ROCM_USE_AITER=0`）。社区给出的 RDNA4 Triton 调参：BLOCK_M/N/K=32/64、num_warps=4、matrix_instr_nonkdim=16（RDNA4 固定）、kpack=1、num_stages=2。
+  https://discuss.vllm.ai/t/native-fp8-wmma-support-for-amd-rdna4-rx-9070-xt-r9700-in-vllm/1900 ；https://github.com/vllm-project/vllm/issues/28649
+- **fp16→fp8 数据布局警告**：FP8 每线程 8 元素 = 64-bit 载荷，**默认打不满 128-bit 内存带宽**，官方建议双 K 融合（一次取 16 个 fp8 = 128-bit）。这才是 FP8 GEMM 跑到峰值带宽的正确姿势；社区（Triton/vLLM）实测也应遵循。
+  https://gpuopen.com/learn/wmma-guide-amd-rdna-4-gpus-part-2
+
+> ⚠️ 对本工程：基线里 "gfx1201 无 int8/fp8 WMMA（mma_s8 = trap）" 需要复核。更可能的原因是：源码里用 CUDA 语义 `mma.sync`/`wmma` 或自封的 `mma_s8` 宏，在 HIP/clang 下没有对应内置 → 编译期 trap，而不是硬件不支持。**既然有 `__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12`，int8/fp8 路径在 gfx1201 是通的**，问题只在移植层。
+
+
+权威对比（Stream HPC「RDNA and CDNA: Similarities and Differences」）：https://streamhpc.com/blog/2026-06-24/rdna-and-cdna-similarities-and-differences/
+另有 AMD 官方 Lab Notes 页面讲 MFMA per-wavefront 分布：https://gpuopen.com/learn/amd-lab-notes/amd-lab-notes-matrix-cores-readme
+
+| 维度 | RDNA（WMMA） | CDNA（MFMA） |
+|---|---|---|
+| Wavefront | **SIMD32**，wave32 为主（gfx12 WMMA 强制 wave32）；指令 1 周期/条 | **SIMD16×4**，wave64；指令 4 周期/条（staggered） |
+| 矩阵指令 | `v_wmma_*`（16×16×16 tile，每线程 8 元素） | `v_mfma_*`（大 K 变体如 16×16×256，K 越大越省 VGPR/加载） |
+| 累加器 | 通用 VGPR（可被普通 vector 指令读写/复用） | **AccVGPR**（专用累加寄存器，MFMA 专用；RDNA 无此概念） |
+| 设计取向 | 面向游戏/低延迟，矩阵单元密度低（gfx1201 每 CU 2 个），优先 1% low | 面向 AI/HPC，每 CU 4 个 Matrix Core 单元 + 超大 K MFMA，喂数据优先 |
+| 吞吐 | gfx1201 FP16 1024 FLOPs/clk/CU；I8/FP8 2048 ops/clk/CU | CDNA3 (MI300) FP16 4096+ FLOPs/clk/CU（FP64 512 等，见 MICC 论文公式 8mnk/c per CU with 4 matrix cores） |
+| 寄存器布局 | 简单（无跨 lane shuffle，gfx12） | 复杂但 K 大时高效（每线程持大片连续元素） |
+
+**为什么 RDNA4 矩阵吞吐低于 CDNA**（直接回答）：① RDNA4 每个 CU 只有 2 个矩阵单元（128 个 / 64 CU），CDNA 每 CU 4 个 Matrix Core（OSTI/MICC 论文对 CDNA 明确 "a CU (with four Matrix Core units)"，公式 `FLOPS/CU/cycle = 8mnk/c`）；② RDNA 走 wave32+SIMD32 + 1 clk/指令，为游戏延迟优化，代价是每周期可发射的矩阵 MAC 数少于 CDNA 的 4×SIMD16 流水深度；③ RDNA 是消费级面积/TDP 预算（304W vs MI300 750W），矩阵单元面积让位给光栅/着色器，所以"每 W 矩阵吞吐"差距巨大。来源：
+- https://www.osti.gov/servlets/purl/2345982 （MICC：Characterizing MFMA, per-CU 4 Matrix Core, FLOPS/CU/cycle）
+- https://salykova.github.io/matrix-cores-cdna （CDNA3 MFMA 指令延迟/吞吐表与 intrinsic 语法）
+- https://github.com/ROCm/amd_matrix_instruction_calculator （官方工具，可自己生成每条指令的 FLOPs/CU/cycle）
+
+---
+
+
+
+gfx1201 / Navi 48 官方与可信第三方数据（zolotukhin.ai 参考页 + Chips and Cheese + AMD 产品页）：
+
+| 层级 | 容量 | 行/带宽 | 延迟（参考） |
+|---|---|---|---|
+| L0 Vector Cache | 32 KB / CU（替代 RDNA3 的 L1） | 64 B/clk/CU 读；64 B line | ~30 clk |
+| L0 Scalar Cache | 16 KB / CU | — | ~30 clk |
+| L2 | **8 MB**（Navi 48） | **每 slice 带宽 = RDNA3 的 2×**；128 B line | ~100 clk |
+| Infinity Cache | **64 MB**（3rd Gen, 作为 L2 与 VRAM 之间的 victim/LLC） | 64 B line | ~150 clk |
+| GDDR6 | 640 GB/s（256-bit @20 Gbps） | 64 B line | ~300+ clk |
+
+来源：
+- https://www.amd.com/en/products/graphics/desktops/radeon/9000-series/amd-radeon-rx-9070xt.html （缓存/带宽规格）
+- https://zolotukhin.ai/zinc/docs/amd-gpu-reference （L0/L2/Infinity 容量、行大小、逐层带宽延迟表；"L2: doubled bandwidth per slice vs RDNA3"）
+- https://chipsandcheese.com/p/amds-rdna4-architecture-video （"RDNA4 doubled the number of banks per L2 slice"：银行数翻倍 = 每 slice 带宽翻倍）
+
+**对 LLM 的意义**：64 MB Infinity Cache 能装下小 context（几路 4K）的 KV 页，做"放大器"；8 MB L2 对 7.2 GB 权重只是流式缓冲（命中率≈容量/权重≈0.1%），**所以 GEMV/decode 的 DRAM 带宽就是天花板，L2/Infinity 只是峰值吸收器**。
+
+
+**探针现状**：本机流式读 614.8 GB/s = 95.5% 峰值，说明**只要访问模式线性 + 足够多并发 wave，RDNA4 的 GDDR6 侧很容易打满**（zolotukhin 参考也报 Navi48 大型 DMMV 普遍 67–93% 利用率）。
+
+**GEMV 隐藏延迟的量化建议（wave64 更优）**：
+- decode（GEMV/matmul-vec）：**wave64 在该负载上实测优于 wave32**（zolotukhin：decode 专用 DMMV 用 wave64 最优，wave32 无改善）。这与"用 WMMA 打 decode"的直觉相反——GEMV N=1 不用矩阵单元。
+- **每 SIMD 同时多少 wave**：RDNA4 每 SIMD 16 wave 槽（VGPR≤96 时 16 wave/SIMD；97–128 → 12；129–192 → 8；193–256 → 6）。DRAM 延迟 ~300+ clk，要隐藏它需要**足够的 outstanding loads**：经验上每 SIMD ≥ 8 wave × 每个 wave 多发宽位 load（GLOBAL_LOAD_DWORDX4 / 128-bit）即可近饱和（llama.cpp RDNA4 特化内核即 16B 载荷/线程 + 多 wave）。
+- **cache hint（cg/ca/streaming 的 AMD 等价）**：RDNA4 把缓存策略改成 **4 个位**：`th[0:2]`（temporal hint：streaming/normal/high-temporal）+ `scope[3:4]`（gpu/SE/system）。**流式权重读用 `th=streaming`（非临时）**：命中时留在缓存但**不更新 LRU**，避免权重把 KV/激活挤出 L2/Infinity；prefetch 权重则用 high-temporal 标记复用。HIP 侧普通 `__restrict__ const` 读默认会被编成合理策略；要显式控制走 `__builtin_amdgcn_s_buffer_load_*(..., aux)` 的 `aux` 字段（GFX12 `aux[0:2]=th, [3:4]=scope`）或 Clang 的 AV load/store 内置。（Chips and Cheese LLVM 文 + Clang Builtins 的 aux 编码说明）https://chipsandcheese.com/p/examining-amds-rdna-4-changes-in-llvm ；https://clang.llvm.org/docs/AMDGPUBuiltinReference.html
+- **GEMV 实际效率**：llama.cpp Q5_K_M 在此 die 达 ~78% 带宽；社区 RDNA4 特化内核（mmq-config-rdna4 等，见 D.1）就是冲着"每字节搬运效率"去的。
+- **wave64 的 `-mno-wavefrontsize64` 注意**：如果内核用 `__builtin_amdgcn_wmma_*`（强制 wave32），则 decode 用的 DMMV 内核不要放同一文件同一次编译；把 GEMV 单独编 `-mwavefrontsize64`，或者干脆 HIP 里 split 文件编译（llama.cpp 就是按内核分文件伺候 wave size）。
+
+
+**结论：gfx1201 没有真正意义的 cp.async / LDS-DMA。** 依据 LLVM AMDGPU 文档的 DMA 支持矩阵：
+- GFX9：`llvm.amdgcn.load[.async].to.lds`，1/2/4 字节（gfx950 才有 12/16B）——老 GCN 风格。
+- **GFX1250（RDNA5）**：`global.load.async.to.lds.b{8,32,64,128}` + `global.store.async.from.lds.b*` + tensor DMA（`tensor.load.to.lds`）——**才是 cp.async 级别的能力**。
+- **gfx1201 不属于这两者**（gfx12 在 LLVM 表里只有 GFX9 与 GFX1250 两档 DMA）→ 无异步 DMA 指令。
+  https://llvm.org/docs/AMDGPUDMAOperations.html
+
+**gfx1201 的"异步搬运"替代方案**：
+1. **普通 global→VGPR load 提前发射 + `s_waitcnt loadcnt` 显式等待**：RDNA4 把内存计数器拆成 `loadcnt`（global load）/`kmcnt`（scalar mem）/`dscnt`（LDS/GDS），可以只等上一批 load 而不阻塞别的；**配合 VGPR 双缓冲即可做软件流水**（vLLM issue #45929 明确：RDNA4 无 cp.async 式异步拷贝，`num_stages>2` 只增 IR 不增吞吐，必须 `num_stages=2`）。
+   https://github.com/vllm-project/vllm/issues/45929
+2. **Vulkan 侧 RADV 的 `coop_matrix` + 普通 buffer 读**也在用同一机制（没有 LDS DMA）。
+3. **工程上的正确造型**：decode/GEMV 这类带宽有界负载**根本不需要 LDS 缓冲**（直接 global load → 寄存器 → FMA），这也是 llama.cpp RDNA4 特化内核（D.1）的组织方式；只有 prefill GEMM 用 LDS tile，此时用 `num_stages=2` + 寄存器双缓冲即可，别学 CUDA 的深流水。
+
+
+| 属性 | 值 | 来源 |
+|---|---|---|
+| 容量 | **64 KB/CU（CU 模式）；128 KB/WGP（2 CU 共享）** | zolotukhin（ROCm 硬件表交叉核对） |
+| 带宽 | ~64 B/clk/CU（双发可） | zolotukhin 表 |
+| Bank | **32 banks × 4 B** | zolotukhin；需注意 wave32 下 32 线程访问 32 bank 的冲突规则 |
+| 无冲突延迟 | ~2 clk；广播（同地址）免费 | zolotukhin |
+| 冲突代价 | N-way 冲突 → N× 延迟；列访问要 padding（+1 元素/行） | zolotukhin；RDNA 性能指南 |
+| 占用联动 | 每 workgroup 用 32 KB → 每 CU 2 workgroup；用 16 KB → 4。**要保占用就 ≤16 KB/workgroup** | zolotukhin |
+
+- 官方 RDNA 性能指南（含 LDS/barrier/occupancy 一般性指导）：https://gpuopen.com/learn/rdna-performance-guide/
+- **gfx1201 LDS 冲突规则**与其他 RDNA 一致：bank = (addr/4) % 32；wave32 里 32 线程若访问 32 个不同 bank 一次完成，同 bank 串行。GEMV 的归约/残差写 LDS 时注意对齐 128B 避免多 wave 踩同 bank。
+
+
+- **社区"ASPM 修复白拿 20%+ 带宽"**：ASPM（PCIe Active State Power Mgmt）是关于 **PCIe 链路**的省电，对"GPU 内部 DRAM 带宽"没有直接影响；影响的是 **CPU↔GPU 拷贝**（模型加载/权重换入换出）。z8.re「The Curse of ASPM」是系统级功耗/调度的知名博客，讲的是 L1 ASPM 对整机 27W 的影响，不是 GPU DRAM 带宽。**结论：decode/prefill 是 GPU 内部访存，ASPM 开关影响极小；对 host→device 权重流有影响。**
+  https://z8.re/blog/aspm.html ；https://wireless.docs.kernel.org/en/latest/en/users/documentation/aspm.html
+- **真正影响 RDNA4 内存有界负载的是这两项**（有实测）：
+  1. **power state 别开 peak**：`RADV_PROFILE_PSTATE=peak` 强制最高时钟会因功耗墙导致**内存有界负载 -23% 回归**（zolotukhin 实测；标准态反而更好）；ROCm 官方 rocprof 文档也要求 Navi3x 计数器采集用 `profile_standard`。
+     https://zolotukhin.ai/zinc/docs/amd-gpu-reference ；https://rocm.docs.amd.com/projects/rocprofiler/en/latest/how-to/rocprofv2-usage.html
+  2. **GPU ECC 默认开，吃掉 ~10% 带宽**：RDNA4 默认启用 GECC；用 `amdgpu.ras_enable=0` 关掉实测 Qwen3.6-35B Q4_K 从 101→110 tok/s（+9%）。**推理可接受 bit-flip 的话建议关。**
+     https://zolotukhin.ai/zinc/docs/amd-gpu-reference
+  3. **SMU 固件/内核版本**：内核 6.17 的 SMU 接口 v0x2e 与 RDNA4 期望的 v0x32 不匹配会把时钟钉在 ~2.2 GHz；等内核/固件更新或回退版本。同上来源。
+
+---
+
+
+
+- **目标**：`hipcc --offload-arch=gfx1201`（本机已验证）。初次支持见 Phoronix：https://www.phoronix.com/news/AMD-LLVM-RDNA4-GFX1200 ；ROCm 编译器参考：https://rocm.docs.amd.com/en/docs-6.1.0/reference/rocmcc.html
+- **wave 大小**：`-mwavefrontsize64` / `-mno-wavefrontsize64` 用于 RDNA 架构设置 wavefront 32/64（ROCm compiler reference 明确列出）。**WMMA 内核必须 wave32**（intrinsic target 要求 `wavefrontsize32`）；**decode GEMV 建议 wave64**。**两者不能共存于同一个内核**，实践上按内核分文件/分编译单元处理（llama.cpp 做法）。本机构建已用 `-mno-wavefrontsize64`（= wave32）——注意这意味着**所有 decode GEMV 内核也是 wave32**，若想 wave64 要分开编。
+- **intrinsic 直接可用**：Clang 的 `__builtin_amdgcn_*`（WMMA、buffer load、av_load/store、cluster 等）在 HIP 里直接用，不需要 ASM。规则见 https://clang.llvm.org/docs/AMDGPUBuiltinReference.html 。
+- **inline asm**：需要时用 `asm volatile("v_wmma_f32_16x16x16_bf16 v[%0], v[%1], v[%2], v[%3]" ...)` 语法参照 RDNA4 ISA 参考（PDF）：https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna4-instruction-set-architecture.pdf
+- **机器可读 ISA**（生成指令表的官方工具 + XML 规范）：GPUOpen Machine-Readable ISA https://gpuopen.com/machine-readable-isa/ + GitHub `GPUOpen-Tools/isa_spec_manager`；`amd_matrix_instruction_calculator` 可算每条 WFMA/MFMA 的 FLOPs/cycles/regs：https://github.com/ROCm/amd_matrix_instruction_calculator
+- **注意**：gfx1201 的 WMMA 输出 lane 映射文档缺口 → 参考 CK 源码 `wmma_gemm.hpp` 的 ASCII 图（ROCm issue https://github.com/ROCm/ROCm/issues/6025）。
+- **wave64 注意**：`-mno-wavefrontsize64` 会全局关成 wave32；`__builtin_amdgcn_*`（如 wmma）自带 target 约束会自动要求 wave32 特性，若冲突会报 "feature wavefrontsize32 required"。
+
+
+官方文档（ROCm Core SDK 10 的 ROCProfiler 2.0）：https://rocm.docs.amd.com/projects/rocprofiler/en/latest/how-to/rocprofv2-usage.html
+
+- 最简单：`rocprofv2 --kernel-trace <app>` → 每个 kernel 的 `Start_Timestamp`/`End_Timestamp`（**ns**）、GRD/WGR/LDS/Arch_VGPR/Wave_Size 等。
+- 加计数器：`rocprofv2 --list-counters` 看 gfx1201 可用计数器（如 `SQ_WAVES`、`SQ_INSTS_VALU`、`FETCH_SIZE`、`WRITE_SIZE`），写进 `-i input.txt`（`pmc:` 行），`-n/--no-serialization` 避免 kernel 序列化改变时序。
+- **Navi 计数器注意**：官方明确要求 Navi3x 计数采集前设 `power_dpm_force_performance_level=profile_standard`，否则时钟波动让数据不可信；`auto` 用于非计数 profiling。**RDNA4 同理**（wattman/功耗墙行为见 B.5）。
+- 带宽利用率 = `FETCH_SIZE / (End-Start)`；如果计数器没有显式 DRAM 总线计数器，可用 `(FETCH_SIZE+WRITE_SIZE)/ΔT` 对比 615 GB/s。
+- legacy `rocprof`（rocprof 1.x）：`rocprof --stats -d . <app>` 给 per-kernel dispatch 时间 < n > 与总时间占比；2.x 用 `rocprofv2 --kernel-trace`（更推荐）。
+
+
+- RDNA4 ISA Reference（PDF，opcodes/encoding/寄存器）— AMD 官方：https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna4-instruction-set-architecture.pdf
+- GPUOpen 架构文档中心（RDNA Performance Guide、Matrix Cores RDNA4、WMMA on RDNA3、Occupancy、机器可读 ISA）：https://gpuopen.com/amd-gpu-architecture-programming-documentation
+- Clang AMDGPU Builtins（官方 intrinsic 大全，含 wmma 全家族与 aux 编码）：https://clang.llvm.org/docs/AMDGPUBuiltinReference.html
+- LLVM AMDGPU User Guide（target triple/特性/内存模型 code sequence）：https://llvm.org/docs/AMDGPUUsage.html ；DMA 操作：https://llvm.org/docs/AMDGPUDMAOperations.html
+- ROCm GPU 硬件规格表（LDS/wave/L2 各行，官方交叉核对用）：https://rocm.docs.amd.com/en/latest/reference/gpu-arch-specs.html
+
+---
+
+
+
+源码（master）：https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-cuda/mmq-config-rdna4.cuh
+
+结构（已读取全文）：
+- 对全部量化型别（Q1_0…Q8_0、Q2_K…Q6_K、IQ1_S…IQ4_NL、MXFP4、NVFP4）给出参数元组 `(type, 128|256, 2, 64or128, rows, sram_layout, MMQ_ITER_K, booleans...)`，即 **cache-line 对齐的 128/256 行 tile、每 CTA 2 组、行组 64/128、块 K，统一走 `MMQ_ITER_K` 的 K-iter 主循环**，`sram_layout` 选择 Q8_0/Q8_1/Q2_K/Q3_K/Q6_K/NVFP4 的 LDS 布局。
+- 组织要点：**权重按 128B cache line 对齐分块（`128,2` / `256,2`），K 方向迭代（`MMQ_ITER_K`）**，每线程处理行组内若干行，从 LDS（Q8_0 反量化后布局）取数、寄存器解码重定标 → 内积 → LDS 归约。GEMV/decode 用它做**带宽有界**的 matmul-vec（wave64 更优，见 B.2）。
+- 对比本工程：t2 三元 2-bit 权重可参照 Q2_K/Q3_K 的 SRAM layout 思路，把 2-bit 解码放到 LDS→寄存器阶段做，复用 `MMQ_ITER_K` 的主循环结构。
+
+
+- 历史文件 `fattn-wmma-f16.cu`（ROCm 6.4 时代 gfx1201 上有编译 bug 记录，证明该路径确实在 gfx1201 上被用过）：issue https://github.com/ggml-org/llama.cpp/issues/13110
+- 现代 llama.cpp 把 CUDA FP16 flash-attn 统一到 `ggml/src/ggml-cuda/fattn-mma-f16.cu`（`fattn.cu` 里按 `amd_wmma_available(cc)` 派发）；RDNA4 gfx120x 的 WMMA flash-attn 路径在运行时 `amd_wmma_available` 命中。（https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-cuda/fattn.cu ；社区 RDNA4 增强补丁集 https://github.com/stew675/llama-cpp-rdna-boosts 把 WMMA flash-attn、chunked-GDN、k-quant VDR 都建在 gfx120x 上）
+- **移植借鉴**：WMMA flash attention 用 wave32 + `__builtin_amdgcn_wmma_*`，QK tile 用 FP16/FP16→FP32 累计，PV 用 FP16×FP16→FP16；GQA 分解 + ncols1 特化（`flash_attn_ext_mma_f16_switch_ncols1`）减少冗余 IO。本工程 decode attention 手写 `__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12` 的姿势与 llama.cpp 一致，可对照它们处理 gfx12 lane 映射（ROCm issue #6025）与 mask 的方法。
+
+
+- Triton AMD 后端布局 `amd_wmma`（矩阵核心专用布局），自动把 `tl.dot` 降到 `v_wmma_*`；AMD 为 Triton 提供了一组后端 pass（AMDGPU accelerate Matmul、Stream Pipeline、Block Ping-pong、Optimize Epilogue、bypass-LDS 等）。来源：ROCm 官方博客 https://rocm.blogs.amd.com/software-tools-optimization/kernel-development-optimizations-with-triton-on-/README.html ；PyTorch 博客 https://pytorch.org/blog/triton-kernel-compilation-stages
+- **RDNA4（gfx1201）实测**：FP8 `tl.dot` 自动编成 `v_wmma_f32_16x16x16_fp8_fp8`，社区在 R9700 跑 Qwen3-30B/GPT-OSS-20B FP8 OK（需 `VLLM_ROCM_USE_AITER=0`；`num_stages=2` 上限，见 B.3）：https://discuss.vllm.ai/t/native-fp8-wmma-support-for-amd-rdna4-rx-9070-xt-r9700-in-vllm/1900 ；https://github.com/vllm-project/vllm/issues/28649
+- TileLang 也有面向 gfx11/gfx12 的 WMMA intrinsic 发射器（f16→f32 16×16×16, warp=32）：https://tilelang.com/autoapi/tilelang/rocm/intrinsics/wmma_macro_generator/index.html
+- **对本工程**：prefill 的 GEMM 可优先评估"让 Triton 自动编"（节省手写布局时间），但 t2 三元反量化不在标准 tl.dot 能力内 —— 需要先反量化成 bf16 tile 再 dot，或手写 HIP 内核把反量化与 WMMA 融合（GPUOpen part2 的 wide-K 样例就是官方给的融合模板）。
+
+
+- **gfx1201 没有 thread-block-cluster / 分布式共享内存**：Clang 的 cluster 内置（`__builtin_amdgcn_cluster_id_*`、`cluster_workgroup_*`）全部标 **gfx1250-insts**——那是 RDNA5 的特性，**gfx1201 不可用**。https://clang.llvm.org/docs/AMDGPUBuiltinReference.html
+- **gfx1201（gfx12）实际可用的新机制**：
+  - 拆分屏障 `s_barrier_signal` / `s_barrier_wait`（可以把 barrier 等待与独立指令重叠）；
+  - 拆分内存计数器 `loadcnt` / `kmcnt` / `dscnt`（比 gfx11 的 vmcnt/lgkmcnt 更细粒度，只在必要依赖上等）；
+  - **乱序内存访问**（RDNA4 去掉了跨 wave 的假内存序依赖，独立内存操作可以乱序完成，减少假 stall）；
+  - RDNA4 的缓存策略位 `th[0:2]` + `scope[3:4]`（B.2）。
+  - 来源：Chips and Cheese LLVM 文 https://chipsandcheese.com/p/examining-amds-rdna-4-changes-in-llvm ；ChC RDNA4 OoO 内存 https://chipsandcheese.com/p/rdna-4s-out-of-order-memory-accesses ；zolotukhin 参考页。
+- **对本工程**：利用 `s_barrier_signal/wait` 重叠 decode 里 GEMV 之后的归约 barrier 与下一层权重 load；用 `s_waitcnt loadcnt(0)` 而非全量等待；global load 用 streaming hint 让权重不污染 L2。
+
+---
+
+
+按优先级（对应任务目标：decode @100k ≥30 t/s，prefill ≥1000 t/s）：
+
+1. **复核"gfx1201 无 int8/fp8 WMMA"结论**。官方 Clang 有 `iu8/fp8/bf8` gfx12 WMMA 内置，Triton/vLLM 已跑通。若 `mma_s8 = trap` 是移植层无对应语义，改走 `__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12`（int4 用 `iu4` 变体）即可。→ 影响量化 QK/decode 精度路径，也影响三元 GEMM 可否用 INT8 中间格式。
+2. **写最小纯 bf16 WMMA GEMM 校准探针**（输入直接 bf16、不反量化；M=34816,N=512,K=5120；wave32；覆盖全部 64 CU；用 rocprofv2 证实时钟与指令占用），区分"矩阵单元峰值"与"反量化管线开销"。**35 vs 195 的真相判定以此为据**；预期矩阵单元能到 100+ TFLOPS（若时钟 2.4G 则为 ~157 上限），35 是反量化+搬运限制。
+3. **三元 GEMM 按 GPUOpen wide-K 模板重做**：反量化→bf16 tile→WMMA 双 K 融合（每个线程取 16 元素 128-bit 载荷），K 循环用 `num_stages=2` + VGPR 双缓冲 + `s_waitcnt loadcnt`；权重读用 streaming cache hint。这个直接决定 prefill 上限。
+4. **decode 用 wave64 GEMV 专用内核**（别用 WMMA）：DMMV 每线程 16B 载荷、多 wave 隐藏延迟、streaming hint；t2 反量化参考 mmq-config 的 128/256 行 + K-iter 组织。目标带宽效率 ≥70%（现在 95.5% 流式已证明可行）。@100k ≥30 t/s 依赖此路。
+5. **attention**：保持 gfx12 WMMA decode attention（姿势正确）；对齐 llama.cpp 对 gfx12 lane 映射的处理（issue #6025）与 GQA 特化；prefill attention O(T²) 部分用 FP16 QK（官方支持）而非必要地加宽到 bf16；int8 K 反量化冗余 4× 的问题等复核 1 之后再议。
+6. **系统层**：关 GPU ECC（`amdgpu.ras_enable=0`，+~10% 带宽）；power state 用 `profile_standard`/auto 而非 peak（peak 反而 -23%）；确认 SMU/内核版本匹配避免锁 2.2G；ASPM 对 GPU 内 DRAM 无影响，别为其折腾。
+7. **编译**：WMMA 内核与 GEMV 内核分编译单元（一个 wave32、一个 wave64，LLVM 不能在一个 kernel 里混 wave 大小）；`--offload-arch=gfx1201` 已对；用 `AMDGPUUsage`/`GPUOpen` 文档做汇编参考，`amd_matrix_instruction_calculator` 算指令吞吐。
+
+---
+
+
+**AMD 官方（产品/文档/博客）**
+- https://www.amd.com/en/products/graphics/desktops/radeon/9000-series/amd-radeon-rx-9070xt.html — 195/389/779 TFLOPS 口径
+- https://gpuopen.com/learn/using_matrix_core_amd_rdna4 — RDNA4 矩阵核心官方指南（FLOPS/clk/CU 表、gfx12 intrinsic）
+- https://gpuopen.com/learn/wmma-guide-amd-rdna-4-gpus-part-1 — WMMA 布局/转置
+- https://gpuopen.com/learn/wmma-guide-amd-rdna-4-gpus-part-2 — wide-K 双 K 融合达峰值带宽（FP8/INT8 128-bit）
+- https://gpuopen.com/learn/wmma_on_rdna3 — RDNA3 WMMA 参考（OPSEL、fragment 布局）
+- https://gpuopen.com/learn/rdna-performance-guide / https://gpuopen.com/amd-gpu-architecture-programming-documentation / https://gpuopen.com/machine-readable-isa/
+- https://gpuopen.com/learn/amd-lab-notes/amd-lab-notes-matrix-cores-readme
+- https://rocm.docs.amd.com/projects/rocprofiler/en/latest/how-to/rocprofv2-usage.html — rocprofv2 用法
+- https://rocm.docs.amd.com/en/docs-6.1.0/reference/rocmcc.html — hipcc 编译选项（wavefrontsize64）
+- https://rocm.docs.amd.com/en/latest/reference/gpu-arch-specs.html — GPU 硬件规格
+- https://rocm.blogs.amd.com/software-tools-optimization/kernel-development-optimizations-with-triton-on-/README.html — AMD Triton pass
+- https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna4-instruction-set-architecture.pdf — RDNA4 ISA PDF
+
+**LLVM/Clang**
+- https://clang.llvm.org/docs/AMDGPUBuiltinReference.html — AMDGPU 内置（wmma、aux、cluster gfx1250）
+- https://codebrowser.dev/llvm/clang/include/clang/Basic/BuiltinsAMDGPU.def.html — wmma gfx12 定义源
+- https://llvm.org/docs/AMDGPUUsage.html — AMDGPU 后端指南（内存模型/目标特性）
+- https://llvm.org/docs/AMDGPUDMAOperations.html — DMA 操作（GFX9 / GFX1250，无 gfx1201）
+
+**可信第三方**
+- https://zolotukhin.ai/zinc/docs/amd-gpu-reference — RDNA3/RDNA4 推理参考（WMMA 表、延迟、LDS、电源/ECC/SMU 实测）
+- https://chipsandcheese.com/p/examining-amds-rdna-4-changes-in-llvm — RDNA4 LLVM 变化（缓存位、内存计数器）
+- https://chipsandcheese.com/p/amds-rdna4-architecture-video （L2 银行翻倍）/ https://chipsandcheese.com/p/llvm-divination-of-gfx1251s-differences （WMMA 4-pass 调度）/ https://chipsandcheese.com/p/rdna-4s-out-of-order-memory-accesses
+- https://www.techpowerup.com/gpu-specs/radeon-rx-9070-xt.c4229 与 review/…/technical-deep-dive/3.html — TFLOPS 拆解
+- https://hothardware.com/reviews/amd-rdna-4-architecture-deep-dive / https://wccftech.com/amd-rdna-4-architecture-deep-dive-new-compute-units-raytracing-cores-ai-enhancements-path-tracing — 每 CU 2 矩阵单元 / DCU 4 MA
+- https://streamhpc.com/blog/2026-06-24/rdna-and-cdna-similarities-and-differences/ — RDNA vs CDNA 对比（wave/SIMD/MFMA）
+- https://www.osti.gov/servlets/purl/2345982 与 https://salykova.github.io/matrix-cores-cdna — CDNA MFMA 延迟/每 CU 4 Matrix Core / FLOPS 公式
+- https://github.com/ROCm/amd_matrix_instruction_calculator — 官方矩阵指令计算器
+- https://github.com/ROCm/ROCm/issues/6025 — gfx12 WMMA lane 映射文档缺口
+- https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-cuda/mmq-config-rdna4.cuh — RDNA4 MMQ 配置
+- https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-cuda/fattn.cu 与 issue https://github.com/ggml-org/llama.cpp/issues/13110 — WMMA flash-attn 路径
+- https://github.com/stew675/llama-cpp-rdna-boosts — RDNA4 增强补丁集（WMMA FA、chunked-GDN）
+- https://discuss.vllm.ai/t/native-fp8-wmma-support-for-amd-rdna4-rx-9070-xt-r9700-in-vllm/1900 — FP8 WMMA Triton 验证
+- https://github.com/vllm-project/vllm/issues/28649 / https://github.com/vllm-project/vllm/issues/45929 — RDNA4 FP8 补丁 / num_stages 限制
+- https://github.com/ROCm/aiter/issues/900 — RDNA4 缺 FA/hipBLASLt 调优的生态现状
+- https://z8.re/blog/aspm.html 与 Linux ASPM 文档 — ASPM 本质（PCIe 链路）
+- https://github.com/iree-org/iree/discussions/23077 — gfx1250 LDS DMA 规划（对比确认 gfx1201 无）
+- https://www.reddit.com/r/LocalLLaMA/comments/1j088yg/rx_9070_xt_potential_performance_discussion — 195 公式社区验证
+
+> **背景**：G 盘（文档卷）出现磁盘故障，`G:\ninfer-hip\probe` 目录 `corrupted and unreadable`，
+> 部分文件损坏。工作目录已紧急迁移到 D 盘。本文档是迁移交接的唯一权威记录。
+
+
+| 目录 | 文件数 | 说明 | 状态 |
+|---|---|---|---|
+| `ninfer/` | 1758 | **引擎完整源码**（src/ 全部内核 + 头文件） | ✅ 1 文件损坏（见下） |
+| `shensanshu/` | 1545 | **原版 NInfer 参考**（ambolio-base 等） | ✅ 完整 |
+| `milestones/` | 731 | 历史快照（20260927 起全部里程碑） | ✅ 完整 |
+| `shim/` | 16 | HIP/CUDA shim（编译依赖） | ✅ 完整 |
+| `build/` | 947 | 编译产物（exe/lib，1.98GB） | ✅ 完整（可重建） |
+| `build_nordc/` | 535 | .obj/.lib + _cc_*.bat 编译脚本 | ✅ 完整（可重建） |
+| `rocwmma_include/` | 114 | rocWMMA 头 | ✅ 完整 |
+| `ternary/` | 1 | 三元内核辅助 | ✅ |
+| `dump/` | 33 | 调试转储 | ✅ |
+| `eval_out/` | 3 | 评测输出 | ✅ |
+| **`probe_rebuilt/`** | 3 | **交接文档重建**（TARGETS/RESUME/PLAN） | 🔶 从会话记忆重建 |
+
+- 顶层脚本/结果/文档 135 个（.py/.md/.json/.pdf/.parquet 等，~2MB）
+- `eval_results/`（评测报告，1 文件）
+- `tools/`、`test/`、`dflash_debug/`、`logs/` 的部分小文件
+- ⚠️ llama.cpp / prism-llama / llama-hip-official 为 **git 仓库（可重建，未迁移）**
+
+
+1. **`G:\ninfer-hip\probe` 目录全部损坏不可读**（核心损失）：
+   - 探针源码：`simt_dot_probe.cu`、`decode_wmma_probe.cu`、`bench_decode_gemv.cu` 等
+   - 任务文件：`task_cap55.txt`、`task_cap75b.txt`、`tasks_capdiag.txt`
+   - 所有 `_simt*.out`、`gsq_*.json`、`_q4v*.out` 等实测数据
+   - → **TARGETS.md / RESUME_20261003.md / PLAN_simt_decode.md 已重建**（含全部关键结论与参数扫描数据）
+   - → 其余探针可按重建文档重写（核心算法/布局已在 PLAN 记录）
+2. **`ninfer/src/ops/sparse_moe/decode/sparse_moe_decode_plan.cpp`**（1.6KB）损坏不可读
+   - → 可从 milestones 快照恢复（若该文件在快照中存在），否则按 sparse_moe 其他 plan 文件重写
+3. **llama.cpp 源码 2 文件 CRC 损坏**（磁盘物理坏道，2026-10-03 确认）：
+   - `llama.cpp/ggml/src/ggml-et/et-kernels/src/block_ops.h`（44KB）
+   - `llama.cpp/common/common.h`（51KB）
+   - → **可恢复**：llama.cpp 的 `.git` 已完整迁移（1022 文件），换盘后 `git checkout` 即可从本地 git 历史还原这两个文件
+4. **prism-llama 差 3 文件**：`.git` 元数据部分（HEAD/config/description 等，git 可重建）；prism-llama 主源码已 51321/51324
+
+- 迁移后 D 盘剩余 **仅 ~5GB**（原 17.7 → 迁移后 5.2）
+- **不可再往 D 盘写大文件**（llama.cpp git 仓库、模型文件勿放 D 盘）
+- 如需继续，请清理 D 盘或换更大的目标盘
+
+1. 新盘挂载后，把 `D:\ninfer-hip-migrate` 整体拷回新盘同构路径（或直接用 D:\ 路径改构建脚本）
+2. 恢复缺失头文件（若 build 报错）：从 `milestones\*\ninfer\src\ops\linear\ternary\` 拷 `ternary_dispatch.h`（本次迁移前曾误删过一次，已用 milestone 版恢复）
+3. 确认模型路径：`S:\NLP_Qwen\...`（换盘后核对 S 盘）与 `D:\ninfer-models\ternary_bonsai_27b_v3.ninfer`
+4. 按 `probe_rebuilt\RESUME_20261003.md` 的构建链重编：`.cu → _cc_*.bat`、`.cpp → compile_one_cpp.py`、`swap_lib.py → link_exe.py`、`NINFER_NORDC=1`
+5. 用 `NINFER_ATTN_SIMT=1` 启用 SIMT decode（@100k 24.51 t/s，bf16 最优）
+
+- 总纲：`D:\ninfer-hip-migrate\probe_rebuilt\TARGETS.md`
+- 进度：`D:\ninfer-hip-migrate\probe_rebuilt\RESUME_20261003.md`
+- SIMT 计划：`D:\ninfer-hip-migrate\probe_rebuilt\PLAN_simt_decode.md`
+- 引擎源码：`D:\ninfer-hip-migrate\ninfer\src\`
+- 原版参考：`D:\ninfer-hip-migrate\shensanshu\ambolio-base\`
+- 编译脚本：`D:\ninfer-hip-migrate\build_nordc\`
+
+**SIMT decode 已集成（@100k 24.51 t/s，wmma 15 的 +63%）；剩余最大优化头是 64 层 MLP/GDN 三元 GEMV（占 decode 43%），对齐探针可再 +15-20% → 逼近 30 生死线；MTP 修复（2.5-3×）是 v1.1 直接跨过 30 的杠杆。**
+
+> 输入：原项目分析 `ARCH_ORIGINAL_PROJECT.md`、社区对标 `ARCH_COMMUNITY_BENCHMARK.md`、AMD 硬件研究 `ARCH_AMD_GFX12.md`、实测基线 `ARCH_REVIEW_BASELINE.md`。
+> 目标：decode @100k ≥30 t/s（生死线，no-MTP）+ prefill ≥1000 t/s。本文件是执行总纲，替代单点打补丁。
+
+---
+
+
+**decode 是带宽问题，prefill 是算力问题；两者的共性瓶颈都是"内核没把 DRAM/矩阵单元用满"，而不是缺投机、缺量化、缺特性。** 追 30 t/s 的主线 = 把 bandwidth 效率从 ~26-48% 修到 ≥67%（decode），把矩阵吞吐从 ~35 TFLOPS 校准到可验证的真值（prefill）。
+
+
+| 项 | 值 | 依据 |
+|---|---|---|
+| DRAM 带宽 | 614.8 GB/s（实测 95.5%）| 探针 |
+| 权重/步（t2 三元）| 7.2 GB | 2.125bit |
+| KV/步（bf16，16 FA 层 @100k）| 6.55 GB | 实测 |
+| 每步合计 | 13.75 GB → 22.4ms → **44.6 t/s 上限** | 物理 |
+| KV q8 后 | 10.48 GB → 58.8 t/s 上限 | +31% |
+| 30 t/s 所需效率 | 67%（bf16 KV）/ 51%（q8）| 物理 |
+| llama.cpp 同卡同模型 | **49.4 t/s no-MTP** | 本地实测，就是"可行"铁证 |
+| 矩阵峰值（官方）| FP16 195 / FP8 389 / INT8 389 TFLOPS | AMD 官方 |
+| 矩阵峰值（实测）| 35 TFLOPS（= 官方 18%，待校准）| 反量化+碎片开销 |
+| 社区 prefill | 1500+ t/s（vllm-radiance）/ 1000-1100（llama.cpp）| 调研 |
+
+
+- **attention 内核读 KV 效率 ~18-27%**（@100k 每步 ~60ms vs 理论 10.65ms）：head_dim 256×4kv 布局没吃满 cache line、int8 K 反量化 4× 冗余、split 组织
+- **三元 GEMV 效率 ~30-47%**（llama.cpp 80-100%）：R8W1 深加载 ILP 设计没搬全、ACO 冗余 wait
+- **launch/调度 ~5-10ms/步**：recurrent GDN 已 -46%，继续单内核化
+- 结论：2-4× 差距 = 三个环节都没把 DRAM 用满，非"多读字节"
+
+- **矩阵吞吐 35 vs 195 TFLOPS（官方 18%）**：反量化+碎片构建指令与 WMMA 周期同量级；decode N=1 时 tile 利用率 6%
+- **attention O(T²) 未 flash 化**：@100k prefill 的 attn 段 197→1163ms/chunk 暴涨
+- **GDN chunked launch 风暴**：recurrent 已 -46%
+- 结论：prefill 主战场 = 矩阵单元吞吐（需先校准）+ attention flash 化
+
+1. ~~**"gfx1201 无 int8/fp8 WMMA" 存疑**~~ ❌ **已实锤：硬件支持**。Clang 的 `iu8/fp8/bf8/iu4` gfx12 内置全编译+运行+数值 PASS（`bench_wmma_i8_fp8_gfx12.cu`）。`mma_s8=trap` = 移植层无 CUDA 语义，非硬件。→ int8-KV QK 可走原生 i8（QK MMA 减半）、三元 GEMM 可评估 INT8 中间格式。
+2. ~~**"35 TFLOPS = WMMA 峰值" 口径错**~~ ❌ **已实测：矩阵单元 163.6 TFLOPS（满占用纯 WMMA），流式 bf16（零反量化）39.2 ≈ 引擎 35**（`bench_bf16_gemm_calib.cu`）。墙 = 权重→碎片加载管线（宽位合并读 + LDS + 双 K 融合可解），不是矩阵单元、不是反量化。
+3. **gfx1201 无 cp.async**：软件流水 num_stages=2 上限，别学 CUDA 深流水。
+4. **decode 用 wave64 GEMV 而非 WMMA**：N=1 时 WMMA tile 只有 1/16 列有效。
+
+---
+
+
+**现状**：decode_t1_wmma（bf16 加宽版）@100k ~74ms/step attention，效率 ~18%。
+**目标**：≥70% 效率（~15ms），单项 11.8→~25 t/s。
+**设计**：
+1. 读 KV 布局对齐：4 kv head × head_dim 256 按 cache line（128B）满宽读；参考 llama.cpp fattn-vec / flash-decode
+2. **消除 int8 K 反量化 4× 冗余**：K tile 一次性反量化进 smem 共享（bf16 加宽），各 warp 复用——现在每个 warp 对同一 K 块重复反量化
+3. GQA 特化：24q/4kv 的 GroupSize=6，只算 6 行/head 有效（现状 warp0 干活，4× 浪费）
+4. 用拆分内存计数器 s_waitcnt loadcnt（非全量等待）做软件流水
+5. 权重读 streaming cache hint（th 位），不污染 L2/Infinity
+
+**现状**：int8 decode @92k 正常、@97k NaN（阈值定位中，bf16 无此问题）。KV 减半是 30 线的保险（67%→51% 所需效率）。
+**设计**：二分定位后修根因（怀疑 split 边界/smem 越界/量化误差累积三选一，用 rocprofv2 定位）。
+
+**现状**：三元 GEMV 30-47% 效率。
+**目标**：≥70%（-10ms/步）。
+**设计**：
+1. 照原项目 R8W1：每行一 warp、静态所有权、40-136 独立 16B 组加载在飞行（`t2_rowsplit_gemv.cuh:34-88` 注释是设计圣经）
+2. 照 llama.cpp mmq-config-rdna4：128/256 行 cache-line 对齐 tile + MMQ_ITER_K 主循环 + 2-bit 解码放 LDS→寄存器阶段
+3. **wave64 专编**：decode GEMV 用 wave64（gfx1201 上 DMMV wave64 实测更优），与 WMMA 内核分编译单元
+4. 用 rocprofv2 查 ACO 冗余 s_waitcnt（#21043 同款清单）
+
+写最小纯 bf16 WMMA GEMM（M=34816, N=512, K=5120，直接 bf16 输入不经反量化，wave32，覆盖 64 CU），rocprofv2 测真实时钟+指令：
+- 若 100+ TFLOPS → 矩阵单元没问题，瓶颈在反量化管线 → 按 GPUOpen wide-K 双 K 融合模板重做三元 GEMM
+- 若仍 ~35 → occupancy/时钟/launch 问题
+
+用 `__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12` 写最小探针，验证 i8 路径通不通：
+- 若通 → int8-KV QK 可走原生 i8 WMMA（不用 bf16 加宽，QK MMA 数减半）；三元 GEMM 可评估 INT8 中间格式
+- 若 trap 确认 → 维持 bf16 加宽，但记录结论为"移植层限制"而非"硬件不支持"
+
+mixer-attn O(T²) 是 @100k prefill 大坑（197→1163ms/chunk）。对齐 llama.cpp fattn-mma-f16 / WMMA FA。
+
+底数到 30 后才有意义（放大器）。修 v1.1 round bug。
+
+---
+
+1. **关 GPU ECC**：`amdgpu.ras_enable=0`，+~10% 带宽（推理可接受 bit-flip）
+2. **power state 用 profile_standard/auto，别用 peak**：peak 反而 -23%
+3. 确认 SMU/内核版本匹配（避免锁 2.2G 时钟）
+4. ASPM 对 GPU 内 DRAM 无影响，别折腾
+
+- WMMA 内核（wave32）与 GEMV 内核（wave64）**分编译单元**（LLVM 不能混 wave 大小）
+- 软件流水 num_stages=2 + VGPR 双缓冲 + s_waitcnt loadcnt
+- rocprofv2 --kernel-trace 拿 kernel ns；Navi 计数前设 profile_standard
+- gfx12 WMMA lane 映射文档缺口 → 参考 CK 源码 wmma_gemm.hpp（ROCm#6025）
+
+1. **P0-1 attn 满宽读**（decode 25 t/s 的保证，~2-3 天）
+2. **P2-2 int8/fp8 WMMA 复核**（半天，影响量化全局）
+3. **P2-1 校准探针**（半天，prefill 决策依据）
+4. **P0-2 int8 NaN 修复**（正确性，1 天）
+5. **P1 GEMV 对齐**（decode 30 线补全）
+6. P2-3 prefill attention flash 化（prefill 1000+ 的主要来源）
+7. P3 MTP（放大器）
+
+**预期账（P0+P1 完成后）**：attn 80%（15ms）+ GEMV 80%（14.6ms）+ launch 3ms ≈ 33ms/步 → **30+ t/s（bf16）**；叠 KV q8 → ~45 t/s。**生死线在 P0+P1 内可达，不需要投机。**
+
+- LUT / 双组循环 / 8 行 CTA 微优化（收益被带宽效率掩盖）
+- 用 TFLOPS 追 decode（decode 是带宽瓶颈，算力利用率 <2%）
+- 学 CUDA 深流水 cp.async（gfx1201 无此指令）
+- int8 decode 当前路径（反量化冗余未消除前是负收益）
+
+> 面向 CUDA→HIP 移植的本地 LLM 推理引擎（Ternary-Bonsai-2-27B，ROCm 7.2，HIP）
+> 编制日期：2026-10-07 | 依据：AMD 官方文档/博客为主，可信第三方技术文章为辅
+> 本机实测锚点：见 `ARCH_REVIEW_BASELINE.md`（DRAM 流式 614.8 GB/s = 95.5% 峰值；三元 GEMM 34–35 TFLOPS；decode @100k 11.76 t/s）
+
+---
+
+- [0. 三十秒结论](#0-三十秒结论)
+- [A. RDNA4 矩阵单元与 WMMA（最高优先级）](#a-rdna4-矩阵单元与-wmma最高优先级)
+  - [A.1 gfx1201 WMMA 指令集全景](#a1-gfx1201-wmma-指令集全景)
+  - [A.2 官方 195/389 TFLOPS 的口径定义，与 35 TFLOPS 差在哪（核心问题）](#a2-官方-195389-tflops-的口径定义与-35-tflops-差在哪核心问题)
+  - [A.3 FP8 WMMA 在 gfx1201](#a3-fp8-wmma-在-gfx1201)
+  - [A.4 WMMA vs MFMA（CDNA）架构差异](#a4-wmma-vs-mfmacdna架构差异)
+- [B. 内存系统与带宽](#b-内存系统与带宽)
+  - [B.1 L2/L0/Infinity Cache 容量与带宽](#b1-l2l0infinity-cache-容量与带宽)
+  - [B.2 全局读如何打满 DRAM：GEMV 隐藏延迟与 cache hint](#b2-全局读如何打满-dramgemv-隐藏延迟与-cache-hint)
+  - [B.3 cp.async 在 gfx12 的等价物](#b3-cpasync-在-gfx12-的等价物)
+  - [B.4 LDS 容量/带宽/冲突](#b4-lds-容量带宽冲突)
+  - [B.5 ASPM / 电源管理对 DRAM 带宽的影响](#b5-aspm--电源管理对-dram-带宽的影响)
+- [C. 编程模型与工具](#c-编程模型与工具)
+  - [C.1 hipcc 编译 gfx1201 要点](#c1-hipcc-编译-gfx1201-要点)
+  - [C.2 rocprofv2 拿 kernel 级 GPU 时间](#c2-rocprofv2-拿-kernel-级-gpu-时间)
+  - [C.3 AMD 官方 assembly/intrinsic 文档](#c3-amd-官方-assemblyintrinsic-文档)
+- [D. 社区 RDNA4 内核参考](#d-社区-rdna4-内核参考)
+  - [D.1 llama.cpp mmq-config-rdna4.cuh](#d1-llamacpp-mmq-config-rdna4cuh)
+  - [D.2 llama.cpp WMMA FlashAttention](#d2-llamacpp-wmma-flashattention)
+  - [D.3 Triton 在 gfx1201 的 WMMA 自动生成（vLLM 用）](#d3-triton-在-gfx1201-的-wmma-自动生成vllm-用)
+  - [D.4 线程/块调度新特性](#d4-线程块调度新特性)
+- [E. 给 NInfer 移植的落地建议汇总](#e-给-ninfer-移植的落地建议汇总)
+
+---
+
+
+| 问题 | 结论 |
+|---|---|
+| 官方 195/389 TFLOPS 怎么算的 | **FP16 195 = 64 CU × 1024 FLOPs/clk/CU（每 CU 每时钟 1024 次 FP16 FMA 计数）× 2.97 GHz 升频**。FP8/INT8 389 = 2048 FLOPs/clk/CU × 2.97 GHz。**纯矩阵单元在输入已就位于 VGPR、无停顿、顶频**下的理论峰值。来源：AMD 产品页 + GPUOpen + TechPowerUp 拆解三重验证。 |
+| 我们的 35 vs 195 差 5.6× 在哪 | ①三元权重是 **2-bit 编码**，WMMA 输入必须是 bf16 矩阵 → 每次都要**先反量化再喂矩阵单元**，吞吐按 bf16 矩阵吞吐（峰值也仅 195）算，而 decode 阶段 N=1、prefill GEMM tile 小、寄存器内碎片布局开销吃掉大量周期；②**真实瓶颈是内存带宽与反量化/碎片构建指令，不是矩阵单元**。35 TFLOPS ≠ 矩阵单元只到 18%，而是"有效 FLOPs 口径"下被内存+解码指令限制的水平。可能需要一条专用 fp16 权重换算路径才能逼近矩阵峰值。详见 [A.2](#a2-官方-195389-tflops-的口径定义与-35-tflops-差在哪核心问题)。 |
+| decode @100k ≥30 t/s 可达性 | 物理上限 ~44.6 t/s（7.2G 权重 + 6.55G KV(bf16)/step ÷ 615 GB/s）。**要达到 30 t/s 需要 67% 带宽效率**，本机 DRAM 流式已达 95.5%，所以注意力与 GEMV 内核的"每字节搬运效率"是关键（llama.cpp RDNA4 特化 Q4 内核可到 ~78%）。 |
+| FP8 WMMA | gfx1201 **有**（`__builtin_amdgcn_wmma_i32_16x16x16_fp8_fp8_w32_gfx12` / `bf8`，Clang 官方内置），Triton 可对 gfx1201 自动生成 `v_wmma_f32_16x16x16_fp8_fp8`，vLLM 社区已在 R9700 上跑通 FP8。**✅ 已实锤（B20 探针）**：iu8/fp8/bf8/iu4 四种 gfx12 WMMA 内置在 gfx1201 编译+运行+数值全 PASS；`mma_s8 = trap` 是移植层无 CUDA 语义映射，**不是硬件不支持**。实现要点：neg 标志=符号开关且必须编译期常量；i8 lane 布局与 bf16 实测布局一致。探针 `probe_rebuilt\bench_wmma_i8_fp8_gfx12.cu`。 |
+| cp.async 等价物 | **gfx1201 无 LDS-DMA / cp.async**（GFX9 有 1/2/4B load-to-LDS，gfx1250 才有 8/32/64/128-bit LDS DMA；gfx1201 两者都不是）。流水线只能靠**普通全局 load 提前发射 + s_waitcnt loadcnt 显式等待**（RDNA4 拆分计数器），软件流水深度上限低，`num_stages>2` 无收益（vLLM 实测）。 |
+| ASPM / 电源 | 官方与社区一致：RDNA4 上 `power_dpm_force_performance_level=peak` 反而因功耗墙**掉内存有界负载 ~23%**；GECC（GPU ECC）默认开，关掉白拿 ~10% 带宽/9% tok/s；SMU 固件版本不对会锁 ~2.2 GHz。 |
+| 线程/块新特性 | gfx1201 **没有** thread-block-cluster / 分布式共享内存（cluster 内置是 **gfx1250-insts**）；gfx1201 有的是拆分屏障 `s_barrier_signal/wait`、拆分内存计数器 `loadcnt/kmcnt/dscnt`、乱序内存访问。 |
+
+---
+
+
+
+**结论：gfx1201（RDNA4）的 WMMA 以 wave32 粒度工作，原生支持 16×16×16 tile，输入型别覆盖 FP16 / BF16 / I8(IU8) / I4(IU4) / FP8(E4M3) / BF8(E5M2)，累加器 FP32 / I32 / FP16 / BF16。**
+
+官方（AMD GPUOpen「Using the Matrix Cores of AMD RDNA 4 architecture GPUs」）：
+
+> RDNA4 有第三代 Matrix Cores。WMMA intrinsic 带 `_gfx12` 后缀（gfx11 没有）。A、B、C、D 矩阵格式与 gfx11 不同（**VGPR 布局改了**），必须用新的 gfx12 intrinsic。
+> 官方表：FP16→FP32/FP16 **1024 FLOPs/clk/CU**，BF16→FP32/BF16 **1024**，I8→I32 **2048 ops/clk/CU**。
+> — https://gpuopen.com/learn/using_matrix_core_amd_rdna4
+
+Clang 官方 AMDGPU Builtins（https://clang.llvm.org/docs/AMDGPUBuiltinReference.html，搜索 `wmma`）与 BuiltinsAMDGPU.def（https://codebrowser.dev/llvm/clang/include/clang/Basic/BuiltinsAMDGPU.def.html）列出 gfx12 WMMA 内置的完整签名，例如：
+
+| 内置 | 原型 | Target 约束 |
+|---|---|---|
+| `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` | `V8f V2i V2i V8f` | `gfx12-insts,wavefrontsize32` |
+| `__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12` | 同 | 同 |
+| `__builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12` | `V8f V2i V2i V8f` | 同 |
+| `__builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12` | `V8f V2i V2i V8f` | 同 |
+| `__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12` | `V8i Ibi Ibi V8i` | 同 |
+| `__builtin_amdgcn_wmma_i32_16x16x16_iu4_w32_gfx12` | `V8iIbiIbiV8iIb` | 同 |
+| `__builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12`（FP16→FP16） | — | 同 |
+
+- **wave32 是硬约束**：所有 gfx12 WMMA 内置都要求 `wavefrontsize32`。编译时用 `-mno-wavefrontsize64`（或 `__builtin_amdgcn_wmma_*` 自动推导 wave32 特性）。（Clang Builtins；本机构建脚本也已加 `-mno-wavefrontsize64`）
+- **吞吐**：FP16/BF16 每条 wave32-WMMA 16×16×16 = 16×16×16×2 = **8192 FLOPs**，per-CU 每时钟 1024 FLOPs → 该指令占 SIMD 约 **8 周期吞吐**（8192/1024）；I8 2048 ops/clk/CU 同理。第三方参考（zolotukhin.ai 表格）：`WMMA FP16 16×16×16` 标 "1/32 clk (1024 FMAs)"（即吞吐 32 clk 一条、每时钟 1024 FMA），`WMMA I8` 2048 ops，与官方一致。（https://zolotukhin.ai/zinc/docs/amd-gpu-reference）
+- **每 fragment VGPR 数（wave32）**：FP16/BF16 A/B 各 8 VGPR（每线程 8 个 16-bit 元素）、C/D 8 VGPR；I8 A/B 各 4、C/D 8；I4 A/B 各 2、C/D 8。（同上 zolotukhin 表）→ 一个纯 WMMA 内核 24 VGPR/fragment，≤96 VGPR 可保持 16 wave/SIMD 满占用。
+- **矩阵布局（gfx12，比 gfx11 简化）**：A 列主序、B 行主序、C/D 行主序；**每线程持 8 个连续元素，32 线程 × 8 = 256 元素 = 16×16**；**gfx12 不再需要 gfx11 的 lane 0–15 复制到 16–31 的 shuffle**。（GPUOpen part2 + zolotukhin）
+- **一个坑（官方文档缺口）**：gfx12 WMMA 的**输出 lane→元素映射**没写进 ISA/GPUOpen 文档，社区要扒 CK 源码才确定：`v_wmma_f32_16x16x16_f16` 在 gfx12 是**按列分布**（lane i 持列 i%16、行 (i/16)*8..+7）。写内核前必须先按此布局验证加载/存储。（https://github.com/ROCm/ROCm/issues/6025）
+- **LLVM 调度视角**：gfx12 WMMA 是四条 pass（16-cycle latency，LLVM 按 four-pass 调度）——见 GFX1251（RDNA5）分析里对同族 WMMA 调度的描述；gfx1201 本身的精确每指令延迟建议用 AMD 官方 `amd_matrix_instruction_calculator` 生成（该工具给每条矩阵指令的 FLOPs、execution cycles、FLOPs/CU/cycle、VGPR 占用）。（https://chipsandcheese.com/p/llvm-divination-of-gfx1251s-differences ；https://github.com/ROCm/amd_matrix_instruction_calculator）
+
+**实体布局**：Navi 48 = 4 Shader Engine，每 SE 16 CU × 2（DCU 双 CU），共 64 CU / 4096 SP / **128 个"AI Accelerators"（每 CU 2 个矩阵单元）**；每 DCU 4 个 Matrix Acceleration Engines（= 每 CU 2 个）。来源：HotHardware 深潜 + wccftech（64 CU、64 RA、128 Matrix Acc）https://hothardware.com/reviews/amd-rdna-4-architecture-deep-dive ；https://wccftech.com/amd-rdna-4-architecture-deep-dive-new-compute-units-raytracing-cores-ai-enhancements-path-tracing
+
+
+**官方口径（推荐全部引用）：**
+
+1. **AMD 官方产品页**（"Peak Half Precision (FP16 Matrix) Performance: 195 TFLOPs / FP8 Matrix: 389 TFLOPs / INT8 Matrix: 389 TOPS / FP16 Matrix with Structured Sparsity: 389 / FP8 with Sparsity: 779"）：
+   https://www.amd.com/en/products/graphics/desktops/radeon/9000-series/amd-radeon-rx-9070xt.html
+2. **GPUOpen 官方表**（FLOPS/clk/CU：RDNA2→RDNA3→RDNA4 = FP16 256→512→1024，BF16 N/A→512→1024，I8 512→512→**2048**）：
+   https://gpuopen.com/learn/using_matrix_core_amd_rdna4
+3. **TechPowerUp 数值拆解**（194.6 FP16 TFLOPS、389.3 FP8/INT8 TFLOPS / 389.3 TOPS，列成 1:1 关系）：
+   https://www.techpowerup.com/gpu-specs/radeon-rx-9070-xt.c4229 、 https://www.techpowerup.com/review/amd-radeon-rx-9070-series-technical-deep-dive/3.html
+4. **公式证明**（Reddit LocalLLaMA 帖子，与官方产品页一致）：
+   `64 CU × 1024 FP16 ops/cycle/CU × 2.97 GHz = 194.6 TFLOPS`（含 4:2 结构化稀疏翻倍 → 389）
+   https://www.reddit.com/r/LocalLLaMA/comments/1j088yg/rx_9070_xt_potential_performance_discussion
+
+**所以：195 = 峰值时钟(2.97 GHz boost) × 每 CU 每时钟矩阵单元 FP16 FMA 计数(1024) × CU 数(64)。这是"矩阵核心满发射、输入已在 VGPR、无访存停顿、1.0 效率"的理论值。**
+
+**我们的 35 TFLOPS（= 195 的 18%）差在哪——逐项拆解：**
+
+本机基线里 "35.4 TFLOPS = WMMA2 峰值"，且 `bench_t2_wmma_gemm.cu` 还是**未完成的存根**（注释自述 "this probe is a work-in-progress scaffold; full A-fragment/B-fragment + mma_bf16 chain lands next edit"，且 fragment 布局用的是 **NVIDIA m16n8k16 布局注释**，没有真正调用 gfx12 WMMA intrinsic）。`bench_fma_density.cu` 则是 **纯 FP32 FMA 流探针**（不是矩阵指令）。因此 35 TFLOPS 更可能来自主工程 MLP GEMM 计时（每 chunk 1072ms / 64 层）按 `2·M·N·K/S` 反推，而非矩阵单元饱和测量。差异来源：
+
+1. **数据格式错配（最主要）**：官方 195 假设输入是**原生 bf16/fp16 矩阵**躺在寄存器里。我们的权重是 **2-bit 三元编码（7.2 GB，2.125 bit/值）**。WMMA 的 A/B 输入必须是 bf16 矩阵，所以每一轮 K 循环都要：
+   - 读 2-bit 编码字节（内存）；
+   - **位拆解 + 查表/算术反量化到 bf16（VALU 开销）**；
+   - 组装成 gfx12 A-fragment 的 lane 布局（每线程 8 连续元素，K-major）；
+   - 才能发一条 WMMA。
+   反量化与碎片组装的指令数（decode 每个 2-bit 值至少 2–3 条整数/移位/转换指令）**可与 WMMA 的计算周期同数量级甚至更高** → 有效矩阵吞吐远低于 195。GPUOpen part 2 明确说：**FP8/INT8 每个线程只持 8 个 8-bit 元素 = 64-bit 载荷，打不满 128-bit 内存口，必须双 K 融合才到峰值**；2-bit 的更极端（每线程 8 元素只有 16-bit 载荷）。
+2. **decode 阶段形状（N=1，GEMV）**：单 token 时 M=34816、N=1，WMMA 的 16×16 tile 只有一列有用 → 矩阵单元利用率 ≈ N/16 = 6%；这是**内存带宽受限**问题，不是矩阵吞吐问题。物理上限 ~44.6 t/s（见上）。decode 阶段根本不该用 GEMM 矩阵内核（社区一致：decode 用 wave64 DMMV/GEMV 专用内核，见 zolotukhin 与 llama.cpp）。
+3. **prefill 阶段形状**：M=34816, N=batch（通常 ≤64）, K=5120。N 小 → tile 利用率低；且每 K 步要反量化。即使假设反量化免费，**纯 bf16 GEMM 理论也只有 195 TFLOPS，而内存只喂得动 7.2GB×2（读权重+写激活）/step**——prefill 大 batch 时（如 B=1024）flops/byte = 2·B·K/B/(2.125/8) ≈ 3850 FLOPs/byte，195 TFLOPS 需要 51 GB/s 只读——远小于 615 GB/s，**所以 prefill 大 batch 时理论上是矩阵吞吐受限、可达接近 195 的**。35/195 = 18% 说明离"矩阵受限"还差得远，反量化+碎片构建+调度开销是主因。
+4. **时钟**：官方 2.97 GHz 是峰值 boost。实测 kernel 时钟受功耗墙/SMU 固件影响，典型 ~2.2–2.4 GHz（zolotukhin：SMU 接口版本不对会锁 ~2200 MHz；`RADV_PROFILE_PSTATE=peak` 反而 -23%）。按 2.4 GHz 算峰值只有 ~157，但这也只是 20% 的差异，不是 5.6× 的主因。
+5. **未用满全部 CU**：128 矩阵单元 vs 实际 launch 配置。64 CU 需 ≥64 CTA 且每 CU 多 wave 才能全占用。本机 prefill MLP 若 CTA 划分/occupancy 不足，直接掉吞吐。
+
+**结论（✅ 2026-10-07 B20 探针已实测验证）**：**35 vs 195 主要是"输入搬运/碎片构建路径"的口径差，矩阵单元本身健康。** 纯 bf16 WMMA 校准探针 `probe_rebuilt\bench_bf16_gemm_calib.cu` 实测：
+- **Mode A**（128 线程×2048 CTA 满占用，A/B 碎片寄存器常驻、K=5120 全循环，零内存）：**163.6 TFLOPS** = 官方 195 按实际时钟（~2.5GHz vs 峰值 2.97）折算的上限 → **5.6× 差距不是矩阵单元**
+- **Mode B**（同尺寸 M=34816 N=512 K=5120 流式 bf16 GEMM，每 k-step 从全局 bf16 数组逐 lane 加载碎片，**零反量化**）：**39.2 TFLOPS** ≈ 引擎三元 35 → **反量化不是主因；逐 lane 跨行 16B 非合并读 + 打包指令把吞吐拉下 4×**
+- 结论修正：① 35 TFLOPS 不是"WMMA2 峰值"，是"朴素加载路径峰值"；② prefill 提速的抓手 = GPUOpen wide-K 双 K 融合（128-bit 宽位合并读 + LDS 暂存 + 一次双 K 反量化），目标 60-100+ TFLOPS；③ 引擎三元在 Mode B 同款加载下已近饱和（35/39），**改加载路径才动得了 prefill**。
+
+
+**结论：gfx1201 原生支持 FP8/BF8 WMMA（E4M3/E5M2，同 INT8 吞吐 2048 ops/clk/CU）。**
+
+- **指令/内置存在**：`__builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12` 与 `bf8_bf8` 变体在 Clang 官方内置表（`gfx12-insts,wavefrontsize32`）。
+  https://clang.llvm.org/docs/AMDGPUBuiltinReference.html ；https://codebrowser.dev/llvm/clang/include/clang/Basic/BuiltinsAMDGPU.def.html
+- **硬件能力**：LLVM 对 RDNA4 支持 FP8/BF8 的 WMMA 指令，I8/BF8/FP8 同吞吐（2048 ops/clk/CU）（Chips and Cheese「Examining AMD's RDNA 4 Changes in LLVM」明确写了"RDNA4 adds instructions to support 8-bit floating point formats"；GPUOpen 官方表 I8=2048）。
+  https://chipsandcheese.com/p/examining-amds-rdna-4-changes-in-llvm ；https://gpuopen.com/learn/using_matrix_core_amd_rdna4
+- **社区验证（vLLM/Triton）**：vLLM 在 gfx1201 上跑 FP8 模型（Qwen3-30B / GPT-OSS-20B on R9700）走的路径是 **Triton 自动把 `tl.dot` FP8 编成 `v_wmma_f32_16x16x16_fp8_fp8`**（无需 AITER C++ 内核，需 `VLLM_ROCM_USE_AITER=0`）。社区给出的 RDNA4 Triton 调参：BLOCK_M/N/K=32/64、num_warps=4、matrix_instr_nonkdim=16（RDNA4 固定）、kpack=1、num_stages=2。
+  https://discuss.vllm.ai/t/native-fp8-wmma-support-for-amd-rdna4-rx-9070-xt-r9700-in-vllm/1900 ；https://github.com/vllm-project/vllm/issues/28649
+- **fp16→fp8 数据布局警告**：FP8 每线程 8 元素 = 64-bit 载荷，**默认打不满 128-bit 内存带宽**，官方建议双 K 融合（一次取 16 个 fp8 = 128-bit）。这才是 FP8 GEMM 跑到峰值带宽的正确姿势；社区（Triton/vLLM）实测也应遵循。
+  https://gpuopen.com/learn/wmma-guide-amd-rdna-4-gpus-part-2
+
+> ⚠️ 对本工程：基线里 "gfx1201 无 int8/fp8 WMMA（mma_s8 = trap）" 需要复核。更可能的原因是：源码里用 CUDA 语义 `mma.sync`/`wmma` 或自封的 `mma_s8` 宏，在 HIP/clang 下没有对应内置 → 编译期 trap，而不是硬件不支持。**既然有 `__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12`，int8/fp8 路径在 gfx1201 是通的**，问题只在移植层。
+
+
+权威对比（Stream HPC「RDNA and CDNA: Similarities and Differences」）：https://streamhpc.com/blog/2026-06-24/rdna-and-cdna-similarities-and-differences/
+另有 AMD 官方 Lab Notes 页面讲 MFMA per-wavefront 分布：https://gpuopen.com/learn/amd-lab-notes/amd-lab-notes-matrix-cores-readme
+
+| 维度 | RDNA（WMMA） | CDNA（MFMA） |
+|---|---|---|
+| Wavefront | **SIMD32**，wave32 为主（gfx12 WMMA 强制 wave32）；指令 1 周期/条 | **SIMD16×4**，wave64；指令 4 周期/条（staggered） |
+| 矩阵指令 | `v_wmma_*`（16×16×16 tile，每线程 8 元素） | `v_mfma_*`（大 K 变体如 16×16×256，K 越大越省 VGPR/加载） |
+| 累加器 | 通用 VGPR（可被普通 vector 指令读写/复用） | **AccVGPR**（专用累加寄存器，MFMA 专用；RDNA 无此概念） |
+| 设计取向 | 面向游戏/低延迟，矩阵单元密度低（gfx1201 每 CU 2 个），优先 1% low | 面向 AI/HPC，每 CU 4 个 Matrix Core 单元 + 超大 K MFMA，喂数据优先 |
+| 吞吐 | gfx1201 FP16 1024 FLOPs/clk/CU；I8/FP8 2048 ops/clk/CU | CDNA3 (MI300) FP16 4096+ FLOPs/clk/CU（FP64 512 等，见 MICC 论文公式 8mnk/c per CU with 4 matrix cores） |
+| 寄存器布局 | 简单（无跨 lane shuffle，gfx12） | 复杂但 K 大时高效（每线程持大片连续元素） |
+
+**为什么 RDNA4 矩阵吞吐低于 CDNA**（直接回答）：① RDNA4 每个 CU 只有 2 个矩阵单元（128 个 / 64 CU），CDNA 每 CU 4 个 Matrix Core（OSTI/MICC 论文对 CDNA 明确 "a CU (with four Matrix Core units)"，公式 `FLOPS/CU/cycle = 8mnk/c`）；② RDNA 走 wave32+SIMD32 + 1 clk/指令，为游戏延迟优化，代价是每周期可发射的矩阵 MAC 数少于 CDNA 的 4×SIMD16 流水深度；③ RDNA 是消费级面积/TDP 预算（304W vs MI300 750W），矩阵单元面积让位给光栅/着色器，所以"每 W 矩阵吞吐"差距巨大。来源：
+- https://www.osti.gov/servlets/purl/2345982 （MICC：Characterizing MFMA, per-CU 4 Matrix Core, FLOPS/CU/cycle）
+- https://salykova.github.io/matrix-cores-cdna （CDNA3 MFMA 指令延迟/吞吐表与 intrinsic 语法）
+- https://github.com/ROCm/amd_matrix_instruction_calculator （官方工具，可自己生成每条指令的 FLOPs/CU/cycle）
+
+---
+
+
+
+gfx1201 / Navi 48 官方与可信第三方数据（zolotukhin.ai 参考页 + Chips and Cheese + AMD 产品页）：
+
+| 层级 | 容量 | 行/带宽 | 延迟（参考） |
+|---|---|---|---|
+| L0 Vector Cache | 32 KB / CU（替代 RDNA3 的 L1） | 64 B/clk/CU 读；64 B line | ~30 clk |
+| L0 Scalar Cache | 16 KB / CU | — | ~30 clk |
+| L2 | **8 MB**（Navi 48） | **每 slice 带宽 = RDNA3 的 2×**；128 B line | ~100 clk |
+| Infinity Cache | **64 MB**（3rd Gen, 作为 L2 与 VRAM 之间的 victim/LLC） | 64 B line | ~150 clk |
+| GDDR6 | 640 GB/s（256-bit @20 Gbps） | 64 B line | ~300+ clk |
+
+来源：
+- https://www.amd.com/en/products/graphics/desktops/radeon/9000-series/amd-radeon-rx-9070xt.html （缓存/带宽规格）
+- https://zolotukhin.ai/zinc/docs/amd-gpu-reference （L0/L2/Infinity 容量、行大小、逐层带宽延迟表；"L2: doubled bandwidth per slice vs RDNA3"）
+- https://chipsandcheese.com/p/amds-rdna4-architecture-video （"RDNA4 doubled the number of banks per L2 slice"：银行数翻倍 = 每 slice 带宽翻倍）
+
+**对 LLM 的意义**：64 MB Infinity Cache 能装下小 context（几路 4K）的 KV 页，做"放大器"；8 MB L2 对 7.2 GB 权重只是流式缓冲（命中率≈容量/权重≈0.1%），**所以 GEMV/decode 的 DRAM 带宽就是天花板，L2/Infinity 只是峰值吸收器**。
+
+
+**探针现状**：本机流式读 614.8 GB/s = 95.5% 峰值，说明**只要访问模式线性 + 足够多并发 wave，RDNA4 的 GDDR6 侧很容易打满**（zolotukhin 参考也报 Navi48 大型 DMMV 普遍 67–93% 利用率）。
+
+**GEMV 隐藏延迟的量化建议（wave64 更优）**：
+- decode（GEMV/matmul-vec）：**wave64 在该负载上实测优于 wave32**（zolotukhin：decode 专用 DMMV 用 wave64 最优，wave32 无改善）。这与"用 WMMA 打 decode"的直觉相反——GEMV N=1 不用矩阵单元。
+- **每 SIMD 同时多少 wave**：RDNA4 每 SIMD 16 wave 槽（VGPR≤96 时 16 wave/SIMD；97–128 → 12；129–192 → 8；193–256 → 6）。DRAM 延迟 ~300+ clk，要隐藏它需要**足够的 outstanding loads**：经验上每 SIMD ≥ 8 wave × 每个 wave 多发宽位 load（GLOBAL_LOAD_DWORDX4 / 128-bit）即可近饱和（llama.cpp RDNA4 特化内核即 16B 载荷/线程 + 多 wave）。
+- **cache hint（cg/ca/streaming 的 AMD 等价）**：RDNA4 把缓存策略改成 **4 个位**：`th[0:2]`（temporal hint：streaming/normal/high-temporal）+ `scope[3:4]`（gpu/SE/system）。**流式权重读用 `th=streaming`（非临时）**：命中时留在缓存但**不更新 LRU**，避免权重把 KV/激活挤出 L2/Infinity；prefetch 权重则用 high-temporal 标记复用。HIP 侧普通 `__restrict__ const` 读默认会被编成合理策略；要显式控制走 `__builtin_amdgcn_s_buffer_load_*(..., aux)` 的 `aux` 字段（GFX12 `aux[0:2]=th, [3:4]=scope`）或 Clang 的 AV load/store 内置。（Chips and Cheese LLVM 文 + Clang Builtins 的 aux 编码说明）https://chipsandcheese.com/p/examining-amds-rdna-4-changes-in-llvm ；https://clang.llvm.org/docs/AMDGPUBuiltinReference.html
+- **GEMV 实际效率**：llama.cpp Q5_K_M 在此 die 达 ~78% 带宽；社区 RDNA4 特化内核（mmq-config-rdna4 等，见 D.1）就是冲着"每字节搬运效率"去的。
+- **wave64 的 `-mno-wavefrontsize64` 注意**：如果内核用 `__builtin_amdgcn_wmma_*`（强制 wave32），则 decode 用的 DMMV 内核不要放同一文件同一次编译；把 GEMV 单独编 `-mwavefrontsize64`，或者干脆 HIP 里 split 文件编译（llama.cpp 就是按内核分文件伺候 wave size）。
+
+
+**结论：gfx1201 没有真正意义的 cp.async / LDS-DMA。** 依据 LLVM AMDGPU 文档的 DMA 支持矩阵：
+- GFX9：`llvm.amdgcn.load[.async].to.lds`，1/2/4 字节（gfx950 才有 12/16B）——老 GCN 风格。
+- **GFX1250（RDNA5）**：`global.load.async.to.lds.b{8,32,64,128}` + `global.store.async.from.lds.b*` + tensor DMA（`tensor.load.to.lds`）——**才是 cp.async 级别的能力**。
+- **gfx1201 不属于这两者**（gfx12 在 LLVM 表里只有 GFX9 与 GFX1250 两档 DMA）→ 无异步 DMA 指令。
+  https://llvm.org/docs/AMDGPUDMAOperations.html
+
+**gfx1201 的"异步搬运"替代方案**：
+1. **普通 global→VGPR load 提前发射 + `s_waitcnt loadcnt` 显式等待**：RDNA4 把内存计数器拆成 `loadcnt`（global load）/`kmcnt`（scalar mem）/`dscnt`（LDS/GDS），可以只等上一批 load 而不阻塞别的；**配合 VGPR 双缓冲即可做软件流水**（vLLM issue #45929 明确：RDNA4 无 cp.async 式异步拷贝，`num_stages>2` 只增 IR 不增吞吐，必须 `num_stages=2`）。
+   https://github.com/vllm-project/vllm/issues/45929
+2. **Vulkan 侧 RADV 的 `coop_matrix` + 普通 buffer 读**也在用同一机制（没有 LDS DMA）。
+3. **工程上的正确造型**：decode/GEMV 这类带宽有界负载**根本不需要 LDS 缓冲**（直接 global load → 寄存器 → FMA），这也是 llama.cpp RDNA4 特化内核（D.1）的组织方式；只有 prefill GEMM 用 LDS tile，此时用 `num_stages=2` + 寄存器双缓冲即可，别学 CUDA 的深流水。
+
+
+| 属性 | 值 | 来源 |
+|---|---|---|
+| 容量 | **64 KB/CU（CU 模式）；128 KB/WGP（2 CU 共享）** | zolotukhin（ROCm 硬件表交叉核对） |
+| 带宽 | ~64 B/clk/CU（双发可） | zolotukhin 表 |
+| Bank | **32 banks × 4 B** | zolotukhin；需注意 wave32 下 32 线程访问 32 bank 的冲突规则 |
+| 无冲突延迟 | ~2 clk；广播（同地址）免费 | zolotukhin |
+| 冲突代价 | N-way 冲突 → N× 延迟；列访问要 padding（+1 元素/行） | zolotukhin；RDNA 性能指南 |
+| 占用联动 | 每 workgroup 用 32 KB → 每 CU 2 workgroup；用 16 KB → 4。**要保占用就 ≤16 KB/workgroup** | zolotukhin |
+
+- 官方 RDNA 性能指南（含 LDS/barrier/occupancy 一般性指导）：https://gpuopen.com/learn/rdna-performance-guide/
+- **gfx1201 LDS 冲突规则**与其他 RDNA 一致：bank = (addr/4) % 32；wave32 里 32 线程若访问 32 个不同 bank 一次完成，同 bank 串行。GEMV 的归约/残差写 LDS 时注意对齐 128B 避免多 wave 踩同 bank。
+
+
+- **社区"ASPM 修复白拿 20%+ 带宽"**：ASPM（PCIe Active State Power Mgmt）是关于 **PCIe 链路**的省电，对"GPU 内部 DRAM 带宽"没有直接影响；影响的是 **CPU↔GPU 拷贝**（模型加载/权重换入换出）。z8.re「The Curse of ASPM」是系统级功耗/调度的知名博客，讲的是 L1 ASPM 对整机 27W 的影响，不是 GPU DRAM 带宽。**结论：decode/prefill 是 GPU 内部访存，ASPM 开关影响极小；对 host→device 权重流有影响。**
+  https://z8.re/blog/aspm.html ；https://wireless.docs.kernel.org/en/latest/en/users/documentation/aspm.html
+- **真正影响 RDNA4 内存有界负载的是这两项**（有实测）：
+  1. **power state 别开 peak**：`RADV_PROFILE_PSTATE=peak` 强制最高时钟会因功耗墙导致**内存有界负载 -23% 回归**（zolotukhin 实测；标准态反而更好）；ROCm 官方 rocprof 文档也要求 Navi3x 计数器采集用 `profile_standard`。
+     https://zolotukhin.ai/zinc/docs/amd-gpu-reference ；https://rocm.docs.amd.com/projects/rocprofiler/en/latest/how-to/rocprofv2-usage.html
+  2. **GPU ECC 默认开，吃掉 ~10% 带宽**：RDNA4 默认启用 GECC；用 `amdgpu.ras_enable=0` 关掉实测 Qwen3.6-35B Q4_K 从 101→110 tok/s（+9%）。**推理可接受 bit-flip 的话建议关。**
+     https://zolotukhin.ai/zinc/docs/amd-gpu-reference
+  3. **SMU 固件/内核版本**：内核 6.17 的 SMU 接口 v0x2e 与 RDNA4 期望的 v0x32 不匹配会把时钟钉在 ~2.2 GHz；等内核/固件更新或回退版本。同上来源。
+
+---
+
+
+
+- **目标**：`hipcc --offload-arch=gfx1201`（本机已验证）。初次支持见 Phoronix：https://www.phoronix.com/news/AMD-LLVM-RDNA4-GFX1200 ；ROCm 编译器参考：https://rocm.docs.amd.com/en/docs-6.1.0/reference/rocmcc.html
+- **wave 大小**：`-mwavefrontsize64` / `-mno-wavefrontsize64` 用于 RDNA 架构设置 wavefront 32/64（ROCm compiler reference 明确列出）。**WMMA 内核必须 wave32**（intrinsic target 要求 `wavefrontsize32`）；**decode GEMV 建议 wave64**。**两者不能共存于同一个内核**，实践上按内核分文件/分编译单元处理（llama.cpp 做法）。本机构建已用 `-mno-wavefrontsize64`（= wave32）——注意这意味着**所有 decode GEMV 内核也是 wave32**，若想 wave64 要分开编。
+- **intrinsic 直接可用**：Clang 的 `__builtin_amdgcn_*`（WMMA、buffer load、av_load/store、cluster 等）在 HIP 里直接用，不需要 ASM。规则见 https://clang.llvm.org/docs/AMDGPUBuiltinReference.html 。
+- **inline asm**：需要时用 `asm volatile("v_wmma_f32_16x16x16_bf16 v[%0], v[%1], v[%2], v[%3]" ...)` 语法参照 RDNA4 ISA 参考（PDF）：https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna4-instruction-set-architecture.pdf
+- **机器可读 ISA**（生成指令表的官方工具 + XML 规范）：GPUOpen Machine-Readable ISA https://gpuopen.com/machine-readable-isa/ + GitHub `GPUOpen-Tools/isa_spec_manager`；`amd_matrix_instruction_calculator` 可算每条 WFMA/MFMA 的 FLOPs/cycles/regs：https://github.com/ROCm/amd_matrix_instruction_calculator
+- **注意**：gfx1201 的 WMMA 输出 lane 映射文档缺口 → 参考 CK 源码 `wmma_gemm.hpp` 的 ASCII 图（ROCm issue https://github.com/ROCm/ROCm/issues/6025）。
+- **wave64 注意**：`-mno-wavefrontsize64` 会全局关成 wave32；`__builtin_amdgcn_*`（如 wmma）自带 target 约束会自动要求 wave32 特性，若冲突会报 "feature wavefrontsize32 required"。
+
+
+官方文档（ROCm Core SDK 10 的 ROCProfiler 2.0）：https://rocm.docs.amd.com/projects/rocprofiler/en/latest/how-to/rocprofv2-usage.html
+
+- 最简单：`rocprofv2 --kernel-trace <app>` → 每个 kernel 的 `Start_Timestamp`/`End_Timestamp`（**ns**）、GRD/WGR/LDS/Arch_VGPR/Wave_Size 等。
+- 加计数器：`rocprofv2 --list-counters` 看 gfx1201 可用计数器（如 `SQ_WAVES`、`SQ_INSTS_VALU`、`FETCH_SIZE`、`WRITE_SIZE`），写进 `-i input.txt`（`pmc:` 行），`-n/--no-serialization` 避免 kernel 序列化改变时序。
+- **Navi 计数器注意**：官方明确要求 Navi3x 计数采集前设 `power_dpm_force_performance_level=profile_standard`，否则时钟波动让数据不可信；`auto` 用于非计数 profiling。**RDNA4 同理**（wattman/功耗墙行为见 B.5）。
+- 带宽利用率 = `FETCH_SIZE / (End-Start)`；如果计数器没有显式 DRAM 总线计数器，可用 `(FETCH_SIZE+WRITE_SIZE)/ΔT` 对比 615 GB/s。
+- legacy `rocprof`（rocprof 1.x）：`rocprof --stats -d . <app>` 给 per-kernel dispatch 时间 < n > 与总时间占比；2.x 用 `rocprofv2 --kernel-trace`（更推荐）。
+
+
+- RDNA4 ISA Reference（PDF，opcodes/encoding/寄存器）— AMD 官方：https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna4-instruction-set-architecture.pdf
+- GPUOpen 架构文档中心（RDNA Performance Guide、Matrix Cores RDNA4、WMMA on RDNA3、Occupancy、机器可读 ISA）：https://gpuopen.com/amd-gpu-architecture-programming-documentation
+- Clang AMDGPU Builtins（官方 intrinsic 大全，含 wmma 全家族与 aux 编码）：https://clang.llvm.org/docs/AMDGPUBuiltinReference.html
+- LLVM AMDGPU User Guide（target triple/特性/内存模型 code sequence）：https://llvm.org/docs/AMDGPUUsage.html ；DMA 操作：https://llvm.org/docs/AMDGPUDMAOperations.html
+- ROCm GPU 硬件规格表（LDS/wave/L2 各行，官方交叉核对用）：https://rocm.docs.amd.com/en/latest/reference/gpu-arch-specs.html
+
+---
+
+
+
+源码（master）：https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-cuda/mmq-config-rdna4.cuh
+
+结构（已读取全文）：
+- 对全部量化型别（Q1_0…Q8_0、Q2_K…Q6_K、IQ1_S…IQ4_NL、MXFP4、NVFP4）给出参数元组 `(type, 128|256, 2, 64or128, rows, sram_layout, MMQ_ITER_K, booleans...)`，即 **cache-line 对齐的 128/256 行 tile、每 CTA 2 组、行组 64/128、块 K，统一走 `MMQ_ITER_K` 的 K-iter 主循环**，`sram_layout` 选择 Q8_0/Q8_1/Q2_K/Q3_K/Q6_K/NVFP4 的 LDS 布局。
+- 组织要点：**权重按 128B cache line 对齐分块（`128,2` / `256,2`），K 方向迭代（`MMQ_ITER_K`）**，每线程处理行组内若干行，从 LDS（Q8_0 反量化后布局）取数、寄存器解码重定标 → 内积 → LDS 归约。GEMV/decode 用它做**带宽有界**的 matmul-vec（wave64 更优，见 B.2）。
+- 对比本工程：t2 三元 2-bit 权重可参照 Q2_K/Q3_K 的 SRAM layout 思路，把 2-bit 解码放到 LDS→寄存器阶段做，复用 `MMQ_ITER_K` 的主循环结构。
+
+
+- 历史文件 `fattn-wmma-f16.cu`（ROCm 6.4 时代 gfx1201 上有编译 bug 记录，证明该路径确实在 gfx1201 上被用过）：issue https://github.com/ggml-org/llama.cpp/issues/13110
+- 现代 llama.cpp 把 CUDA FP16 flash-attn 统一到 `ggml/src/ggml-cuda/fattn-mma-f16.cu`（`fattn.cu` 里按 `amd_wmma_available(cc)` 派发）；RDNA4 gfx120x 的 WMMA flash-attn 路径在运行时 `amd_wmma_available` 命中。（https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-cuda/fattn.cu ；社区 RDNA4 增强补丁集 https://github.com/stew675/llama-cpp-rdna-boosts 把 WMMA flash-attn、chunked-GDN、k-quant VDR 都建在 gfx120x 上）
+- **移植借鉴**：WMMA flash attention 用 wave32 + `__builtin_amdgcn_wmma_*`，QK tile 用 FP16/FP16→FP32 累计，PV 用 FP16×FP16→FP16；GQA 分解 + ncols1 特化（`flash_attn_ext_mma_f16_switch_ncols1`）减少冗余 IO。本工程 decode attention 手写 `__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12` 的姿势与 llama.cpp 一致，可对照它们处理 gfx12 lane 映射（ROCm issue #6025）与 mask 的方法。
+
+
+- Triton AMD 后端布局 `amd_wmma`（矩阵核心专用布局），自动把 `tl.dot` 降到 `v_wmma_*`；AMD 为 Triton 提供了一组后端 pass（AMDGPU accelerate Matmul、Stream Pipeline、Block Ping-pong、Optimize Epilogue、bypass-LDS 等）。来源：ROCm 官方博客 https://rocm.blogs.amd.com/software-tools-optimization/kernel-development-optimizations-with-triton-on-/README.html ；PyTorch 博客 https://pytorch.org/blog/triton-kernel-compilation-stages
+- **RDNA4（gfx1201）实测**：FP8 `tl.dot` 自动编成 `v_wmma_f32_16x16x16_fp8_fp8`，社区在 R9700 跑 Qwen3-30B/GPT-OSS-20B FP8 OK（需 `VLLM_ROCM_USE_AITER=0`；`num_stages=2` 上限，见 B.3）：https://discuss.vllm.ai/t/native-fp8-wmma-support-for-amd-rdna4-rx-9070-xt-r9700-in-vllm/1900 ；https://github.com/vllm-project/vllm/issues/28649
+- TileLang 也有面向 gfx11/gfx12 的 WMMA intrinsic 发射器（f16→f32 16×16×16, warp=32）：https://tilelang.com/autoapi/tilelang/rocm/intrinsics/wmma_macro_generator/index.html
+- **对本工程**：prefill 的 GEMM 可优先评估"让 Triton 自动编"（节省手写布局时间），但 t2 三元反量化不在标准 tl.dot 能力内 —— 需要先反量化成 bf16 tile 再 dot，或手写 HIP 内核把反量化与 WMMA 融合（GPUOpen part2 的 wide-K 样例就是官方给的融合模板）。
+
+
+- **gfx1201 没有 thread-block-cluster / 分布式共享内存**：Clang 的 cluster 内置（`__builtin_amdgcn_cluster_id_*`、`cluster_workgroup_*`）全部标 **gfx1250-insts**——那是 RDNA5 的特性，**gfx1201 不可用**。https://clang.llvm.org/docs/AMDGPUBuiltinReference.html
+- **gfx1201（gfx12）实际可用的新机制**：
+  - 拆分屏障 `s_barrier_signal` / `s_barrier_wait`（可以把 barrier 等待与独立指令重叠）；
+  - 拆分内存计数器 `loadcnt` / `kmcnt` / `dscnt`（比 gfx11 的 vmcnt/lgkmcnt 更细粒度，只在必要依赖上等）；
+  - **乱序内存访问**（RDNA4 去掉了跨 wave 的假内存序依赖，独立内存操作可以乱序完成，减少假 stall）；
+  - RDNA4 的缓存策略位 `th[0:2]` + `scope[3:4]`（B.2）。
+  - 来源：Chips and Cheese LLVM 文 https://chipsandcheese.com/p/examining-amds-rdna-4-changes-in-llvm ；ChC RDNA4 OoO 内存 https://chipsandcheese.com/p/rdna-4s-out-of-order-memory-accesses ；zolotukhin 参考页。
+- **对本工程**：利用 `s_barrier_signal/wait` 重叠 decode 里 GEMV 之后的归约 barrier 与下一层权重 load；用 `s_waitcnt loadcnt(0)` 而非全量等待；global load 用 streaming hint 让权重不污染 L2。
+
+---
+
+
+按优先级（对应任务目标：decode @100k ≥30 t/s，prefill ≥1000 t/s）：
+
+1. **复核"gfx1201 无 int8/fp8 WMMA"结论**。官方 Clang 有 `iu8/fp8/bf8` gfx12 WMMA 内置，Triton/vLLM 已跑通。若 `mma_s8 = trap` 是移植层无对应语义，改走 `__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12`（int4 用 `iu4` 变体）即可。→ 影响量化 QK/decode 精度路径，也影响三元 GEMM 可否用 INT8 中间格式。
+2. **写最小纯 bf16 WMMA GEMM 校准探针**（输入直接 bf16、不反量化；M=34816,N=512,K=5120；wave32；覆盖全部 64 CU；用 rocprofv2 证实时钟与指令占用），区分"矩阵单元峰值"与"反量化管线开销"。**35 vs 195 的真相判定以此为据**；预期矩阵单元能到 100+ TFLOPS（若时钟 2.4G 则为 ~157 上限），35 是反量化+搬运限制。
+3. **三元 GEMM 按 GPUOpen wide-K 模板重做**：反量化→bf16 tile→WMMA 双 K 融合（每个线程取 16 元素 128-bit 载荷），K 循环用 `num_stages=2` + VGPR 双缓冲 + `s_waitcnt loadcnt`；权重读用 streaming cache hint。这个直接决定 prefill 上限。
+4. **decode 用 wave64 GEMV 专用内核**（别用 WMMA）：DMMV 每线程 16B 载荷、多 wave 隐藏延迟、streaming hint；t2 反量化参考 mmq-config 的 128/256 行 + K-iter 组织。目标带宽效率 ≥70%（现在 95.5% 流式已证明可行）。@100k ≥30 t/s 依赖此路。
+5. **attention**：保持 gfx12 WMMA decode attention（姿势正确）；对齐 llama.cpp 对 gfx12 lane 映射的处理（issue #6025）与 GQA 特化；prefill attention O(T²) 部分用 FP16 QK（官方支持）而非必要地加宽到 bf16；int8 K 反量化冗余 4× 的问题等复核 1 之后再议。
+6. **系统层**：关 GPU ECC（`amdgpu.ras_enable=0`，+~10% 带宽）；power state 用 `profile_standard`/auto 而非 peak（peak 反而 -23%）；确认 SMU/内核版本匹配避免锁 2.2G；ASPM 对 GPU 内 DRAM 无影响，别为其折腾。
+7. **编译**：WMMA 内核与 GEMV 内核分编译单元（一个 wave32、一个 wave64，LLVM 不能在一个 kernel 里混 wave 大小）；`--offload-arch=gfx1201` 已对；用 `AMDGPUUsage`/`GPUOpen` 文档做汇编参考，`amd_matrix_instruction_calculator` 算指令吞吐。
+
+---
+
+
+**AMD 官方（产品/文档/博客）**
+- https://www.amd.com/en/products/graphics/desktops/radeon/9000-series/amd-radeon-rx-9070xt.html — 195/389/779 TFLOPS 口径
+- https://gpuopen.com/learn/using_matrix_core_amd_rdna4 — RDNA4 矩阵核心官方指南（FLOPS/clk/CU 表、gfx12 intrinsic）
+- https://gpuopen.com/learn/wmma-guide-amd-rdna-4-gpus-part-1 — WMMA 布局/转置
+- https://gpuopen.com/learn/wmma-guide-amd-rdna-4-gpus-part-2 — wide-K 双 K 融合达峰值带宽（FP8/INT8 128-bit）
+- https://gpuopen.com/learn/wmma_on_rdna3 — RDNA3 WMMA 参考（OPSEL、fragment 布局）
+- https://gpuopen.com/learn/rdna-performance-guide / https://gpuopen.com/amd-gpu-architecture-programming-documentation / https://gpuopen.com/machine-readable-isa/
+- https://gpuopen.com/learn/amd-lab-notes/amd-lab-notes-matrix-cores-readme
+- https://rocm.docs.amd.com/projects/rocprofiler/en/latest/how-to/rocprofv2-usage.html — rocprofv2 用法
+- https://rocm.docs.amd.com/en/docs-6.1.0/reference/rocmcc.html — hipcc 编译选项（wavefrontsize64）
+- https://rocm.docs.amd.com/en/latest/reference/gpu-arch-specs.html — GPU 硬件规格
+- https://rocm.blogs.amd.com/software-tools-optimization/kernel-development-optimizations-with-triton-on-/README.html — AMD Triton pass
+- https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna4-instruction-set-architecture.pdf — RDNA4 ISA PDF
+
+**LLVM/Clang**
+- https://clang.llvm.org/docs/AMDGPUBuiltinReference.html — AMDGPU 内置（wmma、aux、cluster gfx1250）
+- https://codebrowser.dev/llvm/clang/include/clang/Basic/BuiltinsAMDGPU.def.html — wmma gfx12 定义源
+- https://llvm.org/docs/AMDGPUUsage.html — AMDGPU 后端指南（内存模型/目标特性）
+- https://llvm.org/docs/AMDGPUDMAOperations.html — DMA 操作（GFX9 / GFX1250，无 gfx1201）
+
+**可信第三方**
+- https://zolotukhin.ai/zinc/docs/amd-gpu-reference — RDNA3/RDNA4 推理参考（WMMA 表、延迟、LDS、电源/ECC/SMU 实测）
+- https://chipsandcheese.com/p/examining-amds-rdna-4-changes-in-llvm — RDNA4 LLVM 变化（缓存位、内存计数器）
+- https://chipsandcheese.com/p/amds-rdna4-architecture-video （L2 银行翻倍）/ https://chipsandcheese.com/p/llvm-divination-of-gfx1251s-differences （WMMA 4-pass 调度）/ https://chipsandcheese.com/p/rdna-4s-out-of-order-memory-accesses
+- https://www.techpowerup.com/gpu-specs/radeon-rx-9070-xt.c4229 与 review/…/technical-deep-dive/3.html — TFLOPS 拆解
+- https://hothardware.com/reviews/amd-rdna-4-architecture-deep-dive / https://wccftech.com/amd-rdna-4-architecture-deep-dive-new-compute-units-raytracing-cores-ai-enhancements-path-tracing — 每 CU 2 矩阵单元 / DCU 4 MA
+- https://streamhpc.com/blog/2026-06-24/rdna-and-cdna-similarities-and-differences/ — RDNA vs CDNA 对比（wave/SIMD/MFMA）
+- https://www.osti.gov/servlets/purl/2345982 与 https://salykova.github.io/matrix-cores-cdna — CDNA MFMA 延迟/每 CU 4 Matrix Core / FLOPS 公式
+- https://github.com/ROCm/amd_matrix_instruction_calculator — 官方矩阵指令计算器
+- https://github.com/ROCm/ROCm/issues/6025 — gfx12 WMMA lane 映射文档缺口
+- https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-cuda/mmq-config-rdna4.cuh — RDNA4 MMQ 配置
+- https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-cuda/fattn.cu 与 issue https://github.com/ggml-org/llama.cpp/issues/13110 — WMMA flash-attn 路径
+- https://github.com/stew675/llama-cpp-rdna-boosts — RDNA4 增强补丁集（WMMA FA、chunked-GDN）
+- https://discuss.vllm.ai/t/native-fp8-wmma-support-for-amd-rdna4-rx-9070-xt-r9700-in-vllm/1900 — FP8 WMMA Triton 验证
+- https://github.com/vllm-project/vllm/issues/28649 / https://github.com/vllm-project/vllm/issues/45929 — RDNA4 FP8 补丁 / num_stages 限制
+- https://github.com/ROCm/aiter/issues/900 — RDNA4 缺 FA/hipBLASLt 调优的生态现状
+- https://z8.re/blog/aspm.html 与 Linux ASPM 文档 — ASPM 本质（PCIe 链路）
+- https://github.com/iree-org/iree/discussions/23077 — gfx1250 LDS DMA 规划（对比确认 gfx1201 无）
+- https://www.reddit.com/r/LocalLLaMA/comments/1j088yg/rx_9070_xt_potential_performance_discussion — 195 公式社区验证
+
+> **背景**：G 盘（文档卷）出现磁盘故障，`G:\ninfer-hip\probe` 目录 `corrupted and unreadable`，
+> 部分文件损坏。工作目录已紧急迁移到 D 盘。本文档是迁移交接的唯一权威记录。
+
+
+| 目录 | 文件数 | 说明 | 状态 |
+|---|---|---|---|
+| `ninfer/` | 1758 | **引擎完整源码**（src/ 全部内核 + 头文件） | ✅ 1 文件损坏（见下） |
+| `shensanshu/` | 1545 | **原版 NInfer 参考**（ambolio-base 等） | ✅ 完整 |
+| `milestones/` | 731 | 历史快照（20260927 起全部里程碑） | ✅ 完整 |
+| `shim/` | 16 | HIP/CUDA shim（编译依赖） | ✅ 完整 |
+| `build/` | 947 | 编译产物（exe/lib，1.98GB） | ✅ 完整（可重建） |
+| `build_nordc/` | 535 | .obj/.lib + _cc_*.bat 编译脚本 | ✅ 完整（可重建） |
+| `rocwmma_include/` | 114 | rocWMMA 头 | ✅ 完整 |
+| `ternary/` | 1 | 三元内核辅助 | ✅ |
+| `dump/` | 33 | 调试转储 | ✅ |
+| `eval_out/` | 3 | 评测输出 | ✅ |
+| **`probe_rebuilt/`** | 3 | **交接文档重建**（TARGETS/RESUME/PLAN） | 🔶 从会话记忆重建 |
+
+- 顶层脚本/结果/文档 135 个（.py/.md/.json/.pdf/.parquet 等，~2MB）
+- `eval_results/`（评测报告，1 文件）
+- `tools/`、`test/`、`dflash_debug/`、`logs/` 的部分小文件
+- ⚠️ llama.cpp / prism-llama / llama-hip-official 为 **git 仓库（可重建，未迁移）**
+
+
+1. **`G:\ninfer-hip\probe` 目录全部损坏不可读**（核心损失）：
+   - 探针源码：`simt_dot_probe.cu`、`decode_wmma_probe.cu`、`bench_decode_gemv.cu` 等
+   - 任务文件：`task_cap55.txt`、`task_cap75b.txt`、`tasks_capdiag.txt`
+   - 所有 `_simt*.out`、`gsq_*.json`、`_q4v*.out` 等实测数据
+   - → **TARGETS.md / RESUME_20261003.md / PLAN_simt_decode.md 已重建**（含全部关键结论与参数扫描数据）
+   - → 其余探针可按重建文档重写（核心算法/布局已在 PLAN 记录）
+2. **`ninfer/src/ops/sparse_moe/decode/sparse_moe_decode_plan.cpp`**（1.6KB）损坏不可读
+   - → 可从 milestones 快照恢复（若该文件在快照中存在），否则按 sparse_moe 其他 plan 文件重写
+3. **llama.cpp 源码 2 文件 CRC 损坏**（磁盘物理坏道，2026-10-03 确认）：
+   - `llama.cpp/ggml/src/ggml-et/et-kernels/src/block_ops.h`（44KB）
+   - `llama.cpp/common/common.h`（51KB）
+   - → **可恢复**：llama.cpp 的 `.git` 已完整迁移（1022 文件），换盘后 `git checkout` 即可从本地 git 历史还原这两个文件
+4. **prism-llama 差 3 文件**：`.git` 元数据部分（HEAD/config/description 等，git 可重建）；prism-llama 主源码已 51321/51324
+
+- 迁移后 D 盘剩余 **仅 ~5GB**（原 17.7 → 迁移后 5.2）
+- **不可再往 D 盘写大文件**（llama.cpp git 仓库、模型文件勿放 D 盘）
+- 如需继续，请清理 D 盘或换更大的目标盘
+
+1. 新盘挂载后，把 `D:\ninfer-hip-migrate` 整体拷回新盘同构路径（或直接用 D:\ 路径改构建脚本）
+2. 恢复缺失头文件（若 build 报错）：从 `milestones\*\ninfer\src\ops\linear\ternary\` 拷 `ternary_dispatch.h`（本次迁移前曾误删过一次，已用 milestone 版恢复）
+3. 确认模型路径：`S:\NLP_Qwen\...`（换盘后核对 S 盘）与 `D:\ninfer-models\ternary_bonsai_27b_v3.ninfer`
+4. 按 `probe_rebuilt\RESUME_20261003.md` 的构建链重编：`.cu → _cc_*.bat`、`.cpp → compile_one_cpp.py`、`swap_lib.py → link_exe.py`、`NINFER_NORDC=1`
+5. 用 `NINFER_ATTN_SIMT=1` 启用 SIMT decode（@100k 24.51 t/s，bf16 最优）
+
+- 总纲：`D:\ninfer-hip-migrate\probe_rebuilt\TARGETS.md`
+- 进度：`D:\ninfer-hip-migrate\probe_rebuilt\RESUME_20261003.md`
+- SIMT 计划：`D:\ninfer-hip-migrate\probe_rebuilt\PLAN_simt_decode.md`
+- 引擎源码：`D:\ninfer-hip-migrate\ninfer\src\`
+- 原版参考：`D:\ninfer-hip-migrate\shensanshu\ambolio-base\`
+- 编译脚本：`D:\ninfer-hip-migrate\build_nordc\`
+
+**SIMT decode 已集成（@100k 24.51 t/s，wmma 15 的 +63%）；剩余最大优化头是 64 层 MLP/GDN 三元 GEMV（占 decode 43%），对齐探针可再 +15-20% → 逼近 30 生死线；MTP 修复（2.5-3×）是 v1.1 直接跨过 30 的杠杆。**

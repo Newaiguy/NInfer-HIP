@@ -1,0 +1,64 @@
+###ID pr1600
+
+> 📌 **最新交接 (--, 新会话先读): `HANDOFF_.md`** —— 含本轮数据纠错
+> (曾误报 "prefill + 达成/ms"，真实 = - t/s 未达标；SIMT wu_panel edit 实际失败未应用)、
+> 长上下文发布门槛 (对标 llama.cpp k@- t/s)、k 显存估算、按序执行计划 (长ctx测量→KV优化→prefill +→MTP v.→发 GitHub)。
+> 以下 -- 段 (引擎快照/构建铁律/教训) 仍有效。
+> ⚡ **新会话开工指南 (-- 三更, 读完这段直接干活)**:
+> 当前引擎 = milestones/_rotation_bitexact_decode/ninfer_mini_nordc.exe (复制到 build/)。
+> **本轮核心修复: Hadamard 旋转内核并行化 (已逐位验证)** ——
+> 旧内核: 一个 warp 独占一个  点块, T= 时只启  个 warp (机器  个 warp 槽, % 占用),
+> 每个 warp 内  级串行蝶形。旋转是每个 ternary linear 的前置步骤 (每层  次 ×  层), 拖慢一切。
+> 新内核: 一个  线程 CTA 协作处理一个 ( 块, token) 对, 共享内存蝶形。
+> **踩过的坑**: 第一版把 pair 编码 p=(lane<<|idx) 整体移位做 insert_zero, 混入高位 → 引擎乱码;
+> probe/rotation_probe.cu 一跑就复现 (/ differ)。修正: 拆出 (lane, idx) 后只对低位
+> insert_zero → 探针 / differ 逐位一致, 引擎 Paris ✓ 文本逐字同。
+> **教训: 数值内核改动必须先写独立对拍探针, 再进引擎。**
+> **decode . → . t/s (短 prompt), 真实任务 .-.; prefill  → -**。
+> 回退: NINFER_ROTATION_WARP=。MTP draft= = . (仍负收益, 见下)。
+> 时间算进当前段 —— ffn-split 报的 gate_up . ms 里混着 GDN/attn 的时间。
+> 可靠的只有: 端到端 `finish=` 行, 和 NINFER_PROFILE_PREFILL= 的 event timeline
+> (总时长可信, 单段因 event 归属可能漂移)。
+>
+> **下一刀**: MTP 单轮 ~ ms 里, 前向  (layers  + lm_head . + argmax .) +
+> draft ., **还有 ~ ms 非前向开销未定位** (KV commit / egress / host 调度)。
+> 这是 MTP 转正 (当前 . vs 纯 .) 的关键; 原版 MTP/无MTP = / = .x, 我们 .x。
+> 计时开关: NINFER_PROFILE_VERIFY= (verify-split / ffn-split, 注意上面的教训)。
+> 诊断开关全部保留: NINFER_TERN_GEMV_MULTI / NINFER_MTP_TEACHER / NINFER_MTP_AR_POS_SHIFT /
+> NINFER_ROTATION_WARP / NINFER_ATTN_TRACE。
+>
+> ⚡ **(本段结束, 以下为 -- 三更)**:
+> 当前引擎 = `milestones/_verify_fix_mtp_window/ninfer_mini_nordc.exe`
+> (复制到 build/ 使用; Paris ✓, prefill  **** /  **.**, decode @
+> **.**, 真实任务 decode **.-.**, MTP draft= **.** /  **.** /  **.**)。
+>
+> **本轮修掉的真 bug**:
+> . `causal_softmax_attention.cpp` 与 `ternary_rowsplit_gemm.cu` 里被补丁脚本写坏的
+>    **单引号跨行字符串** + `cache.storage` 笔误 → 两个 TU 根本编译不过，库里一直是**旧对象**，
+>    注意力路由与 GEMM 派发都处于未知版本。**教训: 换 obj 后必须 grep 新字符串确认**。
+> . **T=.. 走错 GEMM 内核** (本世纪最大的一刀): 派发到
+>    `ternary_pq_mma_small_t_kernel` (-token 块 + KB 静态 smem → 每 SM  个 CTA)，
+>    实测 **. ms**；同样权重走寄存器解码 WMMA 只要 **. ms (×)**。
+>    已把 T=.. 全部改走 `launch_pq_mma_prefill`，旧内核留在
+>    `NINFER_TERNARY_SMALLT=` 后面。**T= 前向 . ms → . ms**。
+> . MTP draft 窗口  →  (`internal.h` + `round_buffers.h`)，verify 开销对宽度几乎不敏感
+>    (T= ms / T= ms / T= ms，权重只读一遍)，所以宽窗口几乎是白送。
+>
+> **新增构建工具 (重要)**: `probe/check_stale.py` (源比 obj 新的清单)、
+> `probe/swap_lib.py` (**必须用它换 obj**: `llvm-ar r` 不会替换异名成员，
+> `.cpp.o` / `.cpp.obj` 双成员会让链接器取旧对象)、
+> `probe/rebuild_lib.py` (**build_lib.py 只比源文件 mtime，改头文件不会重编依赖 TU**，
+> 结构体大小不一致 = 静默错误)、`probe/run.py` (artifact open 偶发失败自动重试)、
+> `probe/bench_small_t.cu` (小 T GEMM 横评 + **正确性交叉校验**)。
+>
+> **探针盲区已补**: `probe/attn_flash_probe.cu` 原本只测 T∈{,,,,...}，
+> **正好漏掉 .. = verify 区间**；现在 `--sweep` (T=..) 与 `--positions `
+> (pos≠) 全绿。
+>
+> **MTP 现状 (诚实结论)**: 真实任务上 MTP **仍然亏** (draft= . vs 纯 decode .)。
+> 量化原因: 单轮 ≈  ms，其中 verify(宽度) ≈  ms、draft 自回归链 ≈  ms，
+> 而**接受率只有 ./轮** (第  个 draft % 正确，第  个只剩 %)。
+> 纯 decode 一步只要  ms ⇒ 即使 verify 免费也只能到  t/s。
+> 权重物理下限: 每 token ≈ . GB 三元权重、实测最高流式  GB/s ⇒ 单遍 . ms
+
+The secret verification code is 7391. Remember it. What is the secret verification code? Answer with digits only.

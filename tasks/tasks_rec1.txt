@@ -1,0 +1,24 @@
+###ID rec1
+
+Record 1 says the word is apple.
+Record 2 says the word is bridge.
+Record 3 says the word is candle.
+Record 4 says the word is desert.
+Record 5 says the word is engine.
+Record 6 says the word is forest.
+Record 7 says the word is guitar.
+Record 8 says the word is harbor.
+Record 9 says the word is island.
+Record 10 says the word is jacket.
+Record 11 says the word is kettle.
+Record 12 says the word is ladder.
+Record 13 says the word is magnet.
+Record 14 says the word is needle.
+Record 15 says the word is orange.
+Record 16 says the word is pencil.
+Record 17 says the word is quartz.
+Record 18 says the word is rocket.
+Record 19 says the word is silver.
+Record 20 says the word is tunnel.
+
+What word does Record 1 give? Answer with one word.

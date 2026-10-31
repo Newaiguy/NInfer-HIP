@@ -1,0 +1,213 @@
+###ID long
+
+> 📌 **最新交接 (2026-09-30, 新会话先读): `HANDOFF_20260930.md`** —— 含本轮数据纠错
+> (曾误报 "prefill 1000+ 达成/1247ms"，真实 = 406-417 t/s 未达标；SIMT wu_panel edit 实际失败未应用)、
+> 长上下文发布门槛 (对标 llama.cpp 100k@35-40 t/s)、262k 显存估算、按序执行计划 (长ctx测量→KV优化→prefill 1000+→MTP v1.1→发 GitHub)。
+> 以下 2026-09-29 段 (引擎快照/构建铁律/教训) 仍有效。
+
+> ⚡ **新会话开工指南 (2026-09-29 三更, 读完这段直接干活)**:
+
+
+> 当前引擎 = milestones/20260929_rotation_bitexact_decode49/ninfer_mini_nordc.exe (复制到 build/)。
+> **本轮核心修复: Hadamard 旋转内核并行化 (已逐位验证)** ——
+> 旧内核: 一个 warp 独占一个 1024 点块, T=4 时只启 20 个 warp (机器 256 个 warp 槽, 8% 占用),
+> 每个 warp 内 10 级串行蝶形。旋转是每个 ternary linear 的前置步骤 (每层 2 次 × 64 层), 拖慢一切。
+> 新内核: 一个 256 线程 CTA 协作处理一个 (1024 块, token) 对, 共享内存蝶形。
+> **踩过的坑**: 第一版把 pair 编码 p=(lane<<4|idx) 整体移位做 insert_zero, 混入高位 → 引擎乱码;
+> probe/rotation_probe.cu 一跑就复现 (20476/20480 differ)。修正: 拆出 (lane, idx) 后只对低位
+> insert_zero → 探针 0/20480 differ 逐位一致, 引擎 Paris ✓ 文本逐字同。
+> **教训: 数值内核改动必须先写独立对拍探针, 再进引擎。**
+> **decode 44.4 → 49.2 t/s (短 prompt), 真实任务 45.4-47.0; prefill 236 → 264-271**。
+> 回退: NINFER_ROTATION_WARP=1。MTP draft=3 = 24.7 (仍负收益, 见下)。
+> 时间算进当前段 —— ffn-split 报的 gate_up 4.69 ms 里混着 GDN/attn 的时间。
+> 可靠的只有: 端到端 `finish=` 行, 和 NINFER_PROFILE_PREFILL=1 的 event timeline
+> (总时长可信, 单段因 event 归属可能漂移)。
+>
+> **下一刀**: MTP 单轮 ~112 ms 里, 前向 55 (layers 53 + lm_head 1.5 + argmax 0.15) +
+> draft 15.5, **还有 ~42 ms 非前向开销未定位** (KV commit / egress / host 调度)。
+> 这是 MTP 转正 (当前 12.7 vs 纯 44.5) 的关键; 原版 MTP/无MTP = 179/62 = 2.9x, 我们 0.29x。
+> 计时开关: NINFER_PROFILE_VERIFY=1 (verify-split / ffn-split, 注意上面的教训)。
+> 诊断开关全部保留: NINFER_TERN_GEMV_MULTI / NINFER_MTP_TEACHER / NINFER_MTP_AR_POS_SHIFT /
+> NINFER_ROTATION_WARP / NINFER_ATTN_TRACE。
+>
+> ⚡ **(本段结束, 以下为 2026-09-28 三更)**:
+> 当前引擎 = `milestones/20260928_verify_fix_mtp_window/ninfer_mini_nordc.exe`
+> (复制到 build/ 使用; Paris ✓, prefill 512 **424** / 2048 **428.7**, decode @512
+> **41.6**, 真实任务 decode **43.5-44.1**, MTP draft=5 **22.1** / 9 **16.5** / 15 **12.3**)。
+>
+> **本轮修掉的真 bug**:
+> 1. `causal_softmax_attention.cpp` 与 `ternary_rowsplit_gemm.cu` 里被补丁脚本写坏的
+>    **单引号跨行字符串** + `cache.storage` 笔误 → 两个 TU 根本编译不过，库里一直是**旧对象**，
+>    注意力路由与 GEMM 派发都处于未知版本。**教训: 换 obj 后必须 grep 新字符串确认**。
+> 2. **T=2..15 走错 GEMM 内核** (本世纪最大的一刀): 派发到
+>    `ternary_pq2_mma_small_t_kernel` (16-token 块 + 57KB 静态 smem → 每 SM 1 个 CTA)，
+>    实测 **5.826 ms**；同样权重走寄存器解码 WMMA 只要 **0.217 ms (27×)**。
+>    已把 T=2..15 全部改走 `launch_pq2_mma_prefill`，旧内核留在
+>    `NINFER_TERNARY_SMALLT=1` 后面。**T=2 前向 823.8 ms → 60.1 ms**。
+> 3. MTP draft 窗口 5 → 15 (`internal.h` + `round_buffers.h`)，verify 开销对宽度几乎不敏感
+>    (T=4 57ms / T=8 66ms / T=32 76ms，权重只读一遍)，所以宽窗口几乎是白送。
+>
+> **新增构建工具 (重要)**: `probe/check_stale.py` (源比 obj 新的清单)、
+> `probe/swap_lib.py` (**必须用它换 obj**: `llvm-ar r` 不会替换异名成员，
+> `.cpp.o` / `.cpp.obj` 双成员会让链接器取旧对象)、
+> `probe/rebuild_lib.py` (**build_lib.py 只比源文件 mtime，改头文件不会重编依赖 TU**，
+> 结构体大小不一致 = 静默错误)、`probe/run.py` (artifact open 偶发失败自动重试)、
+> `probe/bench_small_t.cu` (小 T GEMM 横评 + **正确性交叉校验**)。
+>
+> **探针盲区已补**: `probe/attn_flash_probe.cu` 原本只测 T∈{1,2,64,100,...}，
+> **正好漏掉 3..63 = verify 区间**；现在 `--sweep` (T=1..80) 与 `--positions 512`
+> (pos0≠0) 全绿。
+>
+> **MTP 现状 (诚实结论)**: 真实任务上 MTP **仍然亏** (draft=5 22.1 vs 纯 decode 43.9)。
+> 量化原因: 单轮 ≈ 97 ms，其中 verify(宽度6) ≈ 72 ms、draft 自回归链 ≈ 25 ms，
+> 而**接受率只有 0.75/轮** (第 1 个 draft 94% 正确，第 2 个只剩 39%)。
+> 纯 decode 一步只要 23 ms ⇒ 即使 verify 免费也只能到 76 t/s。
+> 权重物理下限: 每 token ≈ 6.5 GB 三元权重、实测最高流式 530 GB/s ⇒ 单遍 12.3 ms
+> ⇒ **纯 decode 天花板 ≈ 80 t/s**，100+ 必须靠投机解码，而当前 MTP 头支撑不了。
+>
+> **下一步 (按实测收益排序)**:
+> ① **MTP 的 AR 步骤有 bug，这是本轮最重要的发现** —— 已经证明不是 draft head 的问题:
+>    - `NINFER_MTP_TEACHER=1` 把 verify 的 target token 喂给 draft 自回归链 (排除误差累积)
+>      ⇒ 接受率反而更低: k=2 0.62 / k=5 0.38 / k=9 0.38 / k=15 0.56；
+>    - `NINFER_MTP_AR_POS_SHIFT=0/1/5/6` 平移 AR 步骤的 cache position ⇒ 接受率纹丝不动 (0.38)；
+>    - 结论: **`mtp_forward_decode_batch` 的 AR 步骤 (width=1, batch=1) 本身算错**，
+>      与喂进去哪个 token、cache position 在哪都无关。
+>
+>    **已与上游逐行对照 (shensanshu/ambolio-base = 原始 NInfer, qwen3_6 target)**:
+>    - `src/ops/kernel/mtp_round.cuh` 的 `mtp_prepare_next_round_kernel` —— **逐字节相同**；
+>    - `src/targets/qwen3_6/impl/runtime/mtp_impl.h` 的 AR 链 —— **逐行相同**
+>      (ar_hidden 逐步回喂 / mtp_forward_decode_batch(previous, hidden, position, rope, valid) /
+>      cudaMemcpy D2D，连 slice 维度都对)；
+>    - `text_context_impl.h` 的 `mtp_forward_tail` / `mtp_forward_ar_step` —— **忠实移植**
+>      (差异只有 qwen3_5 的三轴 rope 封装 text_rope，是 ops::rope 的直通)；
+>    - **`speculative_round.cuh/.cu/.cpp/.h` 全部 0 diff** (select_accepted_hidden 因此排除)；
+>    - 排除实验: `NINFER_MTP_TEACHER=1` (喂 target 的 token) ⇒ 接受率不升反降；
+>      `NINFER_MTP_AR_POS_SHIFT=0/1/5/6` ⇒ 纹丝不动；AR 步骤强制走 Direct 元数据 ⇒ 无变化。
+>    ⇒ **host 端逻辑没有移植错误**，问题一定出在某个 AMD 端 kernel 的行为差异上，
+>      且只被 MTP AR 步骤命中 (width=1, batch=1, 用 `batch_mtp_kv_` 第 0 层 KV)。
+>    剩下唯一没对照的是 **MTP cache 的跨轮生命周期** (上游 program_impl.h 是 12378 行单体，
+>    我们拆成了 program/ 下的多文件)：verify 每轮往 MTP cache 写 width 个 token，
+>    AR 步骤在 frontier+1+s 处 append 会**覆盖** verify 已写的槽位，而更早轮次留下的
+>    槽位不会被作废 —— AR 步骤的 attention 是否读到了过期 key，是下一个排查点。
+>    **修正 (本轮最重要的结论)**: 上面"AR 步骤有 bug"的判断**是错的**。查上游
+>    `docs/performance/qwen3.8-27b.md` 的官方 MTP3 实测 (RTX 5090, 同一模型)：
+>    **acceptance 53-90%, tokens/round 2.14-3.68**。我们 draft=3 实测
+>    **200 tokens / 64 rounds = 3.12 tokens/round** —— **和上游 3.17 一致**。
+>    所以 MTP 工作完全正常，接受率从第一天起就没坏；我之前拿"接受率 ≈ draft 数"
+>    当标准是错的（draft=3 时 3.12/4 = 78% 本来就是健康值）。
+>    ⇒ AR 链、teacher forcing、position shift 这些"修复"都是不必要的，可以无视。
+>
+>    **真正的问题只有一个: 单轮时间。** 上游 RTX 5090 MTP3 = 130-224 tok/s；
+>    我们单轮 ~101 ms（draft=3: verify(width4) ≈ 72 ms + batch MTP forward 3.4 +
+>    propose 0.8 + 2×AR 9 ms + prepare 0.2）。要过 100 t/s 需要单轮 ≈ 30 ms
+>    (3.12/0.030 = 104 t/s)，即 **verify(T=4) 从 72 ms 压到 ~20 ms**。
+>
+>    T=4 前向目前 57.3 ms = mlp 25.4 + gdn 17.5 + attn 11.6（T=1 decode 整步 23 ms）。
+>    **要分清哪段是真浪费、哪段是物理必然**:
+>    - mlp 25.4 vs 11.8 (2.1×): 权重只读一遍，**2.1× 全是浪费**，可救 +13 ms
+>      (best measured small-T GEMM: gate_up 0.187 ms @253 GB/s, down 0.134 @177 GB/s；
+>       T=1 分别 0.089 @435 与 0.061 @386)；
+>    - attn 11.6 vs 3.4 (3.4×): KV 只读一遍，**大部分是浪费**，可救 ~+6 ms；
+>    - gdn 17.5 vs 5.6 (3.1×): **这个基本是物理必然** —— recurrent 是按 token 串行的
+>      (`launch_recurrent_inout` T=4 就是 4 步循环)，想救需要把 recurrent 改成
+>      chunked/并行扫描（上游 T≥64 才走 chunked，kChunkSize=64，所以 T=4 永远走 tail）。
+>
+>    可救合计 ~19 ms ⇒ verify 57→38 ms ⇒ 单轮 101→82 ms ⇒ **38 t/s**。
+>    **要到 100 t/s 还差一半，剩下的必须从 gdn 的串行 recurrent 或更宽的窗口里抠**
+>    （上游自己的答案是 DFlash2 K=7：tokens/round 4.5-6.7、decode 84-267 tok/s；
+>     我们这边报 `linear_topk: unsupported head profile`，
+>     是 `src/ops/linear_topk/linear_topk.cpp:38` 只认 Q8/FP8/Q4 头，还没支持 PQ2_0）。
+>    参考: 上游 `docs/performance/qwen3.8-27b.md` 有完整 MTP3/DFlash2 实测表。
+> ② MTP layer 的权重是 **bf16** (ternary trace 里 t=1 只有 lm_head 一个 gemv_smem 条目，
+>    MTP 层完全不走 ternary)，一次 MTP forward ~3.5 ms (tail 3.5 + stem 0.8)，
+>    k-1 次/轮 ⇒ 量化 MTP 层可省 20-60 ms/轮。
+> ③ BN16 WMMA (`pq2_rowsplit_wmma2_bn16_kernel`) 在探针里与 BN32 **逐位相同**
+>    (N/K/T/stride 全组合)，但一接进引擎前向就出乱码 —— 已改成 opt-in
+>    `NINFER_PREFILL_BN16=1`，未解决前不动。
+> ④ 纯 decode 剩余: GDN (48 层, ~225 GB/s) 与 lm_head (211 GB/s)；
+>    非关键路径上还有 ~3.9 ms/步 的小算子。
+> ⚡ **(本段结束, 以下为历史记录)**
+
+> ⚡ **新会话开工指南 (2026-09-28 二更, 读完这段直接干活)**:
+> 当前引擎 = `milestones/20260928_decode26_prefill431/ninfer_mini_nordc.exe`
+> (需复制到 build/ 下使用; Paris ✓, **prefill 2048: 430 t/s / 512: 427**, **decode 41.7 t/s @512 / 33.1 @2048**)。
+> **警告**: 手动 .obj 换库导致 lib 处于不一致状态 (build_nordc/ninfer_hip.lib 需全量重编)。
+> 当前 exe = milestone 快照的副本 (含全部 WMMA 优化), 但下次改代码必须先跑 probe/full_pipeline.ps1。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+The secret verification code is 7391. Remember it.
+
+以上对话中出现的 secret verification code 是多少？请直接回答数字。

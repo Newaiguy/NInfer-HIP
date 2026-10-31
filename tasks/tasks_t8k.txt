@@ -1,0 +1,131 @@
+###ID c9k
+# NInfer鈫扝IP (gfx1201) 绉绘椤圭洰浜ゆ帴鏂囨。
+
+> 馃搶 **鏈€鏂颁氦鎺?(2026-09-30, 鏂颁細璇濆厛璇?: `HANDOFF_20260930.md`** 鈥斺€?鍚湰杞暟鎹籂閿?
+> (鏇捐鎶?"prefill 1000+ 杈炬垚/1247ms"锛岀湡瀹?= 406-417 t/s 鏈揪鏍囷紱SIMT wu_panel edit 瀹為檯澶辫触鏈簲鐢?銆?
+> 闀夸笂涓嬫枃鍙戝竷闂ㄦ (瀵规爣 llama.cpp 100k@35-40 t/s)銆?62k 鏄惧瓨浼扮畻銆佹寜搴忔墽琛岃鍒?(闀縞tx娴嬮噺鈫扠V浼樺寲鈫抪refill 1000+鈫扢TP v1.1鈫掑彂 GitHub)銆?
+> 浠ヤ笅 2026-09-29 娈?(寮曟搸蹇収/鏋勫缓閾佸緥/鏁欒) 浠嶆湁鏁堛€?
+
+> 鈿?**鏂颁細璇濆紑宸ユ寚鍗?(2026-09-29 涓夋洿, 璇诲畬杩欐鐩存帴骞叉椿)**:
+> 褰撳墠寮曟搸 = milestones/20260929_rotation_bitexact_decode49/ninfer_mini_nordc.exe (澶嶅埗鍒?build/)銆?
+> **鏈疆鏍稿績淇: Hadamard 鏃嬭浆鍐呮牳骞惰鍖?(宸查€愪綅楠岃瘉)** 鈥斺€?
+> 鏃у唴鏍? 涓€涓?warp 鐙崰涓€涓?1024 鐐瑰潡, T=4 鏃跺彧鍚?20 涓?warp (鏈哄櫒 256 涓?warp 妲? 8% 鍗犵敤),
+> 姣忎釜 warp 鍐?10 绾т覆琛岃澏褰€傛棆杞槸姣忎釜 ternary linear 鐨勫墠缃楠?(姣忓眰 2 娆?脳 64 灞?, 鎷栨參涓€鍒囥€?
+> 鏂板唴鏍? 涓€涓?256 绾跨▼ CTA 鍗忎綔澶勭悊涓€涓?(1024 鍧? token) 瀵? 鍏变韩鍐呭瓨铦跺舰銆?
+> **韪╄繃鐨勫潙**: 绗竴鐗堟妸 pair 缂栫爜 p=(lane<<4|idx) 鏁翠綋绉讳綅鍋?insert_zero, 娣峰叆楂樹綅 鈫?寮曟搸涔辩爜;
+> probe/rotation_probe.cu 涓€璺戝氨澶嶇幇 (20476/20480 differ)銆備慨姝? 鎷嗗嚭 (lane, idx) 鍚庡彧瀵逛綆浣?
+> insert_zero 鈫?鎺㈤拡 0/20480 differ 閫愪綅涓€鑷? 寮曟搸 Paris 鉁?鏂囨湰閫愬瓧鍚屻€?
+> **鏁欒: 鏁板€煎唴鏍告敼鍔ㄥ繀椤诲厛鍐欑嫭绔嬪鎷嶆帰閽? 鍐嶈繘寮曟搸銆?*
+> **decode 44.4 鈫?49.2 t/s (鐭?prompt), 鐪熷疄浠诲姟 45.4-47.0; prefill 236 鈫?264-271**銆?
+> 鍥為€€: NINFER_ROTATION_WARP=1銆侻TP draft=3 = 24.7 (浠嶈礋鏀剁泭, 瑙佷笅)銆?
+> 鏃堕棿绠楄繘褰撳墠娈?鈥斺€?ffn-split 鎶ョ殑 gate_up 4.69 ms 閲屾贩鐫€ GDN/attn 鐨勬椂闂淬€?
+> 鍙潬鐨勫彧鏈? 绔埌绔?`finish=` 琛? 鍜?NINFER_PROFILE_PREFILL=1 鐨?event timeline
+> (鎬绘椂闀垮彲淇? 鍗曟鍥?event 褰掑睘鍙兘婕傜Щ)銆?
+>
+> **涓嬩竴鍒€**: MTP 鍗曡疆 ~112 ms 閲? 鍓嶅悜 55 (layers 53 + lm_head 1.5 + argmax 0.15) +
+> draft 15.5, **杩樻湁 ~42 ms 闈炲墠鍚戝紑閿€鏈畾浣?* (KV commit / egress / host 璋冨害)銆?
+> 杩欐槸 MTP 杞 (褰撳墠 12.7 vs 绾?44.5) 鐨勫叧閿? 鍘熺増 MTP/鏃燤TP = 179/62 = 2.9x, 鎴戜滑 0.29x銆?
+> 璁℃椂寮€鍏? NINFER_PROFILE_VERIFY=1 (verify-split / ffn-split, 娉ㄦ剰涓婇潰鐨勬暀璁?銆?
+> 璇婃柇寮€鍏冲叏閮ㄤ繚鐣? NINFER_TERN_GEMV_MULTI / NINFER_MTP_TEACHER / NINFER_MTP_AR_POS_SHIFT /
+> NINFER_ROTATION_WARP / NINFER_ATTN_TRACE銆?
+>
+> 鈿?**(鏈缁撴潫, 浠ヤ笅涓?2026-09-28 涓夋洿)**:
+> 褰撳墠寮曟搸 = `milestones/20260928_verify_fix_mtp_window/ninfer_mini_nordc.exe`
+> (澶嶅埗鍒?build/ 浣跨敤; Paris 鉁? prefill 512 **424** / 2048 **428.7**, decode @512
+> **41.6**, 鐪熷疄浠诲姟 decode **43.5-44.1**, MTP draft=5 **22.1** / 9 **16.5** / 15 **12.3**)銆?
+>
+> **鏈疆淇帀鐨勭湡 bug**:
+> 1. `causal_softmax_attention.cpp` 涓?`ternary_rowsplit_gemm.cu` 閲岃琛ヤ竵鑴氭湰鍐欏潖鐨?
+>    **鍗曞紩鍙疯法琛屽瓧绗︿覆** + `cache.storage` 绗旇 鈫?涓や釜 TU 鏍规湰缂栬瘧涓嶈繃锛屽簱閲屼竴鐩存槸**鏃у璞?*锛?
+>    娉ㄦ剰鍔涜矾鐢变笌 GEMM 娲惧彂閮藉浜庢湭鐭ョ増鏈€?*鏁欒: 鎹?obj 鍚庡繀椤?grep 鏂板瓧绗︿覆纭**銆?
+> 2. **T=2..15 璧伴敊 GEMM 鍐呮牳** (鏈笘绾渶澶х殑涓€鍒€): 娲惧彂鍒?
+>    `ternary_pq2_mma_small_t_kernel` (16-token 鍧?+ 57KB 闈欐€?smem 鈫?姣?SM 1 涓?CTA)锛?
+>    瀹炴祴 **5.826 ms**锛涘悓鏍锋潈閲嶈蛋瀵勫瓨鍣ㄨВ鐮?WMMA 鍙 **0.217 ms (27脳)**銆?
+>    宸叉妸 T=2..15 鍏ㄩ儴鏀硅蛋 `launch_pq2_mma_prefill`锛屾棫鍐呮牳鐣欏湪
+>    `NINFER_TERNARY_SMALLT=1` 鍚庨潰銆?*T=2 鍓嶅悜 823.8 ms 鈫?60.1 ms**銆?
+> 3. MTP draft 绐楀彛 5 鈫?15 (`internal.h` + `round_buffers.h`)锛寁erify 寮€閿€瀵瑰搴﹀嚑涔庝笉鏁忔劅
+>    (T=4 57ms / T=8 66ms / T=32 76ms锛屾潈閲嶅彧璇讳竴閬?锛屾墍浠ュ绐楀彛鍑犱箮鏄櫧閫併€?
+>
+> **鏂板鏋勫缓宸ュ叿 (閲嶈)**: `probe/check_stale.py` (婧愭瘮 obj 鏂扮殑娓呭崟)銆?
+> `probe/swap_lib.py` (**蹇呴』鐢ㄥ畠鎹?obj**: `llvm-ar r` 涓嶄細鏇挎崲寮傚悕鎴愬憳锛?
+> `.cpp.o` / `.cpp.obj` 鍙屾垚鍛樹細璁╅摼鎺ュ櫒鍙栨棫瀵硅薄)銆?
+> `probe/rebuild_lib.py` (**build_lib.py 鍙瘮婧愭枃浠?mtime锛屾敼澶存枃浠朵笉浼氶噸缂栦緷璧?TU**锛?
+> 缁撴瀯浣撳ぇ灏忎笉涓€鑷?= 闈欓粯閿欒)銆乣probe/run.py` (artifact open 鍋跺彂澶辫触鑷姩閲嶈瘯)銆?
+> `probe/bench_small_t.cu` (灏?T GEMM 妯瘎 + **姝ｇ‘鎬т氦鍙夋牎楠?*)銆?
+>
+> **鎺㈤拡鐩插尯宸茶ˉ**: `probe/attn_flash_probe.cu` 鍘熸湰鍙祴 T鈭坽1,2,64,100,...}锛?
+> **姝ｅソ婕忔帀 3..63 = verify 鍖洪棿**锛涚幇鍦?`--sweep` (T=1..80) 涓?`--positions 512`
+> (pos0鈮?) 鍏ㄧ豢銆?
+>
+> **MTP 鐜扮姸 (璇氬疄缁撹)**: 鐪熷疄浠诲姟涓?MTP **浠嶇劧浜?* (draft=5 22.1 vs 绾?decode 43.9)銆?
+> 閲忓寲鍘熷洜: 鍗曡疆 鈮?97 ms锛屽叾涓?verify(瀹藉害6) 鈮?72 ms銆乨raft 鑷洖褰掗摼 鈮?25 ms锛?
+> 鑰?*鎺ュ彈鐜囧彧鏈?0.75/杞?* (绗?1 涓?draft 94% 姝ｇ‘锛岀 2 涓彧鍓?39%)銆?
+> 绾?decode 涓€姝ュ彧瑕?23 ms 鈬?鍗充娇 verify 鍏嶈垂涔熷彧鑳藉埌 76 t/s銆?
+> 鏉冮噸鐗╃悊涓嬮檺: 姣?token 鈮?6.5 GB 涓夊厓鏉冮噸銆佸疄娴嬫渶楂樻祦寮?530 GB/s 鈬?鍗曢亶 12.3 ms
+> 鈬?**绾?decode 澶╄姳鏉?鈮?80 t/s**锛?00+ 蹇呴』闈犳姇鏈鸿В鐮侊紝鑰屽綋鍓?MTP 澶存敮鎾戜笉浜嗐€?
+>
+> **涓嬩竴姝?(鎸夊疄娴嬫敹鐩婃帓搴?**:
+> 鈶?**MTP 鐨?AR 姝ラ鏈?bug锛岃繖鏄湰杞渶閲嶈鐨勫彂鐜?* 鈥斺€?宸茬粡璇佹槑涓嶆槸 draft head 鐨勯棶棰?
+>    - `NINFER_MTP_TEACHER=1` 鎶?verify 鐨?target token 鍠傜粰 draft 鑷洖褰掗摼 (鎺掗櫎璇樊绱Н)
+>      鈬?鎺ュ彈鐜囧弽鑰屾洿浣? k=2 0.62 / k=5 0.38 / k=9 0.38 / k=15 0.56锛?
+>    - `NINFER_MTP_AR_POS_SHIFT=0/1/5/6` 骞崇Щ AR 姝ラ鐨?cache position 鈬?鎺ュ彈鐜囩汗涓濅笉鍔?(0.38)锛?
+>    - 缁撹: **`mtp_forward_decode_batch` 鐨?AR 姝ラ (width=1, batch=1) 鏈韩绠楅敊**锛?
+>      涓庡杺杩涘幓鍝釜 token銆乧ache position 鍦ㄥ摢閮芥棤鍏炽€?
+>
+>    **宸蹭笌涓婃父閫愯瀵圭収 (shensanshu/ambolio-base = 鍘熷 NInfer, qwen3_6 target)**:
+>    - `src/ops/kernel/mtp_round.cuh` 鐨?`mtp_prepare_next_round_kernel` 鈥斺€?**閫愬瓧鑺傜浉鍚?*锛?
+>    - `src/targets/qwen3_6/impl/runtime/mtp_impl.h` 鐨?AR 閾?鈥斺€?**閫愯鐩稿悓**
+>      (ar_hidden 閫愭鍥炲杺 / mtp_forward_decode_batch(previous, hidden, position, rope, valid) /
+>      cudaMemcpy D2D锛岃繛 slice 缁村害閮藉)锛?
+>    - `text_context_impl.h` 鐨?`mtp_forward_tail` / `mtp_forward_ar_step` 鈥斺€?**蹇犲疄绉绘**
+>      (宸紓鍙湁 qwen3_5 鐨勪笁杞?rope 灏佽 text_rope锛屾槸 ops::rope 鐨勭洿閫?锛?
+>    - **`speculative_round.cuh/.cu/.cpp/.h` 鍏ㄩ儴 0 diff** (select_accepted_hidden 鍥犳鎺掗櫎)锛?
+>    - 鎺掗櫎瀹為獙: `NINFER_MTP_TEACHER=1` (鍠?target 鐨?token) 鈬?鎺ュ彈鐜囦笉鍗囧弽闄嶏紱
+>      `NINFER_MTP_AR_POS_SHIFT=0/1/5/6` 鈬?绾逛笣涓嶅姩锛汚R 姝ラ寮哄埗璧?Direct 鍏冩暟鎹?鈬?鏃犲彉鍖栥€?
+>    鈬?**host 绔€昏緫娌℃湁绉绘閿欒**锛岄棶棰樹竴瀹氬嚭鍦ㄦ煇涓?AMD 绔?kernel 鐨勮涓哄樊寮備笂锛?
+>      涓斿彧琚?MTP AR 姝ラ鍛戒腑 (width=1, batch=1, 鐢?`batch_mtp_kv_` 绗?0 灞?KV)銆?
+>    鍓╀笅鍞竴娌″鐓х殑鏄?**MTP cache 鐨勮法杞敓鍛藉懆鏈?* (涓婃父 program_impl.h 鏄?12378 琛屽崟浣擄紝
+>    鎴戜滑鎷嗘垚浜?program/ 涓嬬殑澶氭枃浠?锛歷erify 姣忚疆寰€ MTP cache 鍐?width 涓?token锛?
+>    AR 姝ラ鍦?frontier+1+s 澶?append 浼?*瑕嗙洊** verify 宸插啓鐨勬Ы浣嶏紝鑰屾洿鏃╄疆娆＄暀涓嬬殑
+>    妲戒綅涓嶄細琚綔搴?鈥斺€?AR 姝ラ鐨?attention 鏄惁璇诲埌浜嗚繃鏈?key锛屾槸涓嬩竴涓帓鏌ョ偣銆?
+>    **淇 (鏈疆鏈€閲嶈鐨勭粨璁?**: 涓婇潰"AR 姝ラ鏈?bug"鐨勫垽鏂?*鏄敊鐨?*銆傛煡涓婃父
+>    `docs/performance/qwen3.8-27b.md` 鐨勫畼鏂?MTP3 瀹炴祴 (RTX 5090, 鍚屼竴妯″瀷)锛?
+>    **acceptance 53-90%, tokens/round 2.14-3.68**銆傛垜浠?draft=3 瀹炴祴
+>    **200 tokens / 64 rounds = 3.12 tokens/round** 鈥斺€?**鍜屼笂娓?3.17 涓€鑷?*銆?
+>    鎵€浠?MTP 宸ヤ綔瀹屽叏姝ｅ父锛屾帴鍙楃巼浠庣涓€澶╄捣灏辨病鍧忥紱鎴戜箣鍓嶆嬁"鎺ュ彈鐜?鈮?draft 鏁?
+>    褰撴爣鍑嗘槸閿欑殑锛坉raft=3 鏃?3.12/4 = 78% 鏈潵灏辨槸鍋ュ悍鍊硷級銆?
+>    鈬?AR 閾俱€乼eacher forcing銆乸osition shift 杩欎簺"淇"閮芥槸涓嶅繀瑕佺殑锛屽彲浠ユ棤瑙嗐€?
+>
+>    **鐪熸鐨勯棶棰樺彧鏈変竴涓? 鍗曡疆鏃堕棿銆?* 涓婃父 RTX 5090 MTP3 = 130-224 tok/s锛?
+>    鎴戜滑鍗曡疆 ~101 ms锛坉raft=3: verify(width4) 鈮?72 ms + batch MTP forward 3.4 +
+>    propose 0.8 + 2脳AR 9 ms + prepare 0.2锛夈€傝杩?100 t/s 闇€瑕佸崟杞?鈮?30 ms
+>    (3.12/0.030 = 104 t/s)锛屽嵆 **verify(T=4) 浠?72 ms 鍘嬪埌 ~20 ms**銆?
+>
+>    T=4 鍓嶅悜鐩墠 57.3 ms = mlp 25.4 + gdn 17.5 + attn 11.6锛圱=1 decode 鏁存 23 ms锛夈€?
+>    **瑕佸垎娓呭摢娈垫槸鐪熸氮璐广€佸摢娈垫槸鐗╃悊蹇呯劧**:
+>    - mlp 25.4 vs 11.8 (2.1脳): 鏉冮噸鍙涓€閬嶏紝**2.1脳 鍏ㄦ槸娴垂**锛屽彲鏁?+13 ms
+>      (best measured small-T GEMM: gate_up 0.187 ms @253 GB/s, down 0.134 @177 GB/s锛?
+>       T=1 鍒嗗埆 0.089 @435 涓?0.061 @386)锛?
+>    - attn 11.6 vs 3.4 (3.4脳): KV 鍙涓€閬嶏紝**澶ч儴鍒嗘槸娴垂**锛屽彲鏁?~+6 ms锛?
+>    - gdn 17.5 vs 5.6 (3.1脳): **杩欎釜鍩烘湰鏄墿鐞嗗繀鐒?* 鈥斺€?recurrent 鏄寜 token 涓茶鐨?
+>      (`launch_recurrent_inout` T=4 灏辨槸 4 姝ュ惊鐜?锛屾兂鏁戦渶瑕佹妸 recurrent 鏀规垚
+>      chunked/骞惰鎵弿锛堜笂娓?T鈮?4 鎵嶈蛋 chunked锛宬ChunkSize=64锛屾墍浠?T=4 姘歌繙璧?tail锛夈€?
+>
+>    鍙晳鍚堣 ~19 ms 鈬?verify 57鈫?8 ms 鈬?鍗曡疆 101鈫?2 ms 鈬?**38 t/s**銆?
+>    **瑕佸埌 100 t/s 杩樺樊涓€鍗婏紝鍓╀笅鐨勫繀椤讳粠 gdn 鐨勪覆琛?recurrent 鎴栨洿瀹界殑绐楀彛閲屾姞**
+>    锛堜笂娓歌嚜宸辩殑绛旀鏄?DFlash2 K=7锛歵okens/round 4.5-6.7銆乨ecode 84-267 tok/s锛?
+>     鎴戜滑杩欒竟鎶?`linear_topk: unsupported head profile`锛?
+>     鏄?`src/ops/linear_topk/linear_topk.cpp:38` 鍙 Q8/FP8/Q4 澶达紝杩樻病鏀寔 PQ2_0锛夈€?
+>    鍙傝€? 涓婃父 `docs/performance/qwen3.8-27b.md` 鏈夊畬鏁?MTP3/DFlash2 瀹炴祴琛ㄣ€?
+> 鈶?MTP layer 鐨勬潈閲嶆槸 **bf16** (ternary trace 閲?t=1 鍙湁 lm_head 涓€涓?gemv_smem 鏉＄洰锛?
+>    MTP 灞傚畬鍏ㄤ笉璧?ternary)锛屼竴娆?MTP forward ~3.5 ms (tail 3.5 + stem 0.8)锛?
+>    k-1 娆?杞?鈬?閲忓寲 MTP 灞傚彲鐪?20-60 ms/杞€?
+> 鈶?BN16 WMMA (`pq2_rowsplit_wmma2_bn16_kernel`) 鍦ㄦ帰閽堥噷涓?BN32 **閫愪綅鐩稿悓**
+>    (N/K/T/stride 鍏ㄧ粍鍚?锛屼絾涓€鎺ヨ繘寮曟搸鍓嶅悜灏卞嚭涔辩爜 鈥斺€?宸叉敼鎴?opt-in
+>    `NINFER_PREFILL_BN16=1`锛屾湭瑙ｅ喅鍓嶄笉鍔ㄣ€?
+> 鈶?绾?decode 鍓╀綑: GDN (48 灞? ~225 GB/s) 涓?lm_head (211 GB/s)锛?
+>    闈炲叧閿矾寰勪笂杩樻湁 ~3.9 ms/姝?鐨勫皬绠楀瓙銆?
+> 鈿?**(鏈缁撴潫, 浠ヤ笅涓哄巻鍙茶褰?**
+
+> 鈿?**鏂颁細璇濆紑宸ユ寚鍗?(2026-09-28 浜屾洿, 璇诲畬杩欐鐩存帴骞叉椿)**:
+> 褰撳墠寮曟搸 = `milestones/2026

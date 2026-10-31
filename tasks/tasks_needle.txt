@@ -1,0 +1,449 @@
+###ID needle
+Benchmark note: the Kokkos prototype reached 412 GB/s on the reference card in October.
+
+# NInfer→HIP (gfx1201) 移植项目交接文档
+
+> 📌 **最新交接 (2026-09-30, 新会话先读): `HANDOFF_20260930.md`** —— 含本轮数据纠错
+> (曾误报 "prefill 1000+ 达成/1247ms"，真实 = 406-417 t/s 未达标；SIMT wu_panel edit 实际失败未应用)、
+> 长上下文发布门槛 (对标 llama.cpp 100k@35-40 t/s)、262k 显存估算、按序执行计划 (长ctx测量→KV优化→prefill 1000+→MTP v1.1→发 GitHub)。
+> 以下 2026-09-29 段 (引擎快照/构建铁律/教训) 仍有效。
+
+> ⚡ **新会话开工指南 (2026-09-29 三更, 读完这段直接干活)**:
+> 当前引擎 = milestones/20260929_rotation_bitexact_decode49/ninfer_mini_nordc.exe (复制到 build/)。
+> **本轮核心修复: Hadamard 旋转内核并行化 (已逐位验证)** ——
+> 旧内核: 一个 warp 独占一个 1024 点块, T=4 时只启 20 个 warp (机器 256 个 warp 槽, 8% 占用),
+> 每个 warp 内 10 级串行蝶形。旋转是每个 ternary linear 的前置步骤 (每层 2 次 × 64 层), 拖慢一切。
+> 新内核: 一个 256 线程 CTA 协作处理一个 (1024 块, token) 对, 共享内存蝶形。
+> **踩过的坑**: 第一版把 pair 编码 p=(lane<<4|idx) 整体移位做 insert_zero, 混入高位 → 引擎乱码;
+> probe/rotation_probe.cu 一跑就复现 (20476/20480 differ)。修正: 拆出 (lane, idx) 后只对低位
+> insert_zero → 探针 0/20480 differ 逐位一致, 引擎 Paris ✓ 文本逐字同。
+> **教训: 数值内核改动必须先写独立对拍探针, 再进引擎。**
+> **decode 44.4 → 49.2 t/s (短 prompt), 真实任务 45.4-47.0; prefill 236 → 264-271**。
+> 回退: NINFER_ROTATION_WARP=1。MTP draft=3 = 24.7 (仍负收益, 见下)。
+> 时间算进当前段 —— ffn-split 报的 gate_up 4.69 ms 里混着 GDN/attn 的时间。
+> 可靠的只有: 端到端 `finish=` 行, 和 NINFER_PROFILE_PREFILL=1 的 event timeline
+> (总时长可信, 单段因 event 归属可能漂移)。
+>
+> **下一刀**: MTP 单轮 ~112 ms 里, 前向 55 (layers 53 + lm_head 1.5 + argmax 0.15) +
+> draft 15.5, **还有 ~42 ms 非前向开销未定位** (KV commit / egress / host 调度)。
+> 这是 MTP 转正 (当前 12.7 vs 纯 44.5) 的关键; 原版 MTP/无MTP = 179/62 = 2.9x, 我们 0.29x。
+> 计时开关: NINFER_PROFILE_VERIFY=1 (verify-split / ffn-split, 注意上面的教训)。
+> 诊断开关全部保留: NINFER_TERN_GEMV_MULTI / NINFER_MTP_TEACHER / NINFER_MTP_AR_POS_SHIFT /
+> NINFER_ROTATION_WARP / NINFER_ATTN_TRACE。
+>
+> ⚡ **(本段结束, 以下为 2026-09-28 三更)**:
+> 当前引擎 = `milestones/20260928_verify_fix_mtp_window/ninfer_mini_nordc.exe`
+> (复制到 build/ 使用; Paris ✓, prefill 512 **424** / 2048 **428.7**, decode @512
+> **41.6**, 真实任务 decode **43.5-44.1**, MTP draft=5 **22.1** / 9 **16.5** / 15 **12.3**)。
+>
+> **本轮修掉的真 bug**:
+> 1. `causal_softmax_attention.cpp` 与 `ternary_rowsplit_gemm.cu` 里被补丁脚本写坏的
+>    **单引号跨行字符串** + `cache.storage` 笔误 → 两个 TU 根本编译不过，库里一直是**旧对象**，
+>    注意力路由与 GEMM 派发都处于未知版本。**教训: 换 obj 后必须 grep 新字符串确认**。
+> 2. **T=2..15 走错 GEMM 内核** (本世纪最大的一刀): 派发到
+>    `ternary_pq2_mma_small_t_kernel` (16-token 块 + 57KB 静态 smem → 每 SM 1 个 CTA)，
+>    实测 **5.826 ms**；同样权重走寄存器解码 WMMA 只要 **0.217 ms (27×)**。
+>    已把 T=2..15 全部改走 `launch_pq2_mma_prefill`，旧内核留在
+>    `NINFER_TERNARY_SMALLT=1` 后面。**T=2 前向 823.8 ms → 60.1 ms**。
+> 3. MTP draft 窗口 5 → 15 (`internal.h` + `round_buffers.h`)，verify 开销对宽度几乎不敏感
+>    (T=4 57ms / T=8 66ms / T=32 76ms，权重只读一遍)，所以宽窗口几乎是白送。
+>
+> **新增构建工具 (重要)**: `probe/check_stale.py` (源比 obj 新的清单)、
+> `probe/swap_lib.py` (**必须用它换 obj**: `llvm-ar r` 不会替换异名成员，
+> `.cpp.o` / `.cpp.obj` 双成员会让链接器取旧对象)、
+> `probe/rebuild_lib.py` (**build_lib.py 只比源文件 mtime，改头文件不会重编依赖 TU**，
+> 结构体大小不一致 = 静默错误)、`probe/run.py` (artifact open 偶发失败自动重试)、
+> `probe/bench_small_t.cu` (小 T GEMM 横评 + **正确性交叉校验**)。
+>
+> **探针盲区已补**: `probe/attn_flash_probe.cu` 原本只测 T∈{1,2,64,100,...}，
+> **正好漏掉 3..63 = verify 区间**；现在 `--sweep` (T=1..80) 与 `--positions 512`
+> (pos0≠0) 全绿。
+>
+> **MTP 现状 (诚实结论)**: 真实任务上 MTP **仍然亏** (draft=5 22.1 vs 纯 decode 43.9)。
+> 量化原因: 单轮 ≈ 97 ms，其中 verify(宽度6) ≈ 72 ms、draft 自回归链 ≈ 25 ms，
+> 而**接受率只有 0.75/轮** (第 1 个 draft 94% 正确，第 2 个只剩 39%)。
+> 纯 decode 一步只要 23 ms ⇒ 即使 verify 免费也只能到 76 t/s。
+> 权重物理下限: 每 token ≈ 6.5 GB 三元权重、实测最高流式 530 GB/s ⇒ 单遍 12.3 ms
+> ⇒ **纯 decode 天花板 ≈ 80 t/s**，100+ 必须靠投机解码，而当前 MTP 头支撑不了。
+>
+> **下一步 (按实测收益排序)**:
+> ① **MTP 的 AR 步骤有 bug，这是本轮最重要的发现** —— 已经证明不是 draft head 的问题:
+>    - `NINFER_MTP_TEACHER=1` 把 verify 的 target token 喂给 draft 自回归链 (排除误差累积)
+>      ⇒ 接受率反而更低: k=2 0.62 / k=5 0.38 / k=9 0.38 / k=15 0.56；
+>    - `NINFER_MTP_AR_POS_SHIFT=0/1/5/6` 平移 AR 步骤的 cache position ⇒ 接受率纹丝不动 (0.38)；
+>    - 结论: **`mtp_forward_decode_batch` 的 AR 步骤 (width=1, batch=1) 本身算错**，
+>      与喂进去哪个 token、cache position 在哪都无关。
+>
+>    **已与上游逐行对照 (shensanshu/ambolio-base = 原始 NInfer, qwen3_6 target)**:
+>    - `src/ops/kernel/mtp_round.cuh` 的 `mtp_prepare_next_round_kernel` —— **逐字节相同**；
+>    - `src/targets/qwen3_6/impl/runtime/mtp_impl.h` 的 AR 链 —— **逐行相同**
+>      (ar_hidden 逐步回喂 / mtp_forward_decode_batch(previous, hidden, position, rope, valid) /
+>      cudaMemcpy D2D，连 slice 维度都对)；
+>    - `text_context_impl.h` 的 `mtp_forward_tail` / `mtp_forward_ar_step` —— **忠实移植**
+>      (差异只有 qwen3_5 的三轴 rope 封装 text_rope，是 ops::rope 的直通)；
+>    - **`speculative_round.cuh/.cu/.cpp/.h` 全部 0 diff** (select_accepted_hidden 因此排除)；
+>    - 排除实验: `NINFER_MTP_TEACHER=1` (喂 target 的 token) ⇒ 接受率不升反降；
+>      `NINFER_MTP_AR_POS_SHIFT=0/1/5/6` ⇒ 纹丝不动；AR 步骤强制走 Direct 元数据 ⇒ 无变化。
+>    ⇒ **host 端逻辑没有移植错误**，问题一定出在某个 AMD 端 kernel 的行为差异上，
+>      且只被 MTP AR 步骤命中 (width=1, batch=1, 用 `batch_mtp_kv_` 第 0 层 KV)。
+>    剩下唯一没对照的是 **MTP cache 的跨轮生命周期** (上游 program_impl.h 是 12378 行单体，
+>    我们拆成了 program/ 下的多文件)：verify 每轮往 MTP cache 写 width 个 token，
+>    AR 步骤在 frontier+1+s 处 append 会**覆盖** verify 已写的槽位，而更早轮次留下的
+>    槽位不会被作废 —— AR 步骤的 attention 是否读到了过期 key，是下一个排查点。
+>    **修正 (本轮最重要的结论)**: 上面"AR 步骤有 bug"的判断**是错的**。查上游
+>    `docs/performance/qwen3.8-27b.md` 的官方 MTP3 实测 (RTX 5090, 同一模型)：
+>    **acceptance 53-90%, tokens/round 2.14-3.68**。我们 draft=3 实测
+>    **200 tokens / 64 rounds = 3.12 tokens/round** —— **和上游 3.17 一致**。
+>    所以 MTP 工作完全正常，接受率从第一天起就没坏；我之前拿"接受率 ≈ draft 数"
+>    当标准是错的（draft=3 时 3.12/4 = 78% 本来就是健康值）。
+>    ⇒ AR 链、teacher forcing、position shift 这些"修复"都是不必要的，可以无视。
+>
+>    **真正的问题只有一个: 单轮时间。** 上游 RTX 5090 MTP3 = 130-224 tok/s；
+>    我们单轮 ~101 ms（draft=3: verify(width4) ≈ 72 ms + batch MTP forward 3.4 +
+>    propose 0.8 + 2×AR 9 ms + prepare 0.2）。要过 100 t/s 需要单轮 ≈ 30 ms
+>    (3.12/0.030 = 104 t/s)，即 **verify(T=4) 从 72 ms 压到 ~20 ms**。
+>
+>    T=4 前向目前 57.3 ms = mlp 25.4 + gdn 17.5 + attn 11.6（T=1 decode 整步 23 ms）。
+>    **要分清哪段是真浪费、哪段是物理必然**:
+>    - mlp 25.4 vs 11.8 (2.1×): 权重只读一遍，**2.1× 全是浪费**，可救 +13 ms
+>      (best measured small-T GEMM: gate_up 0.187 ms @253 GB/s, down 0.134 @177 GB/s；
+>       T=1 分别 0.089 @435 与 0.061 @386)；
+>    - attn 11.6 vs 3.4 (3.4×): KV 只读一遍，**大部分是浪费**，可救 ~+6 ms；
+>    - gdn 17.5 vs 5.6 (3.1×): **这个基本是物理必然** —— recurrent 是按 token 串行的
+>      (`launch_recurrent_inout` T=4 就是 4 步循环)，想救需要把 recurrent 改成
+>      chunked/并行扫描（上游 T≥64 才走 chunked，kChunkSize=64，所以 T=4 永远走 tail）。
+>
+>    可救合计 ~19 ms ⇒ verify 57→38 ms ⇒ 单轮 101→82 ms ⇒ **38 t/s**。
+>    **要到 100 t/s 还差一半，剩下的必须从 gdn 的串行 recurrent 或更宽的窗口里抠**
+>    （上游自己的答案是 DFlash2 K=7：tokens/round 4.5-6.7、decode 84-267 tok/s；
+>     我们这边报 `linear_topk: unsupported head profile`，
+>     是 `src/ops/linear_topk/linear_topk.cpp:38` 只认 Q8/FP8/Q4 头，还没支持 PQ2_0）。
+>    参考: 上游 `docs/performance/qwen3.8-27b.md` 有完整 MTP3/DFlash2 实测表。
+> ② MTP layer 的权重是 **bf16** (ternary trace 里 t=1 只有 lm_head 一个 gemv_smem 条目，
+>    MTP 层完全不走 ternary)，一次 MTP forward ~3.5 ms (tail 3.5 + stem 0.8)，
+>    k-1 次/轮 ⇒ 量化 MTP 层可省 20-60 ms/轮。
+> ③ BN16 WMMA (`pq2_rowsplit_wmma2_bn16_kernel`) 在探针里与 BN32 **逐位相同**
+>    (N/K/T/stride 全组合)，但一接进引擎前向就出乱码 —— 已改成 opt-in
+>    `NINFER_PREFILL_BN16=1`，未解决前不动。
+> ④ 纯 decode 剩余: GDN (48 层, ~225 GB/s) 与 lm_head (211 GB/s)；
+>    非关键路径上还有 ~3.9 ms/步 的小算子。
+> ⚡ **(本段结束, 以下为历史记录)**
+
+> ⚡ **新会话开工指南 (2026-09-28 二更, 读完这段直接干活)**:
+> 当前引擎 = `milestones/20260928_decode26_prefill431/ninfer_mini_nordc.exe`
+> (需复制到 build/ 下使用; Paris ✓, **prefill 2048: 430 t/s / 512: 427**, **decode 41.7 t/s @512 / 33.1 @2048**)。
+> **警告**: 手动 .obj 换库导致 lib 处于不一致状态 (build_nordc/ninfer_hip.lib 需全量重编)。
+> 当前 exe = milestone 快照的副本 (含全部 WMMA 优化), 但下次改代码必须先跑 probe/full_pipeline.ps1。
+> **prefill 22 → 431 (19.6x); decode 24.3 → 41.6 t/s (1.7x)** — decode attention 换 WMMA prompt
+> 内核 (T=1 也走 Prompt 路由) + smem GEMV。**decode 24ms 分解**: attn 6.1 + mlp 7 + lmhead 1.5
+> + gdn 0.2 + 启动/小算子 ~9ms。**下一刀**: ① MTP 重测前置条件: NINFER_DEBUG_LAYERS=2 时间戳定位 — 错误在 MTP verify 主模型
+> 63 层全部通过后 ([dbg] attn layer=63 T=4 正常) 的**下一个 attention 调用** — 即 MTP
+> DRAFT decode (T=1) 的 attention。draft 的 cache/qtype/geometry 待查 (draft KV 存储若是
+> Int8Group64 → 其 T=1 路由走 SmallT 应安全; 若 bf16 → 我的 width==1→Prompt 门 → WMMA
+> 内核 → 但 draft 的 head_dim/q 布局可能与 D=256 假设不符 → 内核内越界/错误)。
+> [attn-route]/[wmma-launch-fail] 诊断打印已就位。下轮: 打印 draft decode 的 q_heads/
+> storage/geometry 即可定位。MTP 运行暂不可用。
+> **MTP 定位进展 (轮末)**: [attn-route] 全量打印显示 MTP 里只有 1 次 attention 路由
+> (主模型 prefill width=512); draft decode 不走 causal_softmax_attention (draft.cpp:182
+> 自有路径)。[wmma-launch-fail] 未触发 = WMMA 启动成功; 错误由【其它 host 线程】的异步
+> 操作产生 (engine 有 host_worker_pool!) — getLastError 会拾取跨线程错误。下轮:
+> ① 查 draft.cpp:182 的 attention 调用链 (它不走 causal_softmax_attention);
+> ② 用 hipError 按线程隔离或直接检查 draft 投影的 N/K 奇偶 (我的 smem GEMV 要求 n 偶数)。
+> ③ draft decode 链 = dflash 路径 (draft.cpp → ops::linear_pair + context_kv_materialize +
+> sliding/dense attention) — 不走 causal_softmax_attention! draft 权重若为 PQ2 → T=1 走我的
+> smem GEMV (launch_ternary_gemm_t1) — draft 投影形状待打印确认 (N/K 奇偶 + smem 预算)。
+> **MTP 实测结论 (本轮)**: draft-tokens 1/2/3 全部 2-3 t/s (vs plain 42) — MTP round 有
+> ~450ms 固定开销 (与 draft 数无关), 是 mtp.cpp 的 host 端流水线串行化问题, 不是内核问题。
+> **MTP 修复需要专项 session**: ① mtp.cpp round 流水线异步化 (当前每步 sync 等待);
+> ② verify T=2-4 的 GDN batch_update + attention 内核优化 (1.7 GB/s → 500+);
+> ③ draft decode 与 verify 的内核路径统一。修复后 MTP 2x 收益 → 84 t/s 可达。
+> **MTP InvalidValue 已破案**: 是 prompt.cu 调试打印的单引号 C++ 字符串编译错误导致
+> compile_one 静默失败 → 残留 stale obj (修复: 全部改双引号)。MTP 现在能跑通
+> (verify T=4 走 WMMA fallback 分支) 但 decode 2.2 t/s — MTP round 流水线串行 +
+> verify T=4 的 WMMA prompt 内核低效 (~1.3ms/层 × 16)。MTP 提效需要专项: ① round 流水线
+> 优化 (3 次权重遍历合并); ② verify T=4 的 attention 并行度; ③ draft decode attention
+> 并行度。预计全部做完后 MTP 可达 100-150 t/s (bare 75 × MTP 2x)。② draft KV = Int8Group64 的 i8 prompt 内核 (89.5KB smem)
+> 在 gfx12 上 launch 不了 — Int8 存储 chunked small-T 已由路由门控兜住。③ graph 已修: update 失败
+> 时重新 instantiate (decode_graph.cpp), --graph 恢复 (42.3 vs 41.8 — launch 开销确实小)。④ attention
+> decode 并行度: GEMV attention 内核已写 (decode_attention_gemv.cuh) 但未改善 — 6.1ms 是
+> attn_mix 总时间 (GEMV×4 + rmsnorm×3 + rope + attention + sigmoid + attn-out GEMV),
+> 不是 attention 内核单独的时间。graph ≈ no-graph (42.3 vs 41.8) 证实 ~9ms 非启动开销
+> 而是 2000 个小内核的真实 GPU 时间 (每个 0.003-0.01ms)。解法 = 算子融合 (需要上游
+> 架构改动) 或接受现状。
+> **decode 剩余瓶颈 (本轮画像结论)**: GEMV 已到 45-79% 带宽 (smem 版, bench_decode_gemv.cu)；
+> 大头是 64 层的 GDN recurrent + 小算子 (~25-30ms/step 固定成本, 与 ctx 无关) + attention
+> small_t 的 KV 读取 (@2048 比 @512 慢 26%)。下一刀: ① GDN recurrent 内核 standalone 画像；
+> ② 可靠的 decode 逐算子画像 (event 法因多 stream 失真, host clock 法被异步欺骗 — 需要每段
+> 强制 sync 的粒度, 或 nsys/rocprof)；③ graph 修复 (hipErrorGraphExecUpdateFailure)。
+> **新增**: causal_softmax_attention 的 gfx12 prompt 路由修复 + zero-shuffle WMMA prompt 内核
+> (prompt_bf16_wmma.cuh, 40KB smem 可 launch, 探针逐位全绿 attn_flash_probe.cu):
+> mixer-attn 2951→163ms (18x)。回退: NINFER_ATTN_PROMPT_WMMA=0。
+> **当前瓶颈画像** (NINFER_PROFILE_PREFILL=1, 2048 主 pass GPU 2404ms):
+> GDN 1169ms (49%) + MLP 1070ms (44%) + attn 163ms (7%)。
+> **下一刀**: 1) GDN chunked 三内核 (软件 tf32 mma ~1TF, 无 gfx12 tf32 WMMA — 评估 bf16 WMMA
+> 或 fp32 SIMT 化); 2) MLP 的 1070ms @ 约 45 TF; 3) host/launch 间隙 (GPU 2.4s vs 实际 4.8s) —
+> graph 捕获或合并 launch。
+> **历次会话已有**: ternary prefill WMMA v2 内核 (寄存器直解 fragment, 35 TF)、软件/SIMT 回退链
+> (NINFER_PREFILL_SW / NINFER_PREFILL_WMMA1 / NINFER_TERNARY_MMA / NINFER_ATTN_PROMPT_WMMA)。
+> ⚡ **(本段结束, 以下为历史记录)**
+
+
+> ⚡ **新会话开工指南 (2026-09-27 深夜, 已完成 — 归档)**:
+> 当前引擎 = `build/ninfer_mini_nordc.exe` (可用: Paris ✓, prefill 14-17, decode 25-31 t/s)。
+> 核心任务只有一个: **把 prefill 从 22 t/s 提到 1000+ (原版 2530)**。
+> 1. 读 §8.5 的"原版 prefill 内核移植"块 — 内核已写好 (ternary_rowsplit_mma_prefill.cuh,
+>    编译通过) 但首测输出错乱已回退。4 个待查项在那块里。
+> 2. **第一步: 写独立探针** (probe/prefill_probe.cu, 仿 probe/lds_relay_probe.cu 的结构:
+>    合成矩阵 A/B → CPU ref → 新内核 vs ref) — 一次就能定位 B-fragment 索引/warp 布局错在哪
+> 3. 探针绿后: dispatch 接入 (ternary_rowsplit_gemm.cu 的 launch_ternary_gemm_t8 尾部,
+>    被回退的那 4 行) → 2048 prefill 应到 100+ t/s
+> 4. 参考图纸: 项目根的 REFERENCE_original_q4_gemm_mma.cuh (原版 2D tiling 骨架)
+> **构建铁律**: 改源 → `python probe/compile_one.py <相对路径>` → `llvm-ar d` 删旧成员 →
+> `llvm-ar r` 加新成员 → `$env:NINFER_NORDC="1"; python probe/link_exe.py` (每步别省)。
+> 全量重建用 probe/full_pipeline.ps1。**不要在 build 启动后改源文件** (mtime 竞态)。
+> ⚡ **(结束)**
+
+> 更新: 2026-09-26 (第二次, 接手会话当天完成 §4 修复)。接手前必读第 4 节(活跃 bug)和第 3 节(构建管线大坑)。
+> 项目性质: 把 CUDA 推理引擎 NInfer 移植到 AMD HIP/gfx1201 (RX 9070 XT, ROCm 7.2, Windows 11)，
+> 跑三元量化 Bonsai-2-27B (PQ2_0)。用户标准: 输出质量对齐参考实现 + GSQ 同口径评测达标。
+> **性能目标 (2026-09-27 用户明确)**: 逼近原版速度 — 参照 4070 Ti SUPER (同带宽 672GB/s):
+> prefill 2530 t/s, decode 147-290 t/s (MTP)。9070 XT 上限: 644/9.81GB = 65.6 t/s (100% 带宽)。
+
+## 1. 项目目标与现状摘要
+
+- **目标 artifact**: `D:\ninfer-models\ternary_bonsai_27b_v3.ninfer` (v3, 含 MTP 拼头)
+- **已完成**: 工程级构建(370 TUs → `build_nordc/ninfer_hip.lib` → `build/ninfer_mini_nordc.exe`)；
+  输出退化破案修复(#66)；T>42 prefill 崩溃修复(cooperative launch 不支持)；
+  T≥64 prefill 崩溃修复(mma_tf32 trap 桩)；decode 正常，短 prefill 正常
+- **09-26 晚已修**: §4 chunked+tail 数值 bug —— 根因是 `mma_tf32_bits` 仿真的 **B 操作数 lane 收集公式
+  写反**(详见 §4.5)。修复后 cap75/cap55/lp_t1..t3/France/Hello 全过，MMLU 冒烟 3 题 2/3(修复前 gen=2/33/5 即 EOS)
+- **主线任务**: #73 正式评测(GSQ 同口径) —— **42 题评测已在跑/已完成，进度见 eval_out/mmlupro_progress_ninfer.json**; #71 性能排查
+
+## 2. 环境与路径
+
+| 项 | 值 |
+|---|---|
+| 代码树 | `G:\ninfer-hip\ninfer\src` (+`G:\ninfer-hip\shim` HIP/CUDA shim 层) |
+| 构建 | `G:\ninfer-hip\build_nordc\` (obj+lib), `G:\ninfer-hip\build\ninfer_mini_nordc.exe` |
+| 工具链 | `C:\Program Files\AMD\ROCm\7.2\bin` (hipcc, **llvm-ar.exe**) + VS2022 BuildTools (F:) |
+| 编译参数 | `--offload-arch=gfx1201 -mno-wavefrontsize64 -std=c++20 -O2` (+`-fgpu-rdc` 全量构建时) |
+| 模型 | `D:\ninfer-models\ternary_bonsai_27b_v3.ninfer`; 参考 GGUF `S:/NLP自然语言/Ternary-Bonsai-2-27B-PQ2_0.gguf` |
+| 评测数据 | `G:\Qwen3-27B-Deploy\mmlupro_sample.json` (42题) |
+| GPU | RX 9070 XT (gfx1201), ROCm 7.2 Windows。**不支持 cooperative launch** (probe/coop_probe.cu 证实) |
+
+运行方式:
+```
+./build/ninfer_mini_nordc.exe <artifact> [prompt] --ctx 16384 --max-new N --temp F --top-p F --top-k N [--think] [--seed N] [--no-graph] [--ids FILE] [--tasks FILE]
+```
+
+## 3. 构建管线 (⚠️ 大坑集中地)
+
+### 3.1 单 TU 快速循环 (日常改代码用)
+```bash
+cd /g/ninfer-hip
+python probe/compile_one.py "ops/linear_attention/gated_delta_net/xxx.cu"   # 必须确认输出 rc= 0!
+AR="/c/Program Files/AMD/ROCm/7.2/bin/llvm-ar.exe"
+"$AR" d build_nordc/ninfer_hip.lib <member_name>.o <member_name>.o   # 删旧(两个名字都试)
+"$AR" r build_nordc/ninfer_hip.lib build_nordc/<member_name>.o       # 插新
+NINFER_NORDC=1 python probe/link_exe.py                              # 重链 exe
+```
+- member 命名 = 源文件相对路径 `_` 连接: `ops_linear_attention_..._state_passing.cu.o`;
+  **cpp 产物经 build_lib.py 是 `.cpp.obj` 双后缀, compile_one.py 产物是 `.o`** — 删旧时两个名字都要试
+- **compile_one.py 失败也会留下陈旧 obj** → 必须 grep `^rc= 0` 才能继续换库!
+- 改 `.cuh` 头文件要重编所有 include 闭包内的 `.cu` (改 mma.cuh 时注意)
+
+### 3.2 全量重归档 ( rare )
+```bash
+NINFER_NORDC=1 python probe/build_lib.py        # 370 OK / 2 fail(已知 TMA 相关)
+rm -f build_nordc/ninfer_hip.lib                # ⚠️ 必须! llvm-ar rcs 对已存在 lib 是"插入替换"不重建,陈旧成员残留
+tr -d '\r' < all_objs2.txt | xargs -d '\n' llvm-ar rcs build_nordc/ninfer_hip.lib   # all_objs2.txt(370行)是权威清单
+NINFER_NORDC=1 python probe/build_extras.py     # 追加 9 个 extras
+NINFER_NORDC=1 python probe/link_exe.py
+```
+- **build_extras.py / link_exe.py 都看 `NINFER_NORDC` 环境变量选 build_nordc vs build 目录**, 不带 env 会污染错误的 lib
+- Windows 头冲突坑: 在 `chunked/launch.cu` 加 `<cstdio>` 曾使局部变量 `state` 与 `stat()` 函数声明冲突 → 改名 state_cfg
+- HIP 设备代码 **不能用 std::printf/fflush**(报 __host__ 引用错误); 设备 printf 调试不可靠(崩溃丢缓冲), 根因优先静态排查
+
+### 3.3 调试方法论
+- 崩溃 = `hipErrorLaunchFailure` 报在**第一个 CUDA_CHECK 处**,不一定是真凶内核。判别法: 在可疑内核后插
+  `cudaStreamSynchronize + cudaGetErrorString` 探针逐段定位(用完必须删)
+- 静态排查优先: `grep -rln <符号>` 查所有调用方; mma 移植时 trap 桩(`__builtin_trap`)必须确认无存活调用方
+- 内核 hang 会触发 Windows TDR(用户看到"驱动超时"),跑测用 `timeout N` 包裹
+
+## 4. (已修复 09-26 晚) chunked+tail 路径 tail≥2 数值错误
+
+### 4.1 背景与代码路径
+`gated_delta_net.cpp` (src/ops/linear_attention/gated_delta_net/) 的双状态入口:
+- `T_full = (T/64)*64`; 若 T_full>0 → `launch_chunked` (三阶段: `prepare_wy_wu` → `state_passing` → `output`, 全在 `chunked/` 目录)
+- tail = T-T_full > 0 → `launch_recurrent_inout(q_tail, k_tail, ...)` (recurrent.cu:144 → `launch_recurrent_direct_fixed`)
+- 若 normalize_qk 且 T_full>0: 先 l2norm 到 scratch, chunked 用归一化后的 q/k, tail 用 `recurrent_normalize=false` + 归一化 buffer 的 slice
+- tail_in 选择: T_full>0 时 = ssm_state_out (chunked 写出的状态), 否则 = ssm_state_in
+
+### 4.2 证据表 (修复前, 2026-09-26 实测)
+| 测试 | T | 路径 | 结果 |
+|---|---|---|---|
+| hello / "capital of France" | 13/17 | 纯 recurrent | ✅ 正常 |
+| cap55 (capital-completion, temp 0) | 52 | 纯 recurrent (normalize=true) | ✅ 输出 "Paris" |
+| long_prompt | 65 | **实际 58+4+3 三段(见 4.4), 全 <64** | ✅ "连贯"(假象!) |
+| cap75 | 80 (主 pass 73) | chunked NT=1 + tail=9 | ❌ 空输出 |
+| lp_t1/lp_t2/lp_t3 | 76/87/99 | chunked + tail | ❌ 纯空白垃圾 |
+| long_prompt2 (300/450/542 chars) | 134+ | NT=2 + tail | ❌ 垃圾 |
+| MMLU 冒烟 3 题 (chat+think, temp 1.0) | 217~258 | NT=3-4 + tail | ❌ gen=2/33/5 即 EOS, 输出 `>{"` |
+- 测试提示词文件: `probe/long_prompt.txt`, `probe/cap55.txt`/`cap75.txt`(贪心补全,定量), `probe/lp_t0..t3.txt`, `probe/lp2_*.txt`, `probe/ids_N.txt`
+
+### 4.3 排除过程 (接手会话实测, 方法论可复用)
+1. **强制纯 recurrent 对照** (`NINFER_GDN_NO_CHUNKED=1`): cap75 → "Paris" ✅ → bug 在 chunked 路径或交接
+2. **TAIL_RAWNORM 对照** (tail 改用原始 q/k+内核内归一化): cap75 仍 ❌ → 归一化 buffer 无辜
+3. **per-layer hidden dump 对拍** (`NINFER_DEBUG_LAYERS=1 NINFER_DUMP_LAYERS=<prefix>` 两跑 + `probe/cmp_dump.py`):
+   chunked 跑的 gdn layer=0 输出 |v| 膨胀 ~27x (173289 vs 6414), **token 0 起就分叉** → chunked 内核输出本身坏
+4. **stomp A/B 快照** (launch_chunked 前后把 q/k/v/g/beta 读回主机逐字节 diff): 零差异 → 无越界写踩内存
+5. **T=65 对照跑发现关键假象**: chunked 与纯 recurrent 的 gdn checksum **逐位一致** → 引擎内部把 65 token
+   拆成 58+4+3 三段(MTP 对齐), **chunked 内核根本没执行过** → 交接文档此前 "T=65 ✅ 连贯" 不构成对 chunked 的验证
+   (`[dbg]` 行的 T 值分布可查证: T=58/4/3)
+
+### 4.4 ⚠️ 引擎级 prefill 拆分 (重要认知, 以前不知道)
+引擎(text.cpp + MTP 对齐)会把 prompt 拆成多段处理, 各段独立调 GDN:
+- T=65 prompt → 主 pass T=58 (+MTP 对齐 pass T=4, T=3) — **全 <64, 走纯 recurrent**
+- T=73/80 prompt → 主 pass T=73 (chunked T_full=64 + tail=9) + 对齐 pass
+- **推论**: "prompt=N tokens" ≠ "单次 GDN 调用的 T"。判断 chunked 是否真的跑过, 要看
+  `NINFER_DEBUG_LAYERS=1` 的 `[dbg] gdn ... T=<值>` 行里是否出现 T≥64
+
+### 4.5 根因与修复 (mma.cuh `mma_tf32_bits`)
+- **根因**: 09-26 实装的 tf32 mma 仿真里, B 操作数的 lane 收集公式写反:
+  `src = 4j + 2t` (错误) → 应为 `src = 8t + j`(偶列)/`8t + 4 + j`(奇列)。
+  正确布局: b0 of lane L = B[L&3][L>>2] (k 在 t 域, 列在 g 域), 即 B[k][col] 在 lane 4*col+k。
+  与已验证的 `mma_bf16` 收集模式 (shfl(b0, 8t+j)) 同构 —— 写 tf32 时把 j/t 写反了。
+- **影响面**: 所有 tf32 调用点共用此函数: output 内核 `mma_av_panel`(A@V), prepare_wy_wu 的
+  mma16_raw_x_swiz/mma16_swiz_x_raw/compute_store_wu_panel (WY 矩阵), state_passing 的 MM1/MM2。
+  NT=1+chunk0 时 v_new=U (W·0=0) 掩护了 MM1/W, 但 A@V 直接坏 → 输出膨胀。
+- **修复**: 只改 `mma.cuh` 一处; 重编 chunked 三 TU (prepare_wy_wu/state_passing/output.cu) 换库重链。
+- **验证**: cap75 "Paris" ✅, cap55 ✅, lp_t1/t2/t3 连贯 ✅, France/Hello ✅, MMLU 冒烟 2/3 (3999 token 连贯思考链) ✅
+- **教训**: ①新写仿真必须配独立数值 probe (对照 CPU 参考), "不崩溃"+"短 prompt 回归"都不是验证
+  (短 prompt 走纯 recurrent, 根本不经过 tf32)。②"T=65 连贯"这类证据要先确认内核真的被执行了。
+
+## 5. 已修复 bug 史 (按时间序, 含方法论)
+
+### 5.1 #66 输出退化 (已修已验证)
+183 个陈旧 obj 缺 mma C 累加修复 → mma_bf16 覆盖累加器, T≥2 GEMM 全垃圾; 另有 small_t_bf16 from_new
+BF16/FP16 位混淆、cache_v 回读竞态两处。输出 "Hello! How can I help you today?" 验证。
+
+### 5.2 T>42 prefill 崩溃 (09-25 修)
+根因: ROCm 7.2 Windows **完全不支持 cooperative launch** (`cooperativeLaunch=0`)。
+修复: `bf16_gdn_gating_proj_gemm_mma.cuh` 删 `this_grid().sync()` 尾部 → 独立 reduce kernel 两段发射。
+证据: probe/coop_probe.cu。graph 模式也随之恢复(疑似 coop 毒化上下文)。
+
+### 5.3 gfx12 prefill smem (#69, 已修)
+Prompt 路由改走 chunked_small_t。
+
+### 5.4 T≥64 prefill 崩溃 (09-26 修) ← 今天
+根因: **`ops/common/mma.cuh` 移植时 `mma_tf32_bits` 是 `__builtin_trap()` 桩**, 而 GDN chunked 三内核
+prepare_wy_wu / state_passing / output 全用 tf32 mma → 首次执行即非法指令。
+修复: 实装 `mma.m16n8k8.tf32` 仿真(mma.cuh): `tf32_rn`(fp32→tf32 RNE; bf16 位模式无损直通) + warp shuffle 取
+quad 成员 + fp32 FMA。布局: A `a0=A[g][t] a1=A[g+8][t] a2=A[g][t+4] a3=A[g+8][t+4]`;
+B `b0=B[t][g] b1=B[t+4][g]` (即 B[k][col] = lane 4k+col 的 b0)。已加 `NINFER_MMA_NOINLINE`。
+验证: 崩溃消失, T=64..256 sweep 不崩, France/Hello 回归过, decode 31.3 t/s 不变。
+**教训: 当时 `grep -rln mma_tf32` 一步就能发现三个 chunked 内核在用 trap 桩。**
+
+### 5.5 chunked+tail 数值错误 / mma_tf32_bits B-gather (09-26 晚修, 见 §4.5)
+根因: tf32 仿真 B 操作数 lane 收集 `4j+2t` 应为 `8t+j`/`8t+4+j`。修复后全部回归通过。
+
+### 5.6 尚未修复/待办
+- MMLU-Pro 42 题评测进行中/已完成(见 eval_out/mmlupro_progress_ninfer.json); HumanEval 164 驱动脚本未写
+- graph 模式: 简单场景已恢复, 但 MMLU workload 下 decode_graph.cpp:144 曾崩 → 评测暂用 `--no-graph`
+- `gated_delta_net.cpp` 保留了 `NINFER_GDN_NO_CHUNKED` 诊断开关(强制纯 recurrent, 运行时二分用); 其余临时探针已清干净
+
+## 6. 验证基础设施
+
+### 6.1 参考实现 (权威真值)
+```
+G:\Qwen3-27B-Deploy\prism-llama\build-hip72\bin\llama-server.exe --port 8099 ^
+  -m S:/NLP自然语言/Ternary-Bonsai-2-27B-PQ2_0.gguf -c 512 -b 512 -ub 512 -fit off -ngl 99 --no-warmup --embedding --pooling none
+```
+⚠️ 必须 `-c 512` 否则 262K KV commit 爆内存搞崩 explorer。
+- `/embedding` = 每 token final-norm hidden; `/completion` n_probs=20 = top-20 logits 真值
+- **因果不变量二分法**: token0 在 T=1 vs T=N 逐位一致; 首个分叉 tag = 病灶 op
+- dump: `NINFER_DEBUG_LAYERS=1 NINFER_DUMP_LAYERS=<dir>` → `<dir>_prefill_logits.bin` (bf16 位, 最后 token)
+  + `<dir>.bin` (每层 hidden 全 token dump, 72字节头 tag/d/layer/T; 两跑对比用 `probe/cmp_dump.py`)
+
+### 6.2 探针/独立 harness
+- `probe/coop_probe.cu`: cooperative launch 不支持之证据(保留作回归)
+- `probe/gating_probe.cu` + `gating_probe.bat`: mma gating 路径独立对拍(T=65..70 全 0 误差, gating 已洗清)
+- `probe/cmp_dump.py`: 两份 layer-dump 逐记录逐 token 对比, 报首个分叉 (tag, layer, token) — 09-26 接手会话新增
+- `probe/tasks_capdiag.txt` / `tasks_reg.txt`: capital 贪心 + lp_t* 回归任务文件 (⚠️ 写任务文件必须无 BOM, 否则首个 task 被吞)
+- `probe/ids_N.txt`: N×token 271 合成长度提示(32..256); `probe/long_prompt*.txt`, `cap*.txt`, `lp_*.txt`: 真实文本
+- chat 模板 13 token ids: `248045 846 198 14556 248046 198 248045 74455 198 248068 271 248069 271` (probe_ids13.txt)
+
+## 7. #73 正式评测 (GSQ 同口径)
+
+- 脚本: `python probe/eval_mmlupro_ninfer.py [--max-tasks N]` (进度可续, 断点在 eval_out/mmlupro_progress_ninfer.json)
+- 口径: chat, temp 1.0, top_p 0.95, top_k 20, thinking on, max-new 4000, ctx 16384, --no-graph
+- 基线: **GSQ-RCO 83.3%** (MMLU-Pro 42题) / 90.9% (HumanEval 164); Bonsai PTQ1_0 76.2%; PQ2_0 prism 89.6% (HumanEval)
+- 冒烟 3 题 (修复后): 2/3 (题 70 PASS, 71 FAIL, 72 PASS), 每题 2882~3999 token 连贯思考链
+- 42 题正式评测: 09-26 晚启动 (后台), 结果看 eval_out/mmlupro_progress_ninfer.json; 若中断直接重跑脚本即可续
+- HumanEval 164 需仿照 eval_mmlupro_ninfer.py 再写驱动(tasks 文件 + 同采样参数)
+
+## 8. 性能现状 (#71, 09-26 晚基准)
+
+### 8.1 实测基准 (bench_speed.py, ids 纯 token prompt, max-new 128, temp 0)
+| prompt | graph | prefill t/s | decode t/s |
+|---|---|---|---|
+| 32 | off | 16.8 | 26.7 |
+| 32 | on | 17.8 | 27.3 |
+| 256 | on | 16.7 | 26.2 |
+| 1024 | on | 15.7 | 26.1 |
+| 4096 | on | 15.2 | **12.8** |
+- decode 短 KV ~26-27 t/s vs 4080S 上 ninfer 62-64 (≈42%), llama.cpp PQ2_0 41.1 / +drafter 75.7
+- **graph 增益≈2%** (launch 开销不是瓶颈) — graph 模式在 ids decode 下可用, MMLU workload 下 decode_graph.cpp:144 崩仍待查
+- decode @KV4096 掉到 12.6-12.8 → 带宽受限, KV 读取是主成本 → fp8/k8v4 KV 是长上下文提速点(但目前崩溃)
+- prefill 15-17 t/s 在 T=32..4096 几乎不变 (chunked 路由 O(T²/8) 影响不明显)
+- **最大提速空间 = MTP 投机解码** (参考 +drafter 41.1→75.7)
+
+### 8.3 差距分析与提速路线 (#71 路线图, 09-26 晚定)
+外部基准 (用户提供的视频, NInfer 原版 + N 卡): 单流均值 179 / 峰值 370 t/s (含 MTP), 并发均值 948 t/s。
+交接文档原版单流 62-64 t/s 应为无 MTP 基线。差距 = 三层放大器: 内核效率 × MTP × 并发。
+
+- **Roofline**: 27B PQ2_0 ≈ 7GB 权重, 9070XT 644GB/s → 单流理论上限 ~92 t/s。当前 26.4 = 29% roofline;
+  原版 62-64 ≈ 68% (按 4080S 736GB/s)。**内核效率有 ~2x 空间, 纯优化即可追平原版单流。**
+- **prefill 异常**: T=32..4096 prefill 全线性 ~15 t/s (66ms/token, 比 decode 每 token 还慢 2x!)。
+  有效 FLOPS ~0.8-2 TFLOPS (1-2% 利用率)。prefill 走 GEMM → 全部走**软件 mma 仿真**。
+- **#1 杠杆: 硬件矩阵指令移植** (进行中, 09-26 深夜):
+  - **已验证可行**: `probe/wmma_probe.cu` — rocwmma 2.2 在 gfx1201 上 16x16x16 bf16 mma 正确性 max_err=0
+  - **raw builtin 已确认**: `__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12` (v8s16 A, v8s16 B, v8f32 C) -> v8f32
+    (来源: clang AMDGPU builtins 文档 + LLVM CodeGen 测试; gfx12 版无 A/B replication 要求, A/B = 128bit/lane,
+    **C/D = v8f32 每lane 8个f32 = 完整16x16 无 50% 浪费** — 比 rocwmma 16x16x16 fragment 更优)
+  - **硬件布局已破解** (`probe/wmma_layout_probe.cu` + `probe/raw_layout_result.txt`):
+    rocwmma fragment 布局 (=硬件 load 布局): A: lane L<16=行L列0-7, L≥16=行L-16列8-15;
+    C: lane=列+16·(行≥8), x=行%8。raw sweep (A slot→C 行广播): A 的 u32 **低半有效、高半暂无效**
+    (待 B=one-hot 交叉验证补全; probe/raw_wmma_layout_probe.cu 已建)
+  - **rocwmma fragment 的坑** (写 shim 时踩的): ① .x 元素写对 packed 类型 (bf16) 不生效
+    (float fragment 有效); ② `(*frag)[i]` packed 写只部分生效 — **建议直接用 raw builtin 绕开 rocwmma**
+  - **shim 数学已通的部分**: seed(NVIDIA C→AMD布局)+readback 已验证逐位正确 (op0 A=0 传输测试 ✓,
+    probe/wmma_shim_probe.cu); A/B fragment 构建因 packed 存储问题待 raw builtin 版本重写
+  - **发散分支内 shfl = 未定义** (AMD 无 warp-sync 硬件等待; shim __syncwarp 注释同源问题) —
+    所有 shuffle 必须收敛执行, probe 已实测确认 (shfl sanity: 顶层 ✓ / if(L==0) 分支内 ✗)
+  - **⭐ BREAKTHROUGH (第三会话末)**: raw builtin 用 **rocwmma 的原生载体类型** (`VRegF32x4` =
+    `HIP_vector_type<float,4>` + `to_native_vector()`) 后输出**真实计算值** (28.125 = 2×(-3.75)²,
+    应为 225=16×(-3.75)²) — 此前用 short/attr-vector 载体全是垃圾 (clang 数值转换或位错)。
+    **结论: 必须 include rocwmma 并用 VRegF32x4/AccRegF32x8 + to_native_vector 承载操作数**
+    (照抄 rocwmma_include/internal/wmma_impl.hpp:830 的调用方式)。
+
+  - **⭐⭐ K 映射 100% 破解 (raw_wmma_kmap_probe.cu)**: 硬件操作数布局完全实验确定:
+    * **A**: lane L (0..15) = 行 L 的 K0..7 (u32[i] = K{2i,2i+1} 打包, lo=偶K hi=奇K);
+      **lane L+16 = 行 L 的 K8..15** (u32[i] = K{8+2i, 9+2i})。全 256 slot 有效
+      (B=ones 行广播 + 数值指纹双验证: A u32[slot]=1..4 → D=2,4,6,8 ✓ lo/hi 均独立有效)。
+    * **B**: lane L (0..15) = 列 L 的 K0..7; lane L+16 = 列 L 的 K8..15 (JOINT sweep:
+      B lane0 全 slot 拾取 A lane0 的 K0..7 值 1..8 逐一对应 ✓)。
+    * **C/D**: f32[i] @ lane L = 元素 (行 = i + 8·(L≥16), 列 = L%16) (C-layout probe:
+      A=unique 矩阵 + B one-hot, lane0 f32[0..7] = C(0..7,0) 确认)。
+    * **载体类型铁律**: `VRegF32x4`/`AccRegF32x8` + `to_native_vector()` **整体赋值**
+      (照抄 wmma_impl.hpp:830); 逐元素写 .x 或 to_native_vector(frag)[i]=v **均不生效**
+      (packed 存储坑, float fragment 例外); 正确做法 = 本地数组收集 → 整体构造/赋值。
+    * **收敛铁律**: 所有 __shfl_sync 必须 wave 收敛 (发散分支内 shfl 返回垃圾, 实测确认);
+      所有 gather 无条件发射 + 目标本地选择。**shuffle 源 lane 也要 &31 防越界**。
+
+  - **shim 探针状态** (probe/wmma_shim_probe.cu): seed+readback ✓ (op0 A=0 传输完美);
+    A/B 构建已按破解映射重写 (VRegF32x4 整体构造); **剩 1 bug: op3 lane13 c3=0**
+    (c3 = D(11,3); op0 ✓ 
+
+Question: According to the benchmark note near the top of this document, what throughput figure in GB/s did the Kokkos prototype reach? Reply with the number only.
+###END
