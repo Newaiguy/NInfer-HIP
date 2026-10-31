@@ -1,5 +1,26 @@
 # CHANGELOG
 
+## 0.1.0-pre-r4 — 2026-10-31
+
+只修「聊天窗口里混进引擎调试行」这一件事，不改任何计算路径。
+
+### 修复
+- **三个每步/每次都会打印的调试行改为显式开启**（它们原本无条件写 stderr，在同一个控制台里
+  与流式回答交织，看起来像"输出格式坏了"）：
+  - `models/qwen3_5/program/decode.cpp` 的 `[mtp-diag]` → 需要 `NINFER_MTP_DIAG=1`；
+  - `models/qwen3_5/execution/text.cpp` 的 `[rmsnorm-ptr]`（每 decode step 一次）→ 需要 `NINFER_DBG_PTR=1`；
+  - `ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp` 的 `[attn-fallback]` → 需要 `NINFER_ATTN_TRACE=1`。
+- **聊天模式下 stderr 重定向到 `ninfer-chat.log`**（同目录），控制台只留菜单 + 流式回答 + 每轮统计；
+  需要看诊断时用 `NINFER_CHAT_LOG=0` 关掉重定向。
+- 顺带去掉一处每步固定开销：`[rmsnorm-ptr]` 块里的 `ninfer_nan_count` 是 kernel + 同步，
+  原来每步都跑，现在只在 `NINFER_DBG_PTR=1` 时才跑。
+
+### 实测（同一台机器，1 档 = ctx 16384 + MTP dw2）
+| 场景 | 修复前 | 修复后 |
+|---|---|---|
+| 单轮问候（18 new tokens） | — | decode **73.4 t/s**，stdout 无任何调试行，stderr 空 |
+| 多轮第 2 轮（25 new tokens，53 prompt tokens 复用 34） | — | prefill 357 t/s、decode **54.9 t/s** |
+
 ## 0.1.0-pre-r3 — 2026-10-31
 
 本版**没有改动任何计算路径**（decode/prefill 数字与 pre-r2 完全一致），

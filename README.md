@@ -1,4 +1,4 @@
-# NInfer-HIP `0.1.0-pre-r3`
+# NInfer-HIP `0.1.0-pre-r4`
 
 > 把 NInfer 推理引擎推到 AMD RDNA4（gfx1201）—— 一张 16GB 的 RX 9070 XT 上，
 > 27B 模型跑到 126K 上下文、decode 22.9 t/s，开 MTP 后 65K 上下文 41.6 t/s。
@@ -13,6 +13,14 @@ NInfer 引擎（原生 CUDA 项目，Apache-2.0）到 **AMD RDNA4 / gfx1201** �
 目标机型：RX 9070 XT 16GB（256-bit GDDR6，标称 640 GB/s），Windows 11 26200 + HIP SDK 7.2.3。
 模型：`WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3`（官方 v3 单文件 artifact，15,017,456,896 B，
 内含 text + vision + mtp + dflash2 四个组件，本版本只用 text 与 mtp）。
+
+pre-r4 相对 pre-r3 的变化：
+
+1. **聊天输出干净了**：引擎的诊断行（`[mtp-diag]` / `[rmsnorm-ptr]` / `[attn-fallback]`）全部改成
+   `NINFER_MTP_DIAG` / `NINFER_DBG_PTR` / `NINFER_ATTN_TRACE` 显式开启；聊天模式下 stderr 统一重定向到
+   同目录 `ninfer-chat.log`，不会再串到回答中间。
+2. **顺手拿掉一处每步开销**：`[rmsnorm-ptr]` 之前每 decode step 都跑一次 NaN 扫描 kernel + 同步，
+   现在只在 `NINFER_DBG_PTR=1` 时才做。
 
 pre-r3 相对 pre-r2 的变化：
 
@@ -134,7 +142,7 @@ prefill 侧的额外开关（可选）：`NINFER_PREFILL_CHUNK`（默认 1024）
 [5]  custom arguments
 ```
 
-进去以后直接打字提问；`/help` 看命令，`/think on` 开思考，`/stats` 看这轮速度，`/exit` 退出。
+进去以后直接打字提问（引擎的诊断日志在同目录 `ninfer-chat.log`，不会串到回答里）；`/help` 看命令，`/think on` 开思考，`/stats` 看这轮速度，`/exit` 退出。
 每轮结束会打印 `[N prompt tokens (M reused), K new, prefill X t/s, decode Y t/s]` ——
 **M reused 就是前缀复用省下来的 token**（多轮对话里通常 50%）。
 

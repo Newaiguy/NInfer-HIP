@@ -43,6 +43,8 @@
 | `NINFER_KV_DUMP` / `NINFER_KV_DUMP_SEQ` | 按 append 序号 dump KV 池 |
 | `NINFER_KVCAP_DIAG` | 放宽 `--kvcap` 校验（仅实验） |
 | `NINFER_PREFILL_CHUNK` | prefill 分块（默认 1024；128K 下 4096 会 OOM） |
+| `NINFER_CHAT_LOG` | 聊天模式把 stderr 重定向到 `ninfer-chat.log`（默认开，`0` 关闭） |
+| `NINFER_MTP_DIAG` / `NINFER_DBG_PTR` / `NINFER_ATTN_TRACE` | 三类过程打印的开关（默认关；`NINFER_DBG_PTR` 会额外跑每步 NaN 扫描，仅排障用） |
 
 ## 跑测纪律（硬件安全）
 - **同一时刻只允许一个 GPU 作业**；GPU 实验严格串行。

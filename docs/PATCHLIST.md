@@ -72,6 +72,16 @@
 - int8 KV（Int8Group64）走真 WMMA 的 KInt8 分支，in-kernel fresh-row append 缺 `owns_fresh_row` 守卫，
   非确定性（前 12 token 相同后分叉）。
 - dflash2：decode 5.6 t/s、输出垃圾。
+## 本版（pre-r4）新增条目
+
+- `models/qwen3_5/program/decode.cpp`：`[mtp-diag]` 由无条件打印改为 `NINFER_MTP_DIAG=1` 才打印
+  （原来每轮 MTP 都会往 stderr 写一行，双击聊天时串进回答里）。
+- `models/qwen3_5/execution/text.cpp`：`[rmsnorm-ptr]` 的 NaN 预扫描 + 打印由无条件改为 `NINFER_DBG_PTR=1`；
+  该扫描是 kernel + 同步，原来每 decode step 都跑一次。
+- `ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp`：`[attn-fallback]` 改为 `NINFER_ATTN_TRACE=1`。
+- `milestones/20260928_decode26_prefill431/probe/mini_main.cpp`：chat 模式下把 stderr `freopen` 到
+  `ninfer-chat.log`（`NINFER_CHAT_LOG=0` 可关闭），控制台只留回答与每轮统计。
+
 ## 本版（pre-r2）新增条目
 
 ### ops/softmax_attention/dense/causal_cache/decode_t1_wmma_launch.cu

@@ -1,11 +1,11 @@
-NInfer-HIP 0.1.0-pre-r3
+NInfer-HIP 0.1.0-pre-r4
 =====================
 
 名称        : NInfer-HIP —— NInfer 引擎的 AMD RDNA4 / HIP 移植版
 仓库        : https://github.com/Newaiguy/NInfer-HIP
-发布        : https://github.com/Newaiguy/NInfer-HIP/releases/tag/v0.1.0-pre-r3
+发布        : https://github.com/Newaiguy/NInfer-HIP/releases/tag/v0.1.0-pre-r4
 许可证      : Apache-2.0（衍生自 https://github.com/Neroued/ninfer，改动见 docs/PATCHLIST.md）
-状态        : 预发布（prerelease v0.1.0-pre-r3，已发布）
+状态        : 预发布（prerelease v0.1.0-pre-r4，已发布）
 构建时间    : 2026-10-31
 目标硬件    : AMD Radeon RX 9070 XT 16GB (RDNA4, gfx1201), 640 GB/s
 运行系统    : Windows 11 26200 (25H2) + HIP SDK 7.2.3 (AMD Software 26.8.1)
@@ -14,8 +14,8 @@ NInfer-HIP 0.1.0-pre-r3
               size 15,017,456,896 B（text 11.755GB + vision + mtp + dflash2）
 
 引擎        : bin/ninfer_mini_nordc.exe（本版新增 --chat 交互模式）
-  size      : 193,543,168 B
-  sha256    : 84D6280AAA6AB901345F5A91A08901A80C2E8E81F846677768F1D02977C5C819
+  size      : 193,544,704 B
+  sha256    : CCF6B58CDF0E23598941B145FB11293039D951E5BF97ADEF278882978C288E6F
 
 交互聊天（本版新增）
   启动        : 双击 harness/launchers/chat.bat（自动找 exe、记住模型路径、四档场景菜单）
