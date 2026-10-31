@@ -130,6 +130,22 @@ flags `-ngl 99 -ctk q4_0 -ctv q4_0 -fa on --no-warmup --no-display-prompt`。
 - 「能用多大」不是分配问题：`cudaMalloc` 是虚拟超额提交，干净进程可分配到 ≥24 GiB；
   限制是驱动愿意把多少页留在显存（实测 12.6~13.6 GiB，随桌面状态漂移）。
 
+## 5.5 交互式聊天模式（pre-r3 新增，实测）
+
+命令：`ninfer_mini_nordc.exe <artifact> --chat --ctx 16384 --kv rk4v4-e8 --spec mtp --draft-tokens 2 --max-new 512`
+（等价于双击 `harness/launchers/chat.bat` 选 1）。整段 history 每轮重发，靠前缀复用只 prefill 新增部分。
+
+| 轮次 | prompt tokens（复用/新增） | 新增 tokens | prefill | decode |
+|---|---|---|---|---|
+| 1（"你好"） | 13（0 / 13） | 14 | 112 | **57.4** |
+| 2（"用三句话介绍 AMD RDNA4 的显存带宽特点"） | 55（**27 reused** / 28） | 118 | 278 | **60.4** |
+| 单轮事实题（"法国的首都是哪里"） | 22（0 / 22） | 1（答"巴黎"） | 118 | 28.4（1 token，不具代表性） |
+
+- 流式输出正常（content 边生成边打印，reasoning 走 `/think on` 的 `[thinking]` 通道）。
+- **前缀复用生效**：第 2 轮 55 token 中 27 token 命中驻留前缀，prefill 只处理 28 token（278 t/s）。
+- `/stats` 输出 `[stats] turns=2 history_messages=4 last_decode_tps=60.4379`。
+- 非 chat 路径未回归：`tasks_cp8km` → `7F3K9Q` ✅，prefill 842.8 / decode 35.7（与 pre-r2 同）。
+
 ## 6. 已知不可用 / 未验证
 
 | 项 | 状态 |

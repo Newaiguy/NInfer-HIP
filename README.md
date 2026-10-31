@@ -1,4 +1,4 @@
-# NInfer-HIP `0.1.0-pre-r2`
+# NInfer-HIP `0.1.0-pre-r3`
 
 > 把 NInfer 推理引擎推到 AMD RDNA4（gfx1201）—— 一张 16GB 的 RX 9070 XT 上，
 > 27B 模型跑到 126K 上下文、decode 22.9 t/s，开 MTP 后 65K 上下文 41.6 t/s。
@@ -14,6 +14,13 @@ NInfer 引擎（原生 CUDA 项目，Apache-2.0）到 **AMD RDNA4 / gfx1201** �
 模型：`WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3`（官方 v3 单文件 artifact，15,017,456,896 B，
 内含 text + vision + mtp + dflash2 四个组件，本版本只用 text 与 mtp）。
 
+pre-r3 相对 pre-r2 的变化：
+
+1. **引擎内置交互式聊天模式**（`--chat`）：流式输出、多轮、前缀复用（第 2 轮起只 prefill 新增 token）、
+   `/think /clear /stats /system` 命令；实测短上下文 **57-60 t/s**（MTP dw2）。
+2. **双击即用的启动器** `harness/launchers/chat.bat`：自动找 exe、记住模型路径、四种场景菜单，
+   不需要记参数也不需要 Python 包装（引擎已能直接跑，DLL 由启动器补 PATH）。
+
 pre-r2 相对 pre-r1 的两大变化：
 
 1. **长上下文掉速的根因定量到「工作集越过 Windows 高速驻留预算」**（KV 页改按 PCIe 速度读），
@@ -28,6 +35,7 @@ pre-r2 相对 pre-r1 的两大变化：
 
 | 项目 | 状态 |
 |---|---|
+| **交互式聊天** | ✅ `--chat`：流式输出、多轮（前缀复用）、`/think /stats /clear /system /exit`；`harness/launchers/chat.bat` 双击启动 |
 | 正确性 29 token ~ 126K token | ✅ 全部通过（needle 逐字符命中、数字列表、长文摘要语义正确） |
 | **126K 真实上下文** | ✅ **decode 22.9 t/s · prefill 294**（`--ctx 126464`，needle `K8M2Q9` 命中） |
 | 96K 真实上下文 | ✅ decode **25.2**（AR）· **34.0**（MTP dw2）· prefill 346 |
@@ -112,6 +120,26 @@ prefill 侧的额外开关（可选）：`NINFER_PREFILL_CHUNK`（默认 1024）
 
 ## 4. 快速开始
 
+### A. 双击开聊（推荐，不需要命令行的方式）
+
+1. 把 `ninfer_mini_nordc.exe` 和 `chat.bat` 放在同一个文件夹里；
+2. 双击 `chat.bat`，第一次会问模型路径（把 `.ninfer` 文件拖进窗口回车即可，会记在 `model.txt`）；
+3. 选场景：
+
+```
+[1]  daily chat         ctx 16384   + MTP dw2   ~ 78 t/s
+[2]  long doc / code   ctx 32768   + MTP dw2   ~ 64 t/s
+[3]  long doc / code   ctx 65536   + MTP dw2   ~ 42 t/s
+[4]  whole book        ctx 131072  no MTP      ~ 23 t/s
+[5]  custom arguments
+```
+
+进去以后直接打字提问；`/help` 看命令，`/think on` 开思考，`/stats` 看这轮速度，`/exit` 退出。
+每轮结束会打印 `[N prompt tokens (M reused), K new, prefill X t/s, decode Y t/s]` ——
+**M reused 就是前缀复用省下来的 token**（多轮对话里通常 50%）。
+
+### B. 命令行 / 批量（脚本、批量评测用）
+
 ```bat
 REM 1) 引擎 exe 不能直接调：必须走 capture 包装（否则 exit 0xC0000135，DLL 找不到）
 python probe_rebuilt\run_capture.py build\infer_mini_nordc.exe ^
@@ -149,12 +177,14 @@ python probe_rebuilt\run_capture.py build\infer_mini_nordc.exe ^
 ## 6. 目录
 
 ```
-bin/      ninfer_mini_nordc.exe（引擎，193,521,152 B）
+（引擎 exe 不在仓库里：从 Releases 下载 ninfer_mini_nordc.exe，193,543,168 B，
+          sha256 见 VERSION.txt；把它和 harness/launchers/chat.bat 放同一个文件夹即可双击开聊）
 src/      infer/{include,src,third_party} + shim（HIP 兼容层），全量可重建源码
 harness/  构建与跑测工具（compile_one / swap_lib / link_exe / run_capture）
+          harness/launchers/chat.bat  双击启动器（+ model.txt.example）
 tasks/    验收语料（含 126K needle 语料）
 docs/     STORY / VALIDATION / PERF-CAPACITY / CHANGELOG / PATCHLIST / BUILD
-MANIFEST.sha256  bin/ 与 docs/ 的校验和
+VERSION.txt  版本、实测指标、引擎 sha256、环境变量与纪律
 ```
 
 构建方式见 [`docs/BUILD.md`](docs/BUILD.md)；每个改动的回滚点见 [`docs/PATCHLIST.md`](docs/PATCHLIST.md)。

@@ -1,5 +1,39 @@
 # CHANGELOG
 
+## 0.1.0-pre-r3 — 2026-10-31
+
+本版**没有改动任何计算路径**（decode/prefill 数字与 pre-r2 完全一致），
+只让引擎第一次能"像人一样用"：内置聊天模式 + 双击启动器。
+
+### 新增能力
+- **引擎内置 `--chat` 交互模式**（`mini_main.cpp`，约 +150 行）：
+  `ChatSink` 实现 `OutputSink`，content 流式打印、reasoning 以灰蓝 `[thinking]` 前缀输出；
+  每轮把整段 history 重新 `prepare`，靠**驻留前缀复用**只 prefill 新增 token；
+  `ContextLengthExceeded` 时自动丢掉最早一轮 user+assistant 重试一次；
+  `SetConsoleOutputCP(CP_UTF8)` + `ENABLE_VIRTUAL_TERMINAL_PROCESSING` 保证中文/颜色正确。
+  命令：`/help /clear /stats /think on|off /system <text> /exit`。
+- **`harness/launchers/chat.bat`**：双击即用。自动定位 exe（同目录或 `bin\`）、补 ROCm PATH、
+  记住模型路径（`model.txt`）、四档场景菜单（ctx 16384/32768/65536/131072）、第 5 项可手输参数。
+- 新增 `NINFER_ARGV` 环境变量（`main()` 最前面把 argv 逐条打到 stderr），排查"启动器传参是否正确"用。
+
+### 实测（RX 9070 XT 16GB，`--kv rk4v4-e8 --spec mtp --draft-tokens 2 --ctx 16384`）
+| 场景 | 结果 |
+|---|---|
+| 单轮短问（"法国的首都是哪里"） | 22 prompt tokens → 答"巴黎"，decode 28.4 t/s（1 token，不具代表性） |
+| 单轮闲聊（14 new tokens） | decode **57.4 t/s** |
+| 多轮第 2 轮（118 new tokens） | prefill 278 t/s、decode **60.4 t/s**，前缀复用 27/55 |
+| 非 chat 回归 | `tasks_cp8km` → `7F3K9Q` ✅，prefill 842.8 / decode 35.7（与 pre-r2 一致） |
+
+### 排障记录（值得写下来）
+- **启动器一开始启动的是旧 exe**：`build\` 里同时存在 `ninfer_mini_nordc.exe`（08:31 的旧构建，
+  没有 `--chat`）和 `infer_mini_nordc.exe`（当晚的新构建），启动器先匹配前者 ⇒ 表现为
+  "参数都对、就是不进聊天模式"，甚至 `--chat` 被当成普通 prompt（prompt=14 tokens，
+  回复 "Hello! How can I help you today?"）。定位手段：`NINFER_ARGV` 一条都没有 + `for %%F in ("%EXE%") do echo %%~zF`。
+  现在启动器会打印 `engine: <名字> <字节数> <时间>`，类似的错一眼可见。
+- **`chcp 65001` 会破坏 `set /p` 从重定向 stdin 读值**（菜单直接空转）；删掉即可，UTF-8 交给引擎自己做。
+- 测 bat 不要用 PowerShell 的 `cmd /c "bat < file"`（嵌套引号会拿不到 stdin），用
+  `python -c "subprocess.run(['cmd','/c',bat], stdin=open(f,'rb'))"`；测试输入文件必须是 CRLF。
+
 ## 0.1.0-pre-r2 — 2026-10-31
 
 本版没有改计算路径；它把「长上下文掉速」从「原因不明」变成「已定性 + 已有可操作结论」，

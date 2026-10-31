@@ -47,6 +47,22 @@ python harness\run_capture.py build\infer_mini_nordc.exe <artifact.ninfer> ^
 日志重定向用 `cmd /c "... > out.txt 2>&1"`；不要用 PowerShell 的 `>` / `Out-File`（默认 UTF-16LE，
 中文会变成乱码，曾经让我误判"引擎输出了垃圾"）。
 
+## 启动器（给最终用户，不需要命令行）
+
+`launchers/chat.bat` 是双击即用的聊天入口：自动定位 `ninfer_mini_nordc.exe`（同目录或 `bin\`）、
+把 ROCm `bin` 加进 PATH、记住模型路径（写 `model.txt`，参考 `model.txt.example`）、
+四档场景菜单（ctx 16384/32768/65536/131072，前三档带 `--spec mtp --draft-tokens 2`）+ 第 5 项手输参数。
+
+排障要点（都是真踩过的）：
+
+1. 启动器会优先找 `ninfer_mini_nordc.exe`（发布名），再找 `infer_mini_nordc.exe`。
+   **同一个目录里同时放两个名字的不同构建会静默跑到旧的那个** —— 现在启动器会先打印
+   `engine: <文件名> <字节数> <时间>`，对不上就是选错了文件。
+2. 不要在 bat 里写 `chcp 65001`：它会让 `set /p` 从重定向 stdin 读不到值（菜单空转）。
+   UTF-8 由引擎自己 `SetConsoleOutputCP(CP_UTF8)` 负责。
+3. 自动化测试 bat 用 `subprocess.run(['cmd','/c',bat], stdin=open(f,'rb'))`；
+   PowerShell 的 `cmd /c "bat < file"` 嵌套引号不可靠。输入文件必须 CRLF。
+
 ## 正确性探针
 
 - `attn_int4_probe.cu`：把 int4 KV 的 attention 与 host 参考实现逐值对拍（T=1..522，含非恒等块表）。
