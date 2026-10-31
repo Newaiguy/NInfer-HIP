@@ -6,6 +6,9 @@
 
 **为什么会有这个项目、这一个月里发生了什么 → [docs/STORY.md](docs/STORY.md)**（一个普通 AMD 用户的记录）
 
+**预编译二进制 → [Releases](https://github.com/Newaiguy/NInfer-HIP/releases)**
+（仓库不放二进制：exe 193 MB，超过 GitHub 单文件 100 MB 限制；模型权重也不在仓库内）
+
 NInfer 引擎（原生 CUDA 项目，Apache-2.0）到 **AMD RDNA4 / gfx1201** 的 HIP 移植分支。
 目标机型：RX 9070 XT 16GB（256-bit GDDR6，标称 640 GB/s），Windows 11 26200 + HIP SDK 7.2.3。
 模型：`WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3`（官方 v3 单文件 artifact，15,017,456,896 B，

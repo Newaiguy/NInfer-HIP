@@ -1,9 +1,11 @@
 NInfer-HIP 0.1.0-pre-r2
 =====================
 
-名称        : NInfer-HIP（仓库名 ninfer-hip）—— NInfer 引擎的 AMD RDNA4 / HIP 移植版
+名称        : NInfer-HIP —— NInfer 引擎的 AMD RDNA4 / HIP 移植版
+仓库        : https://github.com/Newaiguy/NInfer-HIP
+发布        : https://github.com/Newaiguy/NInfer-HIP/releases/tag/v0.1.0-pre-r2
 许可证      : Apache-2.0（衍生自 https://github.com/Neroued/ninfer，改动见 docs/PATCHLIST.md）
-状态        : 预发布快照（未对外发布，勿分发）
+状态        : 预发布（prerelease v0.1.0-pre-r2，已发布）
 构建时间    : 2026-10-31
 目标硬件    : AMD Radeon RX 9070 XT 16GB (RDNA4, gfx1201), 640 GB/s
 运行系统    : Windows 11 26200 (25H2) + HIP SDK 7.2.3 (AMD Software 26.8.1)
