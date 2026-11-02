@@ -1,8 +1,8 @@
-# NInfer-HIP `0.1.0-pre-r4`
+# NInfer-HIP `0.1.0-pre-r7`
 
 > 把 NInfer 推理引擎推到 AMD RDNA4（gfx1201）—— 一张 16GB 的 RX 9070 XT 上，
-> 27B 模型跑到 126K 上下文、decode 22.9 t/s，开 MTP 后 65K 上下文 41.6 t/s。
-> 同卡同权重下 decode 约为 llama.cpp 的 1.4x（开 MTP 约 2x）。
+> 27B 模型跑到 **126K 真实上下文**（decode 20.7 t/s · prefill 364），短上下文开 MTP dw2 到 **74.6 t/s**。
+> 同卡同权重下 decode 约为 llama.cpp 的 **1.4–2.5x**（开 MTP 约 2x）；prefill 在 ≥64K 落后于 llama.cpp（0.64x / 0.55x）。
 
 **为什么会有这个项目、这一个月里发生了什么 → [docs/STORY.md](docs/STORY.md)**（一个普通 AMD 用户的记录）
 
@@ -45,16 +45,16 @@ pre-r2 相对 pre-r1 的两大变化：
 |---|---|
 | **交互式聊天** | ✅ `--chat`：流式输出、多轮（前缀复用）、`/think /stats /clear /system /exit`；`harness/launchers/chat.bat` 双击启动 |
 | 正确性 29 token ~ 126K token | ✅ 全部通过（needle 逐字符命中、数字列表、长文摘要语义正确） |
-| **126K 真实上下文** | ✅ **decode 22.9 t/s · prefill 294**（`--ctx 126464`，needle `K8M2Q9` 命中） |
-| 96K 真实上下文 | ✅ decode **25.2**（AR）· **34.0**（MTP dw2）· prefill 346 |
-| 短上下文 decode（AR，宽 1） | 37.3 @29 token · 36.6 @529 · 35.4 @5.8K · 32.3 @32K |
-| 中长上下文 decode（AR） | 30.0 @48K · 28.4 @65K · 25.2 @96K · **22.9 @126K**（均要求 `--ctx` 贴紧） |
-| **MTP 推测解码（dw2）** | **77.8 @2.8K（+115%）** · 64.5 @24K（+100%） · **41.6 @65K（+47%）** · 34.9 @48K（+16%） · **34.0 @96K（+35%）** · ❌126K |
-| prefill | 848 @5.8K · 610 @32K · 505 @48K · 442 @64K · 346 @96K · 294 @126K |
+| **126K 真实上下文** | ✅ **decode 20.7 t/s · prefill 364**（`--ctx 131072`，needle `K8M2Q9` 命中） |
+| 96K 真实上下文 | ✅ decode **25.3**（AR）· prefill 422 |
+| 短上下文 decode（AR，宽 1） | 37.5 @29 token · 36.5 @2.8K · 35.7 @5.8K · 32.4 @32K |
+| 中长上下文 decode（AR） | 30.2 @48K · 28.6 @65K · 25.3 @96K · **20.7 @126K**（均要求 `--ctx` 贴紧） |
+| **MTP 推测解码（dw2）** | **74.6 @2.8K（+100%）** · 65.0 @24K（+100%） · 41.5 @131072 容量（真实 2.8K） · ❌真实上下文 ≥100K |
+| prefill | **948 @5.8K · 743 @32K · 633 @48K · 549 @65K · 422 @96K · 364 @126K** |
 | int4 KV | ✅ 16GB 上跑 128K 的唯一容量路径 |
 | int8 KV | ❌ 不可用（非确定性） |
 | fp8 KV | ❌ 不可用（QK 的 MMA 是未移植的 trap 桩；容量也只到 ~96K） |
-| dflash2 | ❌ 坏路径（decode 5.6 t/s、输出垃圾），未启用 |
+| dflash2 | ⚠ 已修好（输出与 AR 逐 token 相同）但**只有 12.8–14.9 t/s**，约为 MTP 的 1/6，未启用 |
 | 256K | ❌ 容量不够（int4 KV 8.86GB + 权重 11.77GB > 16GB），需 KV offload |
 | **多模态（图像输入）** | ❌ **本版不支持**（artifact 内含 vision 组件、引擎也编入了 vision 通路，但本版的 harness 没有图像入口；下一版接） |
 | 并发 | ❌ 只支持 1（`--max-concurrency 1`） |
@@ -123,8 +123,8 @@ KV 池按 `--ctx` **一次性全量提交**（int4 = `capacity × 17,920 B/token
    真实上下文 ≥100K 时直接关 MTP 用 AR。
 4. **真实上下文越长，MTP 倍率越低**（2.15× @2.8K → 1.35× @96K），但直到 96K 都仍是净赚。
 
-prefill 侧的额外开关（可选）：`NINFER_PREFILL_CHUNK`（默认 1024）。真实上下文 ≤32K 且 `--ctx` ≤65536 时设 4096
-可再拿 ~9%（32K: 347 → 378 t/s）；`--ctx` ≥69632 时会 OOM，必须留默认。
+prefill chunk 现在**自动分档**：`--ctx` ≤65536 用 2048、>65536 用 1024（相对 1024 全局快 +10~15%）。
+仍可用 `NINFER_PREFILL_CHUNK` 覆盖；4096 不再更快，且 `--ctx` ≥69632 时会 OOM。
 
 ## 4. 快速开始
 
@@ -185,7 +185,7 @@ python probe_rebuilt\run_capture.py build\infer_mini_nordc.exe ^
 ## 6. 目录
 
 ```
-（引擎 exe 不在仓库里：从 Releases 下载 ninfer_mini_nordc.exe，193,543,168 B，
+（引擎 exe 不在仓库里：从 Releases 下载 ninfer_mini_nordc.exe，193,910,272 B，
           sha256 见 VERSION.txt；把它和 harness/launchers/chat.bat 放同一个文件夹即可双击开聊）
 src/      infer/{include,src,third_party} + shim（HIP 兼容层），全量可重建源码
 harness/  构建与跑测工具（compile_one / swap_lib / link_exe / run_capture）
