@@ -1,4 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/program/storage/kv_retrieval.h"
 #include <windows.h> // AMD port: QPC for NINFER_PROFILE_PREFILL chunk timer
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
@@ -1086,6 +1087,9 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 prefill_chunk_prof.host_t0 = prefill_chunk_prof.chunk_t0;
             }
             while (remaining != 0) {
+                // Resident window (Leg B): drop the oldest KV pages before this chunk appends, so the
+                // append lands inside the always-resident page pool. No-op unless NINFER_RESIDENT_TOKENS.
+                ensure_kv_window(sequence, staged.cursor + nominal);
                 schedule_state.text_kv_base           = staged.cursor;
                 selectors                             = state_selectors(sequence);
                 schedule_state.state_source_slot      = selectors.source;
@@ -1165,6 +1169,29 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                     sequence.dflash_context_frontier = staged.cursor;
                 }
                 commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+
+                // Retrieval recall lands inside that commit, which is one chunk too late for the
+                // final chunk's own attention: replay it so the recalled pages are actually seen
+                // by the forward pass that reads the question.
+                static thread_local bool in_recall_replay = false;
+                if (staged.cursor == staged.prompt_tokens && !in_recall_replay &&
+                    ninfer::models::qwen3_5::detail::KVRetrieval::instance() != nullptr &&
+                    (std::getenv("NINFER_KV_REPLAY") == nullptr ||
+                     std::getenv("NINFER_KV_REPLAY")[0] != '0')) {
+                    in_recall_replay           = true;
+                    schedule_state.text_kv_base =
+                        staged.cursor - static_cast<std::uint32_t>(result.processed_tokens);
+                    const execution::PrefillChunkResult replay = execution::prefill_text_chunk(
+                        schedule_state, std::span<const TokenId>(staged.prompt.token_ids),
+                        static_cast<std::uint32_t>(result.processed_tokens), std::nullopt, true);
+                    in_recall_replay = false;
+                    timing.include(replay.timing);
+                    sequence.text_kv_valid = staged.cursor;
+                    std::fprintf(stderr, "[kv-replay] replayed %u tokens from %u\n",
+                                 static_cast<unsigned>(result.processed_tokens),
+                                 schedule_state.text_kv_base);
+                    std::fflush(stderr);
+                }
 
                 // Prompt transitions are canonical immediately. If this was the first write after
                 // an immutable source, close the Fork before potentially freezing a new rewrite.

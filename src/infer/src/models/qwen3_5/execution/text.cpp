@@ -1,10 +1,13 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/execution/text.h"
+#include "models/qwen3_5/execution/kv_window.h"
+#include "ops/softmax_attention/dense/causal_cache/key_position_hook.h"
 #include "models/qwen3_5/execution/attention.h"
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/execution/workspace.h"
+#include "models/qwen3_5/program/storage/kv_retrieval.h"
 
 #include "core/nvtx.h"
 #include "models/qwen3_5/execution/visual_scatter.h"
@@ -27,6 +30,31 @@
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/mtp_pack.h"
+
+namespace {
+
+// Resident window: hand the decode/prefill kernels an explicit slot -> compact
+// position map for the lifetime of one launch region. Raised only around the calls
+// that consume it, because the hook is process wide while work_ is a reused arena:
+// a stale pointer there would turn unrelated attention calls into dirty reads.
+class ScopedKeyPositionMap {
+public:
+    ScopedKeyPositionMap() = default;
+    ScopedKeyPositionMap(ninfer::Tensor* map, std::int32_t slots) { arm(map, slots); }
+    void arm(ninfer::Tensor* map, std::int32_t slots) {
+        ninfer::ops::g_attention_key_position_map =
+            map == nullptr ? nullptr : static_cast<const std::int32_t*>(map->data);
+        ninfer::ops::g_attention_key_slots = slots;
+    }
+    ~ScopedKeyPositionMap() {
+        ninfer::ops::g_attention_key_position_map = nullptr;
+        ninfer::ops::g_attention_key_slots          = 0;
+    }
+    ScopedKeyPositionMap(const ScopedKeyPositionMap&)            = delete;
+    ScopedKeyPositionMap& operator=(const ScopedKeyPositionMap&) = delete;
+};
+
+}  // namespace
 #include "ops/launcher/paged_kv_window.h"
 #include "ninfer/ops/position.h"
 #include "ninfer/ops/residual_add.h"
@@ -1742,6 +1770,44 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
+    // W4 retrieval: fold this chunk's pre-RoPE K/Q into the block index. The compact layer 0
+    // call is the first full-attention layer of every chunk, so the position copy behind
+    // begin_chunk happens once per chunk rather than once per layer.
+    if (auto* retrieval = ninfer::models::qwen3_5::detail::KVRetrieval::instance();
+        retrieval != nullptr) {
+        if (fidx == 0) {
+            retrieval->begin_chunk(static_cast<const std::int32_t*>(rope_positions.data),
+                                   static_cast<std::int32_t>(T), s);
+            retrieval->reset_query(s);
+        }
+    }
+    // Resident window: attention kernels derive their scan bound and causal mask from these
+    // positions, so they must address the COMPACT KV slot space (absolute - window base).
+    // RoPE keeps absolute positions (rope_positions) because the rotation is applied on write.
+    Tensor cache_positions_compact;
+    const Tensor* cache_positions_ptr = &cache_positions;
+    if (g_ninfer_kv_window_base_tokens != 0) {
+        const std::int32_t ccount = static_cast<std::int32_t>(cache_positions.ne[0]) *
+                                    cache_positions.ne[1] * cache_positions.ne[2] *
+                                    cache_positions.ne[3];
+        if (ccount > 0) {
+            Tensor delta = work_.alloc(DType::I32, {1, 1, 1, 1});
+            ops::set_i32_scalar(delta,
+                                -static_cast<std::int32_t>(g_ninfer_kv_window_base_tokens), s);
+            Tensor target = work_.alloc(DType::I32, {ccount});
+            ops::offset_i32_positions(cache_positions.view({ccount}), delta, target, s);
+            cache_positions_compact = target.view({cache_positions.ne[0], cache_positions.ne[1],
+                                                   cache_positions.ne[2], cache_positions.ne[3]});
+            cache_positions_ptr = &cache_positions_compact;
+            static std::uint32_t compact_traced_base = 0xFFFFFFFFu;
+            if (compact_traced_base != g_ninfer_kv_window_base_tokens) {
+                compact_traced_base = g_ninfer_kv_window_base_tokens;
+                std::fprintf(stderr, "[win] compact positions: count=%d window_base=%u\n", ccount,
+                             static_cast<unsigned>(g_ninfer_kv_window_base_tokens));
+                std::fflush(stderr);
+            }
+        }
+    }
     // Paired pre/post-rope dump: hold the pre-rope qn copy in a static host buffer and
     // resolve it against the post-rope qn right after text_rope, so both come from the
     // very same attention call (rotation is norm-preserving, so a norm mismatch means the
@@ -1785,6 +1851,13 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     }
     text_rope(rope_for_op, *config_.rope_parameters, qn, kn, s);
     debug_layer_checksum("q-rope", fidx, qn, s);
+    // Post-rope: qn/kn now hold exactly what the cache stores, so a page mean of these keys
+    // dotted with the rotated query equals the mean true attention logit of that page.
+    if (auto* retrieval = ninfer::models::qwen3_5::detail::KVRetrieval::instance();
+        retrieval != nullptr) {
+        retrieval->accumulate_keys(kn.data, fidx, s);
+        retrieval->accumulate_query(qn.data, fidx, s);
+    }
     debug_layer_checksum("k-rope", fidx, kn, s);
     if (std::getenv("NINFER_ATTN_PROBE") != nullptr && !s_rope_pre_qn.empty()) {
         // The post-rope side: fire only when we actually captured a pre copy. Write both
@@ -1861,7 +1934,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         Tensor a_batch        = a.view({dimension(config_.attention->head_dim),
                                         dimension(config_.attention->num_attention_heads), width,
                                         active_sequence_batch_});
-        Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
+        Tensor position_batch = cache_positions_ptr->view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         ops::causal_softmax_attention(
             q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
@@ -1873,7 +1946,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
             a_batch, s);
     } else {
         ops::causal_softmax_attention(
-            qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
+            qn, kn, v, *cache_positions_ptr, Tensor{}, kv_table_rows,
             {dimension(config_.attention->head_dim),
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
@@ -2937,9 +3010,20 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             }
             ScopedPositions scoped_cache(active_cache_positions_, positions);
             ScopedPositions scoped_rope(active_rope_positions_, rope_positions);
-            const auto visible = static_cast<std::uint32_t>(base_i + t0 + len);
+            // Resident window: visible counts address the compact KV slot space.
+    const auto visible = static_cast<std::uint32_t>(base_i + t0 + len) -
+                         g_ninfer_kv_window_base_tokens;
             const ops::CausalAttentionExecutionEnvelope chunk_envelope{visible, visible};
             ScopedEnvelope scoped_envelope(active_causal_attention_envelope_, chunk_envelope);
+            // Slot -> compact position map for the retained window (identity order today;
+            // recall blocks will publish a permutation here instead).
+            ScopedKeyPositionMap scoped_key_pos;
+            Tensor key_pos_map;
+            if (g_ninfer_kv_window_base_tokens != 0 && visible > 0) {
+                key_pos_map = work_.alloc(DType::I32, {static_cast<std::int32_t>(visible)});
+                ops::fill_i32_positions(key_pos_map, 0, s);
+                scoped_key_pos.arm(&key_pos_map, static_cast<std::int32_t>(visible));
+            }
 
             Tensor x = roots.residual;
             ops::embedding(ids_device, *embed_, x, s);
@@ -2963,7 +3047,9 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 // B20 P0-2: count NaN at the SAME point as the dump (pre-rmsnorm).
                 // Compare with the in-loop per-layer counts: equal => the dump offset
                 // reads different memory; different => x was modified after run_layers.
-                {
+                // AMD port: NaN pre-scan is a kernel + sync per step; it used to run on EVERY
+                // decode step and both cost time and polluted the chat stream. Debug only.
+                if (std::getenv("NINFER_DBG_PTR") != nullptr) {
                     const int pre_nan = ninfer::ninfer_nan_count(
                         x.data, static_cast<int>(x.ne[0]), static_cast<int>(x.ne[1]),
                         ctx_.stream);
@@ -3131,9 +3217,19 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                         Tensor next_token = io_.mtp->draft_tokens.slice(0, i, 1);
                         Tensor next_hidden =
                             work_.alloc(DType::BF16, {dimension(config_.hidden_size), 1});
-                        const auto ar_visible = static_cast<std::uint32_t>(base_i + T + i);
+                        const auto ar_visible = static_cast<std::uint32_t>(base_i + T + i) -
+                            g_ninfer_kv_window_base_tokens;
                         const ops::CausalAttentionExecutionEnvelope ar_envelope{ar_visible,
                                                                                 ar_visible};
+                        ScopedKeyPositionMap scoped_key_pos;
+                        Tensor key_pos_map;
+                        if (g_ninfer_kv_window_base_tokens != 0 && ar_visible > 0) {
+                            key_pos_map =
+                                work_.alloc(DType::I32, {static_cast<std::int32_t>(ar_visible)});
+                            ops::fill_i32_positions(key_pos_map, 0, s);
+                            scoped_key_pos.arm(&key_pos_map,
+                                               static_cast<std::int32_t>(ar_visible));
+                        }
                         mtp_forward_ar_step(prev_token, io_.mtp->ar_hidden, ar_position,
                                             ar_envelope, next_hidden, logits, next_token);
                         CUDA_CHECK(cudaMemcpyAsync(io_.mtp->ar_hidden.data, next_hidden.data,
@@ -3170,6 +3266,15 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     }
 
     prefill_split_frontier_ = -1;
+
+    // The prompt is complete: snapshot the query summary so the first decode step ranks archived
+    // pages against the question instead of whatever chunk happens to be in flight.
+    if (finalize_at_end && t0 >= T) {
+        if (auto* retrieval = ninfer::models::qwen3_5::detail::KVRetrieval::instance();
+            retrieval != nullptr) {
+            retrieval->freeze_query(s);
+        }
+    }
 
     timing.begin_wait();
     ctx_.synchronize();
