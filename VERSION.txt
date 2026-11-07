@@ -1,98 +1,97 @@
-NInfer-HIP 0.1.0-pre-r4
-=====================
+NInfer-HIP 0.1.0-pre-r8
+=======================
 
 名称        : NInfer-HIP —— NInfer 引擎的 AMD RDNA4 / HIP 移植版
 仓库        : https://github.com/Newaiguy/NInfer-HIP
-发布        : https://github.com/Newaiguy/NInfer-HIP/releases/tag/v0.1.0-pre-r4
-许可证      : Apache-2.0（衍生自 https://github.com/Neroued/ninfer，改动见 docs/PATCHLIST.md）
-状态        : 预发布（prerelease v0.1.0-pre-r4，已发布）
-构建时间    : 2026-10-31
+发布        : https://github.com/Newaiguy/NInfer-HIP/releases/tag/v0.1.0-pre-r8
+许可        : Apache-2.0（派生自 https://github.com/Neroued/ninfer，改动见 docs/PATCHLIST.md）
+状态        : 预发布（prerelease v0.1.0-pre-r8，已发布）
+构建时间    : 2026-11-06
 目标硬件    : AMD Radeon RX 9070 XT 16GB (RDNA4, gfx1201), 640 GB/s
 运行系统    : Windows 11 26200 (25H2) + HIP SDK 7.2.3 (AMD Software 26.8.1)
-模型        : WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3（自足 artifact）
+模型        : WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3（官方 v3 单文件 artifact）
               E:\ninfer-models\Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer
               size 15,017,456,896 B（text 11.755GB + vision + mtp + dflash2）
 
-引擎        : bin/ninfer_mini_nordc.exe（本版新增 --chat 交互模式）
-  size      : 193,544,704 B
-  sha256    : CCF6B58CDF0E23598941B145FB11293039D951E5BF97ADEF278882978C288E6F
+引擎        : ninfer_mini_nordc.exe
+  size      : 191,691,776 B
+  sha256    : 5433232edbc4d8c2f90f15f98b47d0d9f6a98a50fda1c59c167d83faf32a9b2b
 
-交互聊天（本版新增）
-  启动        : 双击 harness/launchers/chat.bat（自动找 exe、记住模型路径、四档场景菜单）
-                或直接：ninfer_mini_nordc.exe <artifact> --chat --ctx 16384 --kv rk4v4-e8
-                        --spec mtp --draft-tokens 2 --max-new 512
-  实测        : 单轮 14 new tokens → decode 57.4 t/s；多轮第 2 轮 118 new tokens → 60.4 t/s
-                （前缀复用 27/55，即整段 history 只需 prefill 新增部分）
-  命令        : /help /clear /stats /think on|off /system <text> /exit
+--------------------------------------------------------------------------------
+本版核心：KV 记忆（KV archive + retrieval recall）
+--------------------------------------------------------------------------------
 
-关键指标（graph on，-kv rk4v4-e8 = int4 K / int4 V，--ctx 均贴近实际 prompt 长度）
+长上下文里被滑出显存的 KV 页不再丢弃：先归档到主机内存；prompt 读完后用最后一个
+query 给所有归档页打分，挑出最相关的一段连续页换回显存，再重放最后一个 chunk。
+目标：长文里"答案在深处"的场景，从答不出来变成答得对。
+
+启动参数（新增四个，不传则行为与 pre-r7 完全一致）
+  --resident-tokens N   常驻窗口 token 数            默认 20480
+  --sink-tokens N       attention sink token 数      默认 2048
+  --archive-mib N       主机侧归档 arena（MiB）        默认 2048；给这个参数自动开归档
+  --kv-retrieval 1      打开检索召回                   默认 0（关）
+
+  等价环境变量：NINFER_RESIDENT_TOKENS / NINFER_SINK_TOKENS /
+                NINFER_KV_ARCHIVE_MIB（自动置 NINFER_KV_ARCHIVE=1）/ NINFER_KV_RETRIEVE
+  调优：NINFER_KV_RECALL_PAGES(112) / NINFER_KV_RECALL_BACKOFF(56) / NINFER_KV_REPLAY(1)
+
+推荐（96K 以上长文，问题在末尾）
+  --kv rk4v4-e8 --ctx 262144 --resident-tokens 20480 --sink-tokens 2048 \
+  --archive-mib 4096 --kv-retrieval 1
+
+实测（96K 正文，needle 埋 25/50/75/92% 深度）
+  25% / 50% / 75%：检索关 = miss，检索开 = HIT（口令逐字符命中）
+  92%           ：两种情况都 HIT，且输出逐 token 相同（无回归）
+  归档开销      ：prefill 801.997 → 800.446，decode 33.14 → 33.62（噪声内），输出逐 token 相同
+  GATE 回归     ：8k 35.63/931.4 · 96k 24.90/422.1 · mtp 80.21/842.2（检索默认关闭，无回退）
+
+限制（务必先读）
+  召回是启发式：页均值打分定位误差约 ±8 页，取 112 页连续段兜住
+  必须读完 prompt 才能召回（query 取最后一个 token）；问题不在末尾没有保证
+  额外显存：页摘要 ~168 MB（1311 页）+ 环形缓冲 64 MB；主机内存：最多 --archive-mib
+  只在 needle 语料上验证过（多跳推理、整篇摘要无数据）
+  详见 docs/KVMEM.md
+
+--------------------------------------------------------------------------------
+关键指标（pre-r7 基线，本版未回退）
+--------------------------------------------------------------------------------
+
+graph on，KV = rk4v4-e8（int4 K / int4 V），--ctx 贴紧实际 prompt 长度
   decode AR      : 37.3 @2.8K(ctx8K) · 35.4 @5.8K(ctx16K) · 32.3 @31K(ctx32K)
                    30.0 @48K(ctx49K) · 28.4 @65K(ctx66K) · 25.2 @96K(ctx98K)
                    **22.9 @126K(ctx126464)**
-  decode MTP dw2 : 77.8 @2.8K（AR 2.15x） · 64.5 @24K（2.0x）
-                   41.6 @65K（1.47x） · 34.9 @48K（1.16x） · 34.0 @96K（1.35x） · 126K 不可用
+  decode MTP dw2 : 77.8 @2.8K（2.15x）· 64.5 @24K（2.0x）· 41.6 @65K（1.47x）
+                   34.0 @96K（1.35x）· 126K 不可用
   prefill        : 848 @5.8K · 610 @31K · 505 @48K · 442 @65K · 346 @96K · 294 @126K
   正确性         : 5.8K / 31K / 48K / 65K / 98K / 126K needle 全命中
-                  （126K = tasks_true128k 126,306 token → K8M2Q9）
 
 本版核心结论（务必先读）
   --ctx 必须 = prompt + max_new，一个 token 都别多开
-    126K 语料：--ctx 131072 → 10.12 t/s；--ctx 126464 → 22.91 t/s（2.26x，复测 22.93 / 23.01）
-    65K  语料：--ctx 131072 → 15.0  t/s；--ctx 65536  → 28.4  t/s
+    126K 语料：--ctx 131072 → 10.12 t/s；--ctx 126464 → 22.91 t/s（2.26x）
   根因：KV 池按 --ctx 一次性全量提交（int4 17920 B/token），越过 Windows 驻留预算
-        （约 12.6~13.6 GiB，当天漂移约 1 GiB）后整池降级到系统内存，按 PCIe ~30 GB/s 读
-  悬崖在“提交量”而非“ctx 值”：同一条 48K 提示，--ctx 65536 上午 30.1 / 下午同命令 30.0；
-        而 --ctx 69632 上午 16.8（越线）、--ctx 122880 下午 29.99（未越线）
-  MTP 的固定开销 = +0.57 GB（mtp 权重 348MB + draft state 190MB + verify 图 73MB）
-        ⇒ 96K 能跑（提交 13.62 GiB）34.0 t/s；126K 越线（14.12 GiB）掉到 10.6 t/s
+        （约 12.6~13.6 GiB，当天漂移 ~1 GiB）后整池降级到系统内存，走 PCIe ~30 GB/s
+  开了 --resident-tokens 窗口模式后，驻留量由窗口决定，不受这条约束
 
-推荐配置（按真实上下文选，详见 docs/README.md 第 3 节）
-  真实 <=8K      : --ctx 16384  --kv rk4v4-e8 --spec mtp --draft-tokens 2  -> 77.8 t/s（AR 36.2）
-  真实 16-32K    : --ctx 32768  --spec mtp --draft-tokens 2                 -> 64.5 t/s（真实 24K）
-  真实 48K       : --ctx 49152  --spec mtp --draft-tokens 2                 -> 34.9 t/s（AR 30.1）
+推荐配置（按真实上下文选）
+  真实 <=8K      : --ctx 16384  --kv rk4v4-e8 --spec mtp --draft-tokens 2  -> 77.8 t/s
+  真实 16-32K    : --ctx 32768  --spec mtp --draft-tokens 2                 -> 64.5 t/s
+  真实 48K       : --ctx 49152  --spec mtp --draft-tokens 2                 -> 34.9 t/s
   真实 64K       : --ctx 65536  （AR 28.4 / 加 MTP 34.9）
-  真实 96K       : --ctx 98304  --spec mtp --draft-tokens 2                 -> 34.0 t/s（AR 25.2）
-  真实 126K      : --ctx 126464 （必须关 MTP）                               -> 22.9 t/s
-  大容量短对话   : --ctx 81920  --spec mtp --draft-tokens 2                 -> 56.0 t/s（真实 2.8K）
-  规则：ctx 贴紧实际长度；draft-tokens 只用 2；>=100K 真实上下文关 MTP
-
-同卡 llama.cpp 对照（llama build 9548，-ctk q4_0 -ctv q4_0 -fa on）
-  【口径】必须在同一时段背靠背测。早期 llama 值（65K 11.47 / 126K 7.15）是预算偏低时测的，
-         llama 自己也被降级，虚低 43%~56%，已作废。下面是同窗口重测：
-  decode : 247 tok  我们 37.3  vs llama 26.54（1.41x）
-           65,135   我们 28.30 vs llama 20.17（1.40x）；开 MTP dw2 41.58 = 2.06x
-           126,294  我们 22.95 vs llama 16.19（1.42x，llama -c 126464；-c 131072 时 16.32）
-           ⇒ 三档倍数一致 1.4x；MTP 让我们在中长上下文达到 llama 的 2 倍
-           （llama 上游 build 9548 无 MTP；用户脚本 G: 补丁分支 draft-mtp n-max3 同档标称 ~37）
-  prefill: 我们 438 vs 752 @65K · 295 vs 575 @126K（0.5-0.6x，下一版主目标）
-  注      : llama 在 126K 不需要收紧 -c（固定开销小，同上下文只占约 13.1 GiB）；
-           我们固定开销多 573 MB（state 320 + ws 240 + graph 13），所以必须 --ctx 贴紧
-
-本版（相对 pre-r2）
-  1 修 decode attention 写回（o_stage 逐片求和，消除 32-周期性重复）——长上下文垃圾文本的根因
-  2 MTP verify 批量化（grid.z == tokens），48K/126K 不再因 per-token 循环退化
-  3 --ctx 台阶定量到“提交预算”：预算是 12.6~13.6 GiB 且当天漂移，悬崖看提交量不看 ctx 值
-  4 126K 口径纠正：pre-r1 的“23.5 不可复现”与初稿的“10.1”都不对，
-    真值 22.9 t/s @ --ctx 126464；10.1 来自 --ctx 131072 多开 4743 token
-  5 96K 真实上下文从 11.8 提到 25.2（AR）/ 34.0（MTP），同样只是 --ctx 从 131072 收到 98304
-  6 诊断仪器：[mem]/[vram]/[xfer] 探针、NINFER_DUMMY_MB、NINFER_PREALLOC_MB、
-    NINFER_VRAM_CEILING（证明 cudaMalloc 是虚拟超额提交：干净进程可分配 >=24 GiB）、
-    NINFER_KVCAP_DIAG、NINFER_STEP_T、NINFER_KV_DUMP_SEQ（源码级，默认全关）
-  7 生产默认关掉 arena 的 alloc 带宽探针（NINFER_ALLOC_BW，默认 0）
-  8 引擎内置 --chat 交互模式（流式、多轮、前缀复用、/think /clear /stats /system /exit）
-  9 harness/launchers/chat.bat 双击启动器（自动找 exe、记住模型路径、四档场景菜单）
+  真实 96K       : --ctx 98304  --spec mtp --draft-tokens 2                 -> 34.0 t/s
+  真实 126K      : --ctx 126464 （必须关 MTP）                              -> 22.9 t/s
+  长文 + KV 记忆 : --ctx 262144 --resident-tokens 20480 --sink-tokens 2048
+                   --archive-mib 4096 --kv-retrieval 1
 
 未修（见 docs/PATCHLIST.md 末节）
-  多模态（图像输入）：本版 harness 无入口（artifact 有 vision 组件、引擎有 enable_vision 通路）
+  多模态（图像输入）：本版 harness 无入口（artifact 有 vision、引擎有 enable_vision 通路）
   int8 KV 非确定性 · fp8 KV 的 QK 是 __builtin_trap() 桩 · dflash2 坏路径
-  126K 以上 MTP（差 0.5 GB 预算） · prefill >=64K 落后 llama · 256K 需 KV offload
+  126K 以上 MTP（差 0.5 GB 预算）· prefill >=64K 落后 llama · 256K 需 KV offload
   短上下文 45 t/s 未达（AR 37.3，物理上限 54）
 
 重要用法
-  --ctx 必须贴近实际 prompt 长度（126K：ctx126464 → 22.9，ctx131072 → 10.1）
-  MTP 只用 --draft-tokens 2；3 及以上净亏；>=100K 真实上下文关 MTP
-  引擎 exe 裸双击需要 ROCm DLL 在 PATH：chat.bat 已自动补；脚本化请走
-    python probe_rebuilt\run_capture.py build\infer_mini_nordc.exe ...
+  --ctx 必须贴近实际 prompt 长度（126K：ctx126464 → 22.9；ctx131072 → 10.1）
+  MTP 只用 --draft-tokens 2；>=100K 真实上下文关 MTP
+  引擎 exe 裸双击需要 ROCm DLL 在 PATH：chat.bat 已自动补
 
 安全铁律
   绝不对卡在 GPU 上的引擎进程 Stop-Process（会让 GPU 队列永久卡死 → 黑屏硬复位）
@@ -100,9 +99,10 @@ NInfer-HIP 0.1.0-pre-r4
   扫测进行中禁止编译/链接（构建会 taskkill 引擎进程并改写 exe）
 
 文档
-  README.md              能力状态、快速开始（含双击开聊）、已知坑
-  docs/VALIDATION.md     正确性+速度矩阵、MTP 倍率、llama 对照、物理上限
-  docs/PERF-CAPACITY.md  --ctx 台阶与驻留预算根因（本版核心结论）
-  docs/CHANGELOG.md      pre-r1 / pre-r2 / pre-r3 变更与否定结论
-  docs/PATCHLIST.md      逐文件改动 + .bak 回滚点 + 未修技术债
-  docs/BUILD.md          单 TU 构建、跑测外壳、环境变量速查、跑测纪律
+  README.md              能力状态、KV 记忆用法、快速开始、已知坑
+  docs/KVMEM.md          KV 记忆的实现、参数、四次证伪过程、实测
+  docs/VALIDATION.md     正确性/速度矩阵、MTP 倍率、llama 对照、物理上限
+  docs/PERF-CAPACITY.md  --ctx 台阶与驻留预算根因
+  docs/CHANGELOG.md      pre-r1 ~ pre-r8 变更
+  docs/PATCHLIST.md      逐文件改动 + 回滚点 + 未修技术债
+  docs/BUILD.md          单 TU 构建、跑测外哨、环境变量速查

@@ -1,40 +1,38 @@
-# NInfer-HIP `0.1.0-pre-r7`
+# NInfer-HIP `0.1.0-pre-r8`
 
 > 把 NInfer 推理引擎推到 AMD RDNA4（gfx1201）—— 一张 16GB 的 RX 9070 XT 上，
 > 27B 模型跑到 **126K 真实上下文**（decode 20.7 t/s · prefill 364），短上下文开 MTP dw2 到 **74.6 t/s**。
 > 同卡同权重下 decode 约为 llama.cpp 的 **1.4–2.5x**（开 MTP 约 2x）；prefill 在 ≥64K 落后于 llama.cpp（0.64x / 0.55x）。
+>
+> **0.1.0-pre-r8 的新东西：KV 记忆（KV memory）。** 显存窗口装不下的老上下文不再被丢弃——
+> 滑出窗口的 KV 页会归档到内存，等 prompt 读完、问题已知时再挑出相关的一段换回显存继续参与注意力。
+> 96K 长文里埋在 25% / 50% / 75% 深度的答案，从「答不出来」变成「逐 token 正确」。详见 [§2](#2-kv-记忆显存装不下的上下文捞回来)。
 
 **为什么会有这个项目、这一个月里发生了什么 → [docs/STORY.md](docs/STORY.md)**（一个普通 AMD 用户的记录）
 
 **预编译二进制 → [Releases](https://github.com/Newaiguy/NInfer-HIP/releases)**
-（仓库不放二进制：exe 193 MB，超过 GitHub 单文件 100 MB 限制；模型权重也不在仓库内）
+（仓库不放二进制：exe 191 MB，超过 GitHub 单文件 100 MB 限制；模型权重也不在仓库内）
 
 NInfer 引擎（原生 CUDA 项目，Apache-2.0）到 **AMD RDNA4 / gfx1201** 的 HIP 移植分支。
 目标机型：RX 9070 XT 16GB（256-bit GDDR6，标称 640 GB/s），Windows 11 26200 + HIP SDK 7.2.3。
 模型：`WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3`（官方 v3 单文件 artifact，15,017,456,896 B，
 内含 text + vision + mtp + dflash2 四个组件，本版本只用 text 与 mtp）。
 
-pre-r4 相对 pre-r3 的变化：
+## 0. 这一版（pre-r8）更新了什么
 
-1. **聊天输出干净了**：引擎的诊断行（`[mtp-diag]` / `[rmsnorm-ptr]` / `[attn-fallback]`）全部改成
-   `NINFER_MTP_DIAG` / `NINFER_DBG_PTR` / `NINFER_ATTN_TRACE` 显式开启；聊天模式下 stderr 统一重定向到
-   同目录 `ninfer-chat.log`，不会再串到回答中间。
-2. **顺手拿掉一处每步开销**：`[rmsnorm-ptr]` 之前每 decode step 都跑一次 NaN 扫描 kernel + 同步，
-   现在只在 `NINFER_DBG_PTR=1` 时才做。
+一句话：**给引擎加了「KV 记忆」——长上下文里被滑出显存的那部分，可以按问题相关性捞回来。**
 
-pre-r3 相对 pre-r2 的变化：
-
-1. **引擎内置交互式聊天模式**（`--chat`）：流式输出、多轮、前缀复用（第 2 轮起只 prefill 新增 token）、
-   `/think /clear /stats /system` 命令；实测短上下文 **57-60 t/s**（MTP dw2）。
-2. **双击即用的启动器** `harness/launchers/chat.bat`：自动找 exe、记住模型路径、四种场景菜单，
-   不需要记参数也不需要 Python 包装（引擎已能直接跑，DLL 由启动器补 PATH）。
-
-pre-r2 相对 pre-r1 的两大变化：
-
-1. **长上下文掉速的根因定量到「工作集越过 Windows 高速驻留预算」**（KV 页改按 PCIe 速度读），
-   并给出唯一有效的操作规则：**`--ctx` 必须贴着实际 prompt 长度**。
-2. **126K 口径纠正**：pre-r1 记的「126K decode 23.5」和本版初稿记的「10.1」都不对 ——
-   真值是 **22.9 t/s @ `--ctx 126464`**，10.1 来自把 `--ctx` 开成 131072（多开 4,743 token 越预算）。
+1. **KV 归档（KV archive）**：窗口每往前滑一次，即将被丢弃的 KV 页先 DMA 到主机内存的一块
+   arena 里（按 token 区间连续存放，满了按 FIFO 淘汰）。归档进去的是**完整的 K+V**，不是摘要。
+2. **页级相关性检索**：prefill 过程中顺手为每个归档页算一份「K 均值摘要」（16 个全注意力层 ×
+   4 个 KV 头 × 256 维，bf16）；prompt 读完、拿到最后一个 query 之后，用 query 与全部候选页打分，
+   每个 (层, 头) 单元各自标准化后取最大，得到页相关性排序。
+3. **按峰值取连续段换回显存**：以排名第一的页为中心取 **112 页（7168 token）连续区间**，
+   从归档里 H2D 拷回显存——正好落在「下一次滑移本来就要丢弃的槽位」上，**不额外占显存容量**。
+4. **重放最后一个 chunk**：召回发生在 prefill 结束之后，而最后一个 chunk 的注意力已经算完了，
+   所以把最后那几 token（实测 4 个）重算一遍，让问题真正「看」到召回的内容。
+5. **四个启动参数上命令行**：`--resident-tokens` / `--sink-tokens` / `--archive-mib` / `--kv-retrieval`，
+   不再需要设环境变量（见 §2.3）。不传 `--kv-retrieval` 时行为与 pre-r7 **完全一致**。
 
 ## 1. 状态总览（本版本实测）
 
@@ -43,6 +41,7 @@ pre-r2 相对 pre-r1 的两大变化：
 
 | 项目 | 状态 |
 |---|---|
+| **KV 记忆（本版新增）** | ✅ 归档 + 检索召回；96K 长文 needle 深度 25/50/75% 全部命中；92% 深度（无需召回）与关闭检索逐 token 相同 |
 | **交互式聊天** | ✅ `--chat`：流式输出、多轮（前缀复用）、`/think /stats /clear /system /exit`；`harness/launchers/chat.bat` 双击启动 |
 | 正确性 29 token ~ 126K token | ✅ 全部通过（needle 逐字符命中、数字列表、长文摘要语义正确） |
 | **126K 真实上下文** | ✅ **decode 20.7 t/s · prefill 364**（`--ctx 131072`，needle `K8M2Q9` 命中） |
@@ -55,11 +54,163 @@ pre-r2 相对 pre-r1 的两大变化：
 | int8 KV | ❌ 不可用（非确定性） |
 | fp8 KV | ❌ 不可用（QK 的 MMA 是未移植的 trap 桩；容量也只到 ~96K） |
 | dflash2 | ⚠ 已修好（输出与 AR 逐 token 相同）但**只有 12.8–14.9 t/s**，约为 MTP 的 1/6，未启用 |
-| 256K | ❌ 容量不够（int4 KV 8.86GB + 权重 11.77GB > 16GB），需 KV offload |
+| 256K | ❌ 直接塞不下（int4 KV 8.86GB + 权重 11.77GB > 16GB）；KV 记忆提供的是「长文可读」而非「显存装得下」 |
 | **多模态（图像输入）** | ❌ **本版不支持**（artifact 内含 vision 组件、引擎也编入了 vision 通路，但本版的 harness 没有图像入口；下一版接） |
 | 并发 | ❌ 只支持 1（`--max-concurrency 1`） |
 
-## 2. 最重要的一条：`--ctx` 必须贴着实际 prompt 长度
+## 2. KV 记忆：显存装不下的上下文，捞回来
+
+### 2.1 要解决什么问题
+
+16GB 的卡，27B 权重占 11.77 GB，int4 KV 每 token 17,920 B。想跑 126K 上下文就要 8.86 GB KV —— **装不下**。
+引擎的做法是**滑动窗口**：只把「最近的 N 个 token」+「最前面 2048 个 token（attention sink）」留在显存里，
+更早的页滑出去、直接释放。
+
+代价是：**窗外的内容真的没了**。把答案埋在 96K 长文的 25% 深度，问「那是什么」——模型看不到那段，
+只能编。`0.1.0-pre-r8` 之前就是这样。
+
+KV 记忆做的事：**滑出去的页不扔，先存到主机内存；读完整段 prompt、知道问题是什么之后，
+按相关性把最可能相关的一小段换回显存，再让问题读一次。**
+
+### 2.2 怎么实现的
+
+整条流水线横跨 4 个文件（`kv_archive` + `kv_retrieval` + `context` + `prefill`/`text`）：
+
+**① 归档 —— 滑移的同一处，D2H 拷一份**
+
+`context.cpp` 的 `ensure_kv_window()` 每次要滑窗时，先算出「这次会丢哪些页」，把它们的
+`DeviceKVPageHandle` 收集起来，`pool.copy_to_host()` 到主机侧 arena。每个归档块记录
+`begin_token` / `pages`，页区间严格递增、无重叠（这点被两次实测校验过：块 86 == 滑移 86 次，
+归档 90048 token + 常驻 6119 + sink 2048 = 98215，账是平的）。
+
+arena 大小 `--archive-mib`（默认 2048 MiB，够存 ~90K token 的 int4 KV）。满了按 FIFO 淘汰，
+淘汰前 `cudaStreamSynchronize`，因为 D2H 可能还在飞。
+
+**② 摘要 —— prefill 时顺手统计，不额外读一遍 KV**
+
+每个全注意力层（共 16 层，索引 3,7,…,63）在 `text.cpp` 的 `attn_mix()` 里，于 RMSNorm 之后、
+RoPE 之前采集 `kn` / `qn`，用 kernel 把这一页 64 个 token 的 K 按页求均值
+（每页 16 层 × 4 KV 头 × 256 维 bf16 = 128 KiB）。query 同理，但只用最后一个 token。
+
+**③ 打分 —— (层, 头) 各自标准化后取最大**
+
+页均值和 query 点积出 64 个 (层, 头) 分数；每个单元跨全部候选做 z-score，一页取 64 个单元的**最大值**。
+这一步是从「#322 名」提到「#35 名」的关键：平均掉 64 个单元会把信号冲淡，取最大保留了
+「某一层某一头确实在看这段」的证据。
+
+> 这段路走了 4 个弯路才通：页均值直接点积（分数全等）、余弦归一化、逐层 z-score、
+> 候选均值中心化 —— 单独做都没用；最后是「逐 (层,头) 取最大」才把 needle 区从 #322 拉到 #35。
+> 已知页均值打分对 needle 的定位误差约 ±8 页，所以下面取的是**连续段**而不是精确页。
+
+**④ 召回 —— 用「本来就要丢的槽位」装，零额外容量**
+
+以 top-1 页为中心取 112 页（7168 token）连续区间，`copy_from_host()` 拷回
+`[sink_pages, sink_pages + 112)` 这段槽位 —— 它正好是下一次滑移要释放的位置。
+所以召回**不增加显存占用**，只是把「要丢的」换成「更有用的」。
+
+**⑤ 重放最后一个 chunk —— 因为召回发生在 prefill 之后**
+
+这是最容易被忽略的一环，也是最后一关：自动选块版一开始**明明找回对了页、答案仍然是错的**，
+因为召回是 prefill 结束后才做的，而最后一个 chunk 的注意力已经算完了。把最后一个 chunk
+（实测只有 4 个 token）重算一遍，问题才真正看到召回内容。开关 `NINFER_KV_REPLAY=0` 可关。
+
+### 2.3 怎么用
+
+**四个命令行参数**（在 exe 和 artifact 之后）：
+
+| 参数 | 含义 | 默认值 |
+|---|---|---|
+| `--resident-tokens N` | 常驻窗口大小：最近 N 个 token 始终留在显存 | 20480 |
+| `--sink-tokens N` | attention sink：最前面 N 个 token 始终保留（不能是 0） | 2048 |
+| `--archive-mib N` | 主机侧归档 arena 大小（MiB）；**给这个参数会自动打开归档** | 2048 |
+| `--kv-retrieval 1` | 打开检索召回（不开就是纯归档，行为与 pre-r7 等价） | 0（关） |
+
+一条完整的长文命令：
+
+```bat
+ninfer_mini_nordc.exe ^
+    E:\ninfer-models\Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer ^
+    --chat --kv rk4v4-e8 --ctx 262144 ^
+    --resident-tokens 20480 --sink-tokens 2048 --archive-mib 4096 --kv-retrieval 1
+```
+
+> `--ctx 262144` 是给 int4 KV 池留的**逻辑容量**；实际驻留的显存由 `--resident-tokens` 控制，
+> 所以这个值开大不会像 §3 那样掉速（§3 说的是 KV 池按 `--ctx` 一次性提交的老行为）。
+
+**等价的传统环境变量**（参数内部就是回写这些变量，两个都认）：
+
+| 命令行 | 环境变量 |
+|---|---|
+| `--resident-tokens` | `NINFER_RESIDENT_TOKENS` |
+| `--sink-tokens` | `NINFER_SINK_TOKENS` |
+| `--archive-mib` | `NINFER_KV_ARCHIVE_MIB`（并自动置 `NINFER_KV_ARCHIVE=1`） |
+| `--kv-retrieval` | `NINFER_KV_RETRIEVE` |
+
+**调优用（只有需要时设）**：`NINFER_KV_RECALL_PAGES`（召回页数，默认 112）、
+`NINFER_KV_RECALL_BACKOFF`（top-1 页之前的回退页数，默认 56 = 对称取段）、
+`NINFER_KV_REPLAY=0`（关闭最后 chunk 重放，用于对照实验）。
+
+**看它干活**（诊断都走 stderr，聊天模式下进 `ninfer-chat.log`）：
+
+| 变量 | 输出 |
+|---|---|
+| `NINFER_WINDOW_TRACE=1` | `[win] slide -> base=...`、`[win] archive N pages from ...` |
+| `NINFER_KV_ARCHIVE_TRACE=1` | `[kv-archive] block k: N pages, tokens [a,b), ...` |
+| `NINFER_KV_RETRIEVE_TRACE=1` | `[kv-rank] blocks=/pages=/candidates= top: ...`、`[kv-recall] 112 pages from token X -> slots [a,b)` |
+| `NINFER_KV_REPLAY` | `[kv-replay] replayed N tokens from M` |
+
+### 2.4 最佳配置
+
+**短上下文（≤32K）别开**：常驻窗口 20480 + sink 2048 已经装得下，开归档只是白占内存。
+
+**长文（≥48K，问题在末尾）用这套**：
+
+```bat
+--kv rk4v4-e8 --ctx 262144 --resident-tokens 20480 --sink-tokens 2048 --archive-mib 4096 --kv-retrieval 1
+```
+
+- `--archive-mib 4096`：96K 正文全部归档只需 ~1.7 GB，给 4096 是留余量，避免 FIFO 淘汰把要用的页淘汰掉。
+- `--resident-tokens 20480` 是显存与命中率的折中：实测 96K 正文下 needle 在 75% 深度也能覆盖，
+  92% 深度本来就在常驻窗口里、根本不需要召回。
+- 想再省显存可以把 `--resident-tokens` 降到 12288，代价是召回频率变高、prefill 期间多几次 D2H。
+
+**同时要 MTP 时**：`--spec mtp --draft-tokens 2` 照旧，KV 记忆与 MTP 互不影响；
+但注意 §3 的提交预算限制（真实上下文 ≥100K 关 MTP）。
+
+### 2.5 实测效果
+
+语料：96K 正文，同一句答案（随机口令）埋在文档 25% / 50% / 75% / 92% 深度
+（`tasks_needle_q25/q50/q75/q92.txt`），每档跑「检索关 / 检索开」两次：
+
+| needle 深度 | 检索关 | 检索开 | 说明 |
+|---|---|---|---|
+| 25% | ❌ 编造 | ✅ **口令逐字符命中** | 页已滑出窗口，靠归档救回 |
+| 50% | ❌ 编造 | ✅ **命中** | 同上 |
+| 75% | ❌ 编造 | ✅ **命中** | 同上 |
+| 92% | ✅ 命中 | ✅ **命中（与关闭时逐 token 相同）** | 还在常驻窗口内 ⇒ 召回不引入回归 |
+
+四格 GATE 回归（8K / 96K / MTP，检索默认关闭路径）：
+`8k decode 35.63 · prefill 931.4` / `96k decode 24.90 · prefill 422.1` / `mtp decode 80.21 · prefill 842.2`，
+全部在容差内（对照 pre-r7：8K 35.72 / 96K 25.33 / MTP 78.50）。
+
+归档本身的开销（同一份 98K prompt，开/关归档各跑两轮）：输出逐 token 相同，
+prefill `801.997 → 800.446`、decode `33.14 → 33.62` —— **在噪声内**。
+
+### 2.6 代价与限制（先看这段再开）
+
+- **吃内存**：归档存在**主机内存**，最多 `--archive-mib`。96K 正文实测 ~1.7 GB。
+- **吃显存**：页摘要 128 KiB/页，1311 页 ≈ 168 MB（另有 512 槽环形缓冲）。这是**额外的**显存开销。
+- **prefill 变慢一点点**：做过一次 112 页（~122 MiB）的 H2D 召回 + 重放 4 个 token，实测在噪声内。
+- **召回是启发式，不是精确注意力**：页均值打分定位误差约 ±8 页，所以取 112 页连续段兜住。
+  只在这套 needle 语料上验证过；如果答案需要精确到几十个 token 的定位、或者问题不在 prompt 末尾，
+  命中率没有保证。
+- **必须读完 prompt 才能召回**：query 来自 prompt 最后一个 token，所以「边读边召回」不支持。
+- **环境**：只在 RX 9070 XT + Windows 11 + HIP SDK 7.2.3 上验证，别的卡没测。
+
+## 3. 最重要的一条：`--ctx` 必须贴着实际 prompt 长度
+
+> 这条针对**不开 KV 记忆**的老路径：KV 池按 `--ctx` 一次性全量提交。
+> 开了 `--resident-tokens` 的窗口模式后驻留量由窗口决定，不受这条约束。
 
 KV 池按 `--ctx` **一次性全量提交**（int4 = `capacity × 17,920 B/token`）。Windows 下驱动只愿意把
 约 **12.6 ~ 13.6 GiB** 的引擎工作集留在显存（WDDM 硬预留 1/8 + 桌面占用 + 驱动开销，且**会随桌面状态漂移**）。
@@ -98,7 +249,7 @@ KV 池按 `--ctx` **一次性全量提交**（int4 = `capacity × 17,920 B/token
 **不能**用作驻留证据；② `cudaMalloc` 是虚拟超额提交，干净进程能「分配」到 24 GiB 以上，
 所以「分配失败」从来不是限制，限制是「愿不愿意留在显存」）。
 
-## 3. 推荐配置（本引擎目前的最优参数组合）
+## 4. 推荐配置（本引擎目前的最优参数组合）
 
 三个开关真正重要：**`--ctx`（= prompt + max_new，一个 token 别多开）**、
 **`--spec mtp --draft-tokens 2`**（收益取决于真实上下文长度与是否越过驻留预算）、
@@ -112,6 +263,7 @@ KV 池按 `--ctx` **一次性全量提交**（int4 = `capacity × 17,920 B/token
 | 64K | `--kv rk4v4-e8 --ctx 65536 --spec mtp --draft-tokens 2` | **41.6**（AR 28.3 ⇒ 1.47×） |
 | 96K | `--kv rk4v4-e8 --ctx 98304 --spec mtp --draft-tokens 2` | **34.0**（AR 25.2 ⇒ 1.35×） |
 | **126K** | `--kv rk4v4-e8 --ctx 126464`（**必须关 MTP**） | **22.9**（MTP 会多提交 0.57 GB 越线 ⇒ 掉到 10.6） |
+| 长文 + KV 记忆 | `--kv rk4v4-e8 --ctx 262144 --resident-tokens 20480 --sink-tokens 2048 --archive-mib 4096 --kv-retrieval 1` | 见 §2.5 |
 | 想开大容量但对话很短 | `--ctx 81920 --spec mtp --draft-tokens 2` | **56.0**（真实 2.8K） |
 
 四条硬规则：
@@ -126,7 +278,7 @@ KV 池按 `--ctx` **一次性全量提交**（int4 = `capacity × 17,920 B/token
 prefill chunk 现在**自动分档**：`--ctx` ≤65536 用 2048、>65536 用 1024（相对 1024 全局快 +10~15%）。
 仍可用 `NINFER_PREFILL_CHUNK` 覆盖；4096 不再更快，且 `--ctx` ≥69632 时会 OOM。
 
-## 4. 快速开始
+## 5. 快速开始
 
 ### A. 双击开聊（推荐，不需要命令行的方式）
 
@@ -146,6 +298,9 @@ prefill chunk 现在**自动分档**：`--ctx` ≤65536 用 2048、>65536 用 10
 每轮结束会打印 `[N prompt tokens (M reused), K new, prefill X t/s, decode Y t/s]` ——
 **M reused 就是前缀复用省下来的 token**（多轮对话里通常 50%）。
 
+**想试 KV 记忆**：选 `[5] custom arguments`，在里面加
+`--resident-tokens 20480 --sink-tokens 2048 --archive-mib 4096 --kv-retrieval 1`。
+
 ### B. 命令行 / 批量（脚本、批量评测用）
 
 ```bat
@@ -160,10 +315,11 @@ python probe_rebuilt\run_capture.py build\infer_mini_nordc.exe ^
     --tasks tasks\tasks_cp64km.txt --ctx 65536 --max-new 128 --kv rk4v4-e8 ^
     --spec mtp --draft-tokens 2
 
-REM 3) 128K 长文（ctx = prompt + max_new，关 MTP）
+REM 3) 长文 + KV 记忆（96K 正文，答案埋在深处）
 python probe_rebuilt\run_capture.py build\infer_mini_nordc.exe ^
     E:\ninfer-models\Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer ^
-    --tasks tasks\tasks_true128kL.txt --ctx 126464 --max-new 20 --kv rk4v4-e8
+    --tasks tasks\tasks_needle_q50.txt --ctx 262144 --max-new 16 --kv rk4v4-e8 ^
+    --resident-tokens 20480 --sink-tokens 2048 --archive-mib 4096 --kv-retrieval 1
 ```
 
 - **`--kv rk4v4-e8` 是 128K 的必需品**（bf16 KV 需 9.99 GB、int8 KV 需 5.83 GB，而运行时可分配只有 5.16 GB）。
@@ -172,9 +328,11 @@ python probe_rebuilt\run_capture.py build\infer_mini_nordc.exe ^
 - `tasks` 文件格式：首行必须 `###ID <name>`；**正文内任何以 `#` 开头的行都会被当成新任务分隔符**；
   文件必须是无 BOM 的 UTF-8。
 
-## 5. 已知坑与硬限制
+## 6. 已知坑与硬限制
 
-- **`--ctx` 开大了就掉速**（§2）。这是本版本已知的主要性能缺陷，规避手段只有「按实际长度设 ctx」。
+- **`--ctx` 开大了就掉速**（§3）。不开 KV 记忆时这是主要性能缺陷，规避手段只有「按实际长度设 ctx」。
+- **KV 记忆是启发式召回**（§2.6）：定位误差 ±8 页、要求问题在 prompt 末尾、必须重放最后 chunk。
+  它提升的是「长文里找信息」的命中率，不是无损上下文扩展。
 - **MTP 到 96K 为止**：126K 加 MTP 会多提交 0.57 GB 越过预算 ⇒ 10.6 t/s（比 AR 还慢）。≥100K 真实上下文请关 MTP。
 - **`--draft-tokens` 用 2**：3 以上草稿链自回归退化，每轮实际接受数掉下来。
 - `--no-graph` + `NINFER_PROFILE_MIXER=1` + `--spec mtp` 会挂死 GPU 队列；`NINFER_PROFILE_DECODE` 必须配 `--no-graph`。
@@ -182,17 +340,19 @@ python probe_rebuilt\run_capture.py build\infer_mini_nordc.exe ^
   死循环 kernel 会把显示卡死（2026-10-30 已发生过一次黑屏硬复位）。要么等，要么重启机器。
 - int8 / fp8 / dflash2 / 256K / 并发 > 1 均不可用（见 §1 与 [`docs/PATCHLIST.md`](docs/PATCHLIST.md) 末节）。
 
-## 6. 目录
+## 7. 目录
 
 ```
-（引擎 exe 不在仓库里：从 Releases 下载 ninfer_mini_nordc.exe，193,910,272 B，
+（引擎 exe 不在仓库里：从 Releases 下载 ninfer_mini_nordc.exe，191,691,776 B，
           sha256 见 VERSION.txt；把它和 harness/launchers/chat.bat 放同一个文件夹即可双击开聊）
 src/      infer/{include,src,third_party} + shim（HIP 兼容层），全量可重建源码
+          新增 kv_archive.{h,cpp} / kv_retrieval.{h,cu}（KV 记忆）
 harness/  构建与跑测工具（compile_one / swap_lib / link_exe / run_capture）
           harness/launchers/chat.bat  双击启动器（+ model.txt.example）
-tasks/    验收语料（含 126K needle 语料）
-docs/     STORY / VALIDATION / PERF-CAPACITY / CHANGELOG / PATCHLIST / BUILD
+tasks/    验收语料（含 126K needle 语料、96K 多深度 needle 语料 q25/q50/q75/q92）
+docs/     STORY / VALIDATION / PERF-CAPACITY / KVMEM / CHANGELOG / PATCHLIST / BUILD
 VERSION.txt  版本、实测指标、引擎 sha256、环境变量与纪律
 ```
 
-构建方式见 [`docs/BUILD.md`](docs/BUILD.md)；每个改动的回滚点见 [`docs/PATCHLIST.md`](docs/PATCHLIST.md)。
+构建方式见 [`docs/BUILD.md`](docs/BUILD.md)；每个改动的回滚点见 [`docs/PATCHLIST.md`](docs/PATCHLIST.md)；
+KV 记忆的实现细节与全部实测数据见 [`docs/KVMEM.md`](docs/KVMEM.md)。

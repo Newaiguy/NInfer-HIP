@@ -1,5 +1,37 @@
 # CHANGELOG
 
+## 0.1.0-pre-r8 — 2026-11-06
+
+本版新增一条**默认关闭**的长上下文通路：KV 记忆（归档 + 检索召回）。不传新参数时，
+行为与 pre-r7 完全一致。
+
+### 新增
+- **KV 归档**（`src/infer/src/models/qwen3_5/program/storage/kv_archive.{h,cpp}`）：
+  滑动窗口丢弃的页在释放前 `copy_to_host` 到主机 arena（`--archive-mib`），按 token 区间连续存放，
+  满了 FIFO 淘汰。存完整 K+V。挂接在 `context.cpp::ensure_kv_window()` 的滑移之前。
+- **页摘要与检索**（`kv_retrieval.{h,cu}`）：prefill 时为每页统计 16 层 × 4 头 × 256 维 K 均值
+  （4 个子块取最大，128 KiB/页）；prompt 读完后用最后一个 query 打分，
+  **每个 (层,头) 单元跨候选 z-score、每页取 64 个单元最大值**。
+- **召回**（`context.cpp::recall_into_tail()`）：以 top-1 页为中心取 112 页连续段，
+  `copy_from_host` 到 `[sink_pages, sink_pages+112)` —— 正好是下次滑移要丢弃的槽位，**不额外占显存**。
+- **最后 chunk 重放**（`prefill.cpp`）：召回发生在 prefill 之后，最后一个 chunk 的注意力已算完，
+  故重算该 chunk（实测 4 token），`thread_local` 防重入，`NINFER_KV_REPLAY=0` 可关。
+- **四个命令行参数**（`milestones/.../probe/mini_main.cpp`）：`--resident-tokens` / `--sink-tokens` /
+  `--archive-mib` / `--kv-retrieval`，内部用 `_putenv_s` 回写等价环境变量，下游读取点未改。
+
+### 实测
+- 96K 正文、needle 埋 25%/50%/75%/92%：检索关 = 前三档全 miss；检索开 = 全部命中；
+  92% 档两种模式输出**逐 token 相同**（无回归）。
+- 归档开销（98K prompt，开/关各两轮）：输出逐 token 相同，prefill 801.997 → 800.446、
+  decode 33.14 → 33.62（噪声内）。
+- GATE（8k / 96k / mtp）：35.63/931.4 · 24.90/422.1 · 80.21/842.2，全部在 ±3% 内。
+
+### 已知限制
+- 召回是启发式（页均值打分定位误差约 ±8 页，靠 112 页连续段兜住）；必须读完 prompt 才能召回。
+- 额外显存 ~168 MB（页摘要）+ 64 MB（环形缓冲）；额外主机内存最多 `--archive-mib`。
+- 只在 needle 语料上验证；问题不在 prompt 末尾时没有保证。
+- 详见 [`KVMEM.md`](KVMEM.md)。
+
 ## 0.1.0-pre-r4 — 2026-10-31
 
 只修「聊天窗口里混进引擎调试行」这一件事，不改任何计算路径。
