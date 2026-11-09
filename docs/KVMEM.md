@@ -101,10 +101,16 @@ prefill chunk 循环
 | `--resident-tokens N` | `NINFER_RESIDENT_TOKENS` | 20480 | 常驻窗口 token 数 |
 | `--sink-tokens N` | `NINFER_SINK_TOKENS` | 2048 | attention sink token 数 |
 | `--archive-mib N` | `NINFER_KV_ARCHIVE_MIB` | 2048 | 主机 arena；给这个参数自动开归档 |
-| `--kv-retrieval 1` | `NINFER_KV_RETRIEVE` | 0 | 打开检索召回 |
-| — | `NINFER_KV_RECALL_PAGES` | 112 | 召回页数 |
-| — | `NINFER_KV_RECALL_BACKOFF` | 56 | top-1 之前回退页数 |
+| `--kv-retrieval 1` | `NINFER_KV_RETRIEVE` | 0 | 打开检索召回（同时自动开归档，并按 `--resident-tokens` 推 arena 大小） |
+| `--kv-recall-pages N` | `NINFER_KV_RECALL_PAGES` | 112 | 召回页数（112 页 = 7168 token） |
+| — | `NINFER_KV_RECALL_BACKOFF` | slots/2 | top-1 之前回退页数 |
 | — | `NINFER_KV_REPLAY` | 1 | 设 0 关闭最后 chunk 重放 |
+| — | `NINFER_KV_AGG` | avg | `max` 回退到旧的逐单元取最大聚合 |
+| — | `NINFER_KV_DETREND` | 0 | 距离去趋势（实测有害，默认关） |
+
+`--kv-retrieval` 的自动档位：不给 `--archive-mib` 时按 `2 × resident × 17920 B` 推算并夹在
+1024–4096 MiB；`--resident-tokens 20480/32768/65536/98304` 分别得到 1024/1120/2240/3360 MiB。
+显存 ≤16 GB 的卡建议 4096 上限，实测 6144 MiB 会在 `cudaMallocHost` 失败。
 
 诊断：`NINFER_WINDOW_TRACE`、`NINFER_KV_ARCHIVE_TRACE`、`NINFER_KV_RETRIEVE_TRACE`。
 
@@ -125,8 +131,17 @@ prefill chunk 循环
 
 | 改动 | needle 区名次 |
 |---|---|
-| 逐 (层,头) 打分，各单元 z-score 后取 max | **#35** |
-| 以峰值页为中心取 112 页连续段 | 命中（配合重放） |
+| 逐 (层,头) 打分，各单元 z-score 后取 **max** | #35 |
+| 同前，但 64 个单元改为**取平均** | **#8**（默认） |
+| 再叠加距离去趋势（±64 页邻域减均值） | #417（有害，已改为 opt-in） |
+
+取 max 时单个头的尖峰就能决定名次，softmax 出现 `top-1 = 0.816` 的独霸；改平均后分布平坦
+（`top-1 ≈ 0.006`），排序才对得上内容。
+
+还有一个真实 bug 值得记：摘要环形槽最初只有 512/1152 个，而 65536 档窗口就有 1024 页、整段
+prompt 1534 页，后段页面按 `page % ring_pages` 复用槽位把前段 `tags_` 覆盖掉，`copy_page_means`
+于是整页跳过、留下全零 → 所有候选分数**恰好等于 `1/候选数`**。看到这个数字就直接查 ring 容量，
+别去调算法。现在 ring = 2048 槽、单页摘要 64 KiB（子块从 4 收回 1，四子块实验已证伪）。
 
 中间还有一个「本来已经成功」的对照实验值得记：**手工指定召回 token 位置**（`47104` / `49152`）
 时答案完全正确，说明召回机制本身没问题，坏的只是打分。这条对照一直是判断「是选块错还是机制错」的
@@ -148,6 +163,20 @@ prefill chunk 循环
 **归档开销**（98K prompt，开/关归档各两轮）：输出逐 token 相同；
 prefill `801.997 → 800.446`，decode `33.14 → 33.62`，噪声内。
 
+**召回档位（`tasks_needle_mid_q.txt`，98218 token，needle 埋在 ~48% 处，页区间 [768,800)）**
+
+| `--resident-tokens` | 常驻窗口 | needle 是否在窗口内 | 输出 |
+|---|---|---|---|
+| 20480 | 320 页 | 否（纯召回） | 与 GT **逐 token 相同** |
+| 32768 | 512 页 | 否（纯召回） | 与 GT **逐 token 相同** |
+| 65536 | 1024 页 | 是 | 与 GT 逐 token 相同 |
+
+GT = `45 669 24312 10846 8006 5434 12 19 19 22 16 248046`；召回段 `112 pages from token 45056`，
+重放 `4 tokens`。`[kv-rank]` 里 needle 页名次 #8、峰值页 760（含 8 页定位误差，112 页段兜住）。
+
+> 注：`tasks_needle_q25/q75/q92` 语料在 needle 之后还夹了一条「列出 1..400 的整数」的指令，
+> 模型会去答那道题，因此**不能**用它们判断召回命中；只有 mid 语料是可信 oracle。
+
 **账目自洽**：归档 90,048 token + 常驻 6,119 + sink 2,048 = 98,215；归档块数 86 == 滑移次数 86；
 归档页数 1,407 == 90,048 / 64；块区间严格递增无重叠。
 
@@ -157,8 +186,113 @@ mtp `80.21 / 842.2` —— 全部在容差内，无回退。
 ## 7. 已知限制
 
 - 打分是**启发式**，定位误差约 ±8 页（512 token），所以取 112 页连续段兜住，代价是显存里
-  有 7K token 的「陪跑」。
+  有 7K token 的「陪跑」。真正消掉误差要靠两阶段精排，而归档页是 `rk4v4-e8` 量化格式
+  （`page_stride = 1146880 B`），主机侧要先写反量化才能做逐 token 精排，暂未做。
+- 摘要是**页均值**，容量上界是 Quest 的 per-channel min/max 上界；后者能把「页内某一维特别
+  突出」的信号留住，是下一步最现实的算法升级。
+- 摘要环形缓冲 **2048 槽**，一个 chunk 的页数上限就是它（当前 chunk 宽度 = 常驻窗口）。
+  窗口 ≥ 131072 token 时会绕回、`tags_` 被覆盖、分数退化成 `1/候选数` —— 要开更大窗口必须
+  同步扩大 ring（`kRetrievalRingPages`）。
 - 召回时机固定在 **prefill 结束后**，query 取 prompt 最后一个 token。问题不在末尾（例如
   多轮对话里问题在中间）时没有保证。
-- 摘要额外占显存 ~168 MB（1311 页 × 128 KiB）+ 64 MB 环形缓冲。
+- 摘要额外占显存约 82 MB（1311 页 × 64 KiB）+ 128 MiB 环形缓冲。
 - 只在 needle 类语料上验证过；多跳推理、整篇摘要这类任务没有数据。
+
+## 8. 与上游 llama-kvmem 的实测对比（同机、同模型、同 prompt）
+
+同一台机器（RX 9070 XT 16 GB）、同一份权重（Qwen3.8-27B-GSQ-RCO-IQ3_S，GGUF / .ninfer 两种容器）、
+同一段 98,180 token 的 prompt（`tasks_needle_mid_q.txt`，答案埋在 ~48% 深度），各跑一次：
+
+| | 上游 llama-kvmem beta2 | 本引擎（r9 档位化） |
+|---|---|---|
+| 启动 | `llama-kvmem-server.exe -c 262144 --kvmem --kvmem-budget 32768 --kvmem-gen-reserve 32768 --kvmem-block-tokens 128 --kvmem-query-policy user -ctk q8_0 -ctv q4_0 --spec-type draft-mtp --spec-draft-n-max 2` | `--ctx 262144 --resident-tokens 32768 --sink-tokens 2048 --kv-retrieval 1 --kv rk4v4-e8` |
+| KV 精度 | q8_0 K / q4_0 V | int4 K / int4 V（rk4v4-e8） |
+| MTP | 开（n_max = 2） | **关**（窗口模式下 98K prompt 会报 `request reservation exceeds Engine shared KV capacity`） |
+| prefill | 380.4 t/s（258.1 s / 98,180 token） | **563.7 t/s** |
+| decode | 13.98 t/s | **29.79 t/s** |
+| 答案 | `NINFER-ZEBRA-4471` ✅ | 同答案 ✅（与 GT 逐 token 相同） |
+
+读法：
+- 我们这边**没开 MTP**，上游**开了**，所以 decode 2.1× 的差距是在我们让一手的情况下测出来的。
+- 上游 KV 是 q8_0/q4_0（约 1.5× 于 int4/int4），注意力带宽开销更大；它胜在 query 策略更细
+  （整段用户消息 + 128 token 块），我们胜在窗口与内核效率。
+- 各只跑一次，速度 ±5% 波动；**准确性这个规模只能算一个样本**，要下「不低于」的结论仍需成套语料。
+
+### 8.1 同 MTP 对比（两边都开 MTP2，全上下文模式）
+
+同一份语料按 16K / 32K / 64K 截断（needle 固定在 48% 深度，答案相同），两边都开
+`--spec-type draft-mtp --spec-draft-n-max 2` / `--spec mtp --draft-tokens 2`：
+
+| prompt | 上游 prefill | 上游 decode | 本引擎 prefill | 本引擎 decode |
+|---|---|---|---|---|
+| 16K（15,803 / 15,814 tok） | 762.9 t/s | 34.56 t/s | **883.2 t/s** | **52.02 t/s** |
+| 32K（32,092 / 32,103 tok） | 633.3 | 35.69 | **724.6** | **45.17** |
+| 64K（64,963 / 64,974 tok） | 454.0 | **35.16** | **521.3** | 32.67 |
+| 98K（98,180 tok） | 380.4 | 13.98 | **563.7**（无 MTP） | **29.79**（无 MTP） |
+
+读法：prefill 我们三个尺寸都快 14–16%；decode 在 16K/32K 快 27–50%，到 64K 反而慢 7% ——
+上游把注意力封在 32K 工作集里，decode 基本恒定；我们的 decode 随上下文线性下降，这是
+「窗口 + 召回」该接手的地方。98K 一档上游掉到 14 t/s，是因为工作集装不下、每步都要换块。
+
+### 8.2 MTP 与常驻窗口：曾经互斥，现已打通
+
+pre-r8 时 `--resident-tokens` 与 `--spec mtp` **不能同时开**：任何长度、任何窗口值都会立刻失败
+
+```
+error: request reservation exceeds Engine shared KV capacity
+```
+
+实测矩阵（全部失败）：prompt 15.8K / 32K / 64K / 98K × resident 8192 / 20480 / 32768；
+去掉 `--resident-tokens` 后同一条命令立刻正常（16K：prefill 883.2、decode 52.02）。
+所以上面 98K 那一行我们只能是「无 MTP」对「有 MTP」，不是同等条件。
+
+原因在 `planning/pressure.cpp::isolated_request_feasible()`：窗口模式只把
+`device.main_kv_pages` 钳到池容量，MTP 草稿头带来的 lane / state / backend 页需求没有同样的
+钳制，于是判定 `PermanentlyInfeasible`。打开 `NINFER_ADMIT_TRACE=1` 可以看到具体是哪个维度：
+
+```
+[admit] final 1/1 1/2 128/128 248/129 0/8 0/8589934592
+                       主KV 用满  ^草稿缓存 248 页 / 只有 129 页
+```
+
+进一步定位：`planning/startup.cpp` 里 MTP 物理页数 = 主 KV 物理页数 + draft 页，
+而主 KV 物理页数在窗口模式下已被裁到窗口大小，草稿缓存因此只有 129 页。
+
+**修复（pre-r9，已入库）**：把窗口基址的纪律推进到 MTP 路径——KV 索引用紧凑坐标、RoPE 用绝对位置。
+四处落点：①`program/context_work.cpp` 的 `mtp_causal_attention_envelopes` 减窗口基址、下界夹 1
+（0 号槽是内核哨兵）；②`planning/request_plan.cpp` 的 MTP 配额改按 `resident_entitlement_tokens`；
+③`storage/context.cpp` 给投机缓存加 `compact_backend`，并让它的 `slide_prefix_pages` 与主 KV 同步滑页；
+④`program/decode.cpp` 的 verify RoPE 位置补回窗口基址（窗口只改「注意力扫哪些槽位」，不改旋转相位）。
+
+最后一处致命 bug 是 `ensure_sequence_kv_mapped()` 里 `*sequence.kv->backend` **没有判 `has_value()`**：
+普通请求没有投机缓存，解引用空 optional 得到垃圾句柄，于是**所有**窗口用例都在第一个 chunk 前
+抛 `KV address-space handle is stale`。加上判空后整条链路才通。
+
+**打通后的实测（窗口 + 召回 + MTP2，`--archive-mib 3072`）**
+
+| 用例 | prompt | 窗口 | 输出 | prefill | decode |
+|---|---|---|---|---|---|
+| hh16k | 15,814 | 8192 | 与 GT 逐 token 相同 | 799.7 | **52.9** |
+| hh32k | 32,103 | 8192 | 仅末位差 2（`…16 248044`） | 806.9 | 37.5 |
+| hh64k | 64,974 | 16384 | 仅末位差 2 | 693.8 | 30.6 |
+| mid98k | 98,182 | 32768 | 与 GT 逐 token 相同 | 556.0 | 35.4 |
+| hh192k | 196,427 | 32768 | 与 GT 逐 token 相同 | **535.7** | **33.8** |
+
+## 9. 长上下文（128K–192K）：为什么必须开窗口
+
+引擎按**整段** KV 预留运行期容量，这张卡（16 GB）扣掉 12.5 GB 权重后只剩约 3.8 GB，所以：
+
+- 128K 文本裸跑直接拒绝：`requires 5,271,090,176 bytes … the largest capacity this device can hold is
+  about 189,646 tokens or less`；
+- 192K 同理。**窗口不是优化，是这些长度唯一能跑的路径。**
+
+窗口档位实测（同一份 192K 语料，196,427 token，needle 在 48% 深度）：
+
+| 窗口 | 结果 | prefill | decode |
+|---|---|---|---|
+| 32768 | ✅ 与 GT 逐 token 相同 | 535.7 | 33.8 |
+| 16384 | ❌ 前段复读噪声、答案在后半段才补出来 | 683.9 | 42.7 |
+
+16K 在 64K 语料能用，到 192K 就崩——因为一轮召回只能装 112 页（7168 token），窗口太小时 needle 邻域
+被切碎。**结论：长上下文窗口 ≥ 32768 起步。** 显存按 int4 `17,920 B/token` 估算：32768 → 0.59 GB、
+65536 → 1.17 GB，叠加 MTP 草稿行后 65536 已贴边。
