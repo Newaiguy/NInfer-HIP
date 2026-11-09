@@ -1,5 +1,34 @@
 # CHANGELOG
 
+## 0.1.0-pre-r9 - 2026-11-09
+
+这一版把 **KV 记忆与 MTP 打通**、把长上下文从 98K 推到 192K，并补上与 llama.cpp kvmem 的同机对比。
+默认路径（不传 `--resident-tokens` / `--kv-retrieval`）行为与 pre-r8 一致。
+
+### 新增
+- **MTP 与常驻窗口可同时开启**：verify 注意力 envelope 改用紧凑坐标（下界夹 1，0 号槽是内核哨兵）、
+  MTP 配额按窗口 `resident_entitlement_tokens` 计算、投机缓存 `slide_prefix_pages` 与主 KV 同步滑页、
+  verify 的 RoPE 位置补回窗口基址。16,814 token 档窗口 8192 + 召回 + MTP2：decode **52.9 t/s**。
+- **长上下文档位实测**：128K（130,700 token）prefill 544.3 / decode 34.4、192K（196,427 token）
+  prefill 535.7 / decode 33.8，两者输出与 GT **逐 token 相同**。
+- **与 llama.cpp kvmem 的五档同机对比**（README §2.5、docs/KVMEM.md §8）：192K 档 prefill +59%、decode +52%。
+
+### 修复
+- **窗口路径全尺寸失效**：`ensure_sequence_kv_mapped()` 解引用空的 `sequence.kv->backend`，
+  得到垃圾句柄后抛 `KV address-space handle is stale`。加判空后所有窗口用例恢复。
+- 窗口模式下 `--kv-retrieval` 的召回闸门：归档页少于一轮召回所需时直接跳过，避免用归档内容
+  覆盖仍在使用的窗口页。
+
+### 文档
+- README §2.4 新增「档位怎么选」表，明确**长上下文窗口 >= 32768 起步**（16K 在 192K 语料上不可用）。
+- docs/KVMEM.md §8.2 由「MTP 与常驻窗口互斥」改写为「已打通」并记录四个落点；
+  新增 §9 长上下文窗口档位、§10 末位停止符已知问题（P3，暂不修）。
+
+### 已知问题
+- **末位停止符可能差 1**（P3）：召回真正生效的档位，最后一个 token 可能是 `248044` 而非 `248046`。
+  两者同属停止符集合（`finish=3` 即 `StopToken`），正文与速度无影响；成因是召回后重放最后一个
+  chunk 重算了末位 logits。详见 docs/KVMEM.md §10。
+
 ## 0.1.0-pre-r8 — 2026-11-06
 
 本版新增一条**默认关闭**的长上下文通路：KV 记忆（归档 + 检索召回）。不传新参数时，

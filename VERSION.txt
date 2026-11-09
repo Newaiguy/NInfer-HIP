@@ -1,12 +1,12 @@
-NInfer-HIP 0.1.0-pre-r8
+NInfer-HIP 0.1.0-pre-r9
 =======================
 
 名称        : NInfer-HIP —— NInfer 引擎的 AMD RDNA4 / HIP 移植版
 仓库        : https://github.com/Newaiguy/NInfer-HIP
-发布        : https://github.com/Newaiguy/NInfer-HIP/releases/tag/v0.1.0-pre-r8
+发布        : https://github.com/Newaiguy/NInfer-HIP/releases/tag/v0.1.0-pre-r9
 许可        : Apache-2.0（派生自 https://github.com/Neroued/ninfer，改动见 docs/PATCHLIST.md）
-状态        : 预发布（prerelease v0.1.0-pre-r8，已发布）
-构建时间    : 2026-11-06
+状态        : 预发布（prerelease v0.1.0-pre-r9，已发布）
+构建时间    : 2026-11-09
 目标硬件    : AMD Radeon RX 9070 XT 16GB (RDNA4, gfx1201), 640 GB/s
 运行系统    : Windows 11 26200 (25H2) + HIP SDK 7.2.3 (AMD Software 26.8.1)
 模型        : WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3（官方 v3 单文件 artifact）
@@ -15,7 +15,7 @@ NInfer-HIP 0.1.0-pre-r8
 
 引擎        : ninfer_mini_nordc.exe
   size      : 191,691,776 B
-  sha256    : 5433232edbc4d8c2f90f15f98b47d0d9f6a98a50fda1c59c167d83faf32a9b2b
+  sha256    : 5ae3816e517284efa007d0a46bac08e5986c614f889613739cc050e2c4cdf7ed
 
 --------------------------------------------------------------------------------
 本版核心：KV 记忆（KV archive + retrieval recall）
@@ -106,3 +106,19 @@ graph on，KV = rk4v4-e8（int4 K / int4 V），--ctx 贴紧实际 prompt 长度
   docs/CHANGELOG.md      pre-r1 ~ pre-r8 变更
   docs/PATCHLIST.md      逐文件改动 + 回滚点 + 未修技术债
   docs/BUILD.md          单 TU 构建、跑测外哨、环境变量速查
+
+------------------------------------------------------------------------------
+r9 变更摘要（2026-11-09）
+------------------------------------------------------------------------------
+1. KV 记忆 × MTP 打通：verify 注意力 envelope 改紧凑坐标、MTP 配额按窗口 entitlement、
+   投机缓存随主 KV 同步滑页、verify RoPE 用绝对位置。16,814 token 档 decode 52.9 t/s。
+2. 修 ensure_sequence_kv_mapped() 解引用空 backend optional 的致命 bug（曾使所有窗口
+   用例在第一个 chunk 前抛 "KV address-space handle is stale"）。
+3. 长上下文：192K（196,427 token，窗口 32768）逐 token 正确，prefill 535.7 / decode 33.8；
+   128K（130,700 token）544.3 / 34.4；推荐窗口 >= 32768（16K 窗口在 192K 上不可用）。
+4. 与 llama.cpp kvmem 同机同模型五档对比：192K 档 prefill +59% / decode +52%。
+5. 已知问题（P3，暂不修）：召回生效档位的末位停止符可能由 248046 变 248044，
+   两者同属 StopToken、正文与速度无影响；详见 docs/KVMEM.md §10。
+
+二进制 sha256 : 5ae3816e517284efa007d0a46bac08e5986c614f889613739cc050e2c4cdf7ed
+二进制大小    : 191,730,688 B

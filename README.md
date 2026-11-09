@@ -1,4 +1,4 @@
-# NInfer-HIP `0.1.0-pre-r8`
+# NInfer-HIP `0.1.0-pre-r9`
 
 > 把 NInfer 推理引擎推到 AMD RDNA4（gfx1201）—— 一张 16GB 的 RX 9070 XT 上，
 > 27B 模型跑到 **126K 真实上下文**（decode 20.7 t/s · prefill 364），短上下文开 MTP dw2 到 **74.6 t/s**。
@@ -18,7 +18,23 @@ NInfer 引擎（原生 CUDA 项目，Apache-2.0）到 **AMD RDNA4 / gfx1201** �
 模型：`WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3`（官方 v3 单文件 artifact，15,017,456,896 B，
 内含 text + vision + mtp + dflash2 四个组件，本版本只用 text 与 mtp）。
 
-## 0. 这一版（pre-r8）更新了什么
+## 0. 这一版（pre-r9）更新了什么
+
+一句话：**KV 记忆与 MTP 可以同时开了，长上下文从 98K 推到 192K，并做了与 llama.cpp kvmem 的同机对比。**
+
+1. **MTP × 常驻窗口打通**（pre-r8 时两者互斥）：verify 注意力 envelope 改用紧凑坐标、MTP 配额按窗口
+    entitlement 计算、投机缓存随主 KV 同步滑页、verify 的 RoPE 用绝对位置。修完窗口+召回+MTP2
+    ｜16,814 token 档 decode **52.9 t/s**。
+2. **修掉一个致命 bug**：`ensure_sequence_kv_mapped()` 解引用空的 `sequence.kv->backend`，导致**所有**
+   窗口用例在第一个 chunk 前就抛 `KV address-space handle is stale`。
+3. **128K–192K 实测跑通**：192K prompt（196,427 token，窗口 32768）输出与 GT **逐 token 相同**，
+   prefill 535.7 / decode 33.8；128K（130,700 token）prefill 544.3 / decode 34.4。
+4. **档位结论**：长上下文窗口 **≥ 32768 起步**；16K 在 192K 语料上会先复读噪声、答案补在后半段。
+5. **与 llama.cpp kvmem 同机同模型对比**（五档，见 §2.5）：192K 档 prefill **+59%**、decode **+52%**。
+6. **已知问题（P3，暂不修）**：召回真正生效的档位，末位停止符可能是 `248044` 而非 `248046`——
+   两者同属停止符集合、`finish` 都是 `StopToken`，正文与速度无影响，详见 [docs/KVMEM.md §10](docs/KVMEM.md)。
+
+## 0.1 pre-r8 的内容（KV 记忆首次落地）
 
 一句话：**给引擎加了「KV 记忆」——长上下文里被滑出显存的那部分，可以按问题相关性捞回来。**
 
