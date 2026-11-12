@@ -34,9 +34,10 @@ public:
         HostKVAllocation allocation;
         std::uint32_t begin_token = 0;
         std::uint32_t pages       = 0;
-        // Device bf16 mean key per page, [pages][kRetrievalLayers][4 kv heads][256], or nullptr
-        // when retrieval indexing is off. Owned by the archive; freed on eviction.
-        void* means = nullptr;
+        // Host bf16 summary per page, [pages][kRetrievalPageMeanBytes / 2], empty when retrieval
+        // indexing is off. Kept on the host so ranking can upload one contiguous block and cannot
+        // race with a device buffer freed by eviction.
+        std::vector<std::uint16_t> means_host;
     };
 
     KVArchive()  = default;

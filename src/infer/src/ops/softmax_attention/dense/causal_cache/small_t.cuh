@@ -79,7 +79,7 @@ __device__ __forceinline__ bool causal_valid_q_head(int kv_head, int q_head) {
 
 template <typename Geometry>
 __device__ __forceinline__ int causal_small_t_default_splits(int window) {
-    int target_keys_per_split = 480 / Geometry::SmallTSplitScale;
+    int target_keys_per_split = 240 / Geometry::SmallTSplitScale;
     if (window <= 4096) {
         target_keys_per_split = 64 / Geometry::SmallTSplitScale;
     } else if (window <= 8198) {

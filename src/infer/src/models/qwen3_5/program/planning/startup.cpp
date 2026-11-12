@@ -22,6 +22,8 @@
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/speculative_round.h"
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -764,13 +766,16 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("maximum Main KV page count exceeds uint32");
     }
+    // AMD port diagnostic: NINFER_KVCAP_DIAG relaxes both bounds so the KV pool size can be
+    // varied independently of the attention envelope (max_context) during tuning.
+    const bool kvcap_diag = std::getenv("NINFER_KVCAP_DIAG") != nullptr;
     switch (options.kv_capacity.mode) {
     case KvCapacityMode::Explicit: {
-        if (options.kv_capacity.explicit_tokens < options.max_context) {
+        if (!kvcap_diag && options.kv_capacity.explicit_tokens < options.max_context) {
             throw std::invalid_argument("kv_capacity must be at least max_context");
         }
         const std::uint32_t requested_pages = page_count(options.kv_capacity.explicit_tokens);
-        if (requested_pages < minimum_pages || requested_pages > maximum_pages64) {
+        if (!kvcap_diag && (requested_pages < minimum_pages || requested_pages > maximum_pages64)) {
             throw std::invalid_argument(
                 "kv_capacity is outside the usable range for max_context and max_concurrency");
         }
@@ -882,6 +887,15 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->device_reservation_bytes = checked_add(
         checked_add(impl->persistent.bytes, impl->workspace.capacity, "sequence memory plan"),
         impl->graph_allowance_bytes, "sequence graph allowance");
+    if (std::getenv("NINFER_PLAN_DUMP") != nullptr) {
+        std::fprintf(stderr,
+                     "[plan] capacity=%u pages=%u kv_capacity=%u chunk=%d persistent=%zu workspace=%zu "
+                     "graph=%zu total=%zu\n",
+                     impl->capacity, impl->main_page_groups, impl->kv_capacity,
+                     static_cast<int>(impl->prefill_chunk), impl->persistent.bytes,
+                     impl->workspace.capacity, impl->graph_allowance_bytes,
+                     impl->device_reservation_bytes);
+    }
     return impl;
 }
 
@@ -906,10 +920,15 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .device              = options.device,
         .context_cache       = options.context_cache,
     };
-    const std::uint32_t logical_pages = page_count(inputs.capacity);
-    const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
+    std::uint32_t resident_tokens = 0;
+    if (const char* env_resident = std::getenv("NINFER_RESIDENT_TOKENS")) {
+        resident_tokens = static_cast<std::uint32_t>(std::strtoul(env_resident, nullptr, 10));
+    }
+    resident_tokens = resident_tokens == 0 ? inputs.capacity : std::min(resident_tokens, inputs.capacity);
+    const std::uint32_t resident_pages  = std::max(page_count(resident_tokens), 1U);
+    const std::uint32_t minimum_pages   = std::max(resident_pages, inputs.max_concurrency);
     const std::uint64_t maximum_pages64 =
-        static_cast<std::uint64_t>(inputs.max_concurrency) * logical_pages;
+        static_cast<std::uint64_t>(inputs.max_concurrency) * resident_pages;
     if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("maximum Main KV page count exceeds uint32");
     }

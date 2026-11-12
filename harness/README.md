@@ -49,13 +49,13 @@ python harness\run_capture.py build\infer_mini_nordc.exe <artifact.ninfer> ^
 
 ## 启动器（给最终用户，不需要命令行）
 
-`launchers/chat.bat` 是双击即用的聊天入口：自动定位 `ninfer_mini_nordc.exe`（同目录或 `bin\`）、
+`launchers/chat.bat` 是双击即用的聊天入口：自动定位 `infer-mini.exe`（也兼容旧的 `ninfer_mini_nordc.exe`；同目录或 `bin\`）、
 把 ROCm `bin` 加进 PATH、记住模型路径（写 `model.txt`，参考 `model.txt.example`）、
 四档场景菜单（ctx 16384/32768/65536/131072，前三档带 `--spec mtp --draft-tokens 2`）+ 第 5 项手输参数。
 
 排障要点（都是真踩过的）：
 
-1. 启动器会优先找 `ninfer_mini_nordc.exe`（发布名），再找 `infer_mini_nordc.exe`。
+1. 启动器会优先找 `infer-mini.exe`（本版发布名），再兼容 `ninfer_mini_nordc.exe` / `infer_mini_nordc.exe`。
    **同一个目录里同时放两个名字的不同构建会静默跑到旧的那个** —— 现在启动器会先打印
    `engine: <文件名> <字节数> <时间>`，对不上就是选错了文件。
 2. 不要在 bat 里写 `chcp 65001`：它会让 `set /p` 从重定向 stdin 读不到值（菜单空转）。

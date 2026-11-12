@@ -1171,6 +1171,8 @@ private:
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
     void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                    std::uint32_t backend_tokens = 0);
+    void ensure_kv_window(SequenceState& sequence, std::uint32_t absolute_end);
+    void recall_into_tail(SequenceState& sequence);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                           std::uint32_t backend_tokens = 0);
     void release_sequence_growth_entitlement(SequenceState& sequence) noexcept;

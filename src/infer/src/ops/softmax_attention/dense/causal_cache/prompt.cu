@@ -317,7 +317,11 @@ void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tens
                                            cache, out, stream);
         return;
     }
-    kv_cache_append_batch_launch(k, v, positions, valid_columns, table_rows, cache, stream);
+    // The draft refresh after a recall replay only needs the attention output; appending again
+    // would rewrite the very rows the replay just committed.
+    if (std::getenv("NINFER_KV_DRAFT_ONLY") == nullptr) {
+        kv_cache_append_batch_launch(k, v, positions, valid_columns, table_rows, cache, stream);
+    }
     // AMD port: the speculative VERIFY pass arrives with a non-null valid_columns mask and
     // is therefore routed through PagedKVBatchMetadata<true>, whose block_table() resolves
     // the page table as tables + table_rows[0]*table_stride (the direct metadata uses row

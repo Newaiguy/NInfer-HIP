@@ -1,3 +1,4 @@
+#include "models/qwen3_5/execution/kv_window.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
@@ -336,13 +337,17 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         submit_range.emplace(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode,
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable = nullptr;
-        ops::CausalAttentionExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
+        // Resident window: the attention envelope addresses compact KV slots, not absolute tokens.
+        ops::CausalAttentionExecutionEnvelope envelope{
+            maximum_frontier + 1 - g_ninfer_kv_window_base_tokens,
+            maximum_frontier + 1 - g_ninfer_kv_window_base_tokens};
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(ordinary_graphs, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "ordinary batch");
             executable = &install_graph_profile(ordinary_graphs, profile, "ordinary batch");
-            envelope   = {profile.min_execution_frontier + 1, profile.max_execution_frontier + 1};
+            envelope   = {profile.min_execution_frontier + 1 - g_ninfer_kv_window_base_tokens,
+                          profile.max_execution_frontier + 1 - g_ninfer_kv_window_base_tokens};
         }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -392,6 +397,19 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         timing.end_wait();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
+        {
+            // AMD port: per-step AR wall time (host-side only, valid with graphs on because the
+            // round synchronized above). NINFER_STEP_T=1.
+            static const bool step_t_on = std::getenv("NINFER_STEP_T") != nullptr;
+            static int step_t_n = 0;
+            if (step_t_on && step_t_n < 2048) {
+                ++step_t_n;
+                std::fprintf(stderr, "[step-t] n=%d frontier=%u graph=%d ms=%.3f\n", step_t_n,
+                             static_cast<unsigned>(maximum_frontier), use_cuda_graph ? 1 : 0,
+                             seconds * 1000.0);
+                std::fflush(stderr);
+            }
+        }
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence    = active_sequence(lanes[row]);
             RequestControl& request    = requests[lanes[row]];
@@ -513,8 +531,11 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             }
             for (std::uint32_t j = 0; j < width; ++j) {
                 const std::uint32_t position = frontier + std::min(j, extent);
+                // RoPE is an absolute-position transform: the window only shifts the slot indices that
+                // attention scans, never the phase the keys were written with.
                 mtp_host_ingress->target_rope_positions[row * width + j] =
-                    checked_i32(position, "MTP batch RoPE position") + sequence.rope_delta;
+                    checked_i32(position, "MTP batch RoPE position") + sequence.rope_delta +
+                    static_cast<std::int32_t>(g_ninfer_kv_window_base_tokens);
             }
             mtp_host_ingress->text_kv_table_rows[row] =
                 text_kv_addresses->bound_row(sequence.kv->text);
@@ -596,14 +617,36 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             const std::int32_t count_i    = mtp_host_egress->licensed_counts[row];
             const std::int32_t accepted_i = mtp_host_egress->accepted_drafts[row];
             const std::int32_t next_i     = mtp_host_egress->next_extents[row];
-            // TEMP: diagnose the invalid-row-metadata conditions.
-            std::fprintf(stderr,
-                         "[mtp-diag] row=%zu count=%d accepted=%d next=%d width=%d dw=%d cap=%u baseE=%u rem=%u\n",
-                         row, count_i, accepted_i, next_i, static_cast<int>(width),
-                         static_cast<int>(draft_window), static_cast<unsigned>(capacity),
-                         static_cast<unsigned>(base_E),
-                         static_cast<unsigned>(budgets[row].generated_tokens_remaining));
-            std::fflush(stderr);
+            {
+                // AMD port: per-round MTP wall time (host-side only, valid with graphs on
+                // because the round synchronized above). NINFER_MTP_RTIME=1.
+                static const bool rtime_on = [] {
+                    const char* e = std::getenv("NINFER_MTP_RTIME");
+                    return e != nullptr && e[0] == '1';
+                }();
+                static int rtime_round = 0;
+                if (rtime_on && row == 0 && rtime_round < 64) {
+                    ++rtime_round;
+                    std::fprintf(stderr, "[mtp-rtime] r=%d seconds=%.4f\n", rtime_round, seconds);
+                    std::fflush(stderr);
+                }
+            }
+            // AMD port: per-round MTP acceptance trace. Debug only - off unless
+            // NINFER_MTP_DIAG=1 (it used to print unconditionally and polluted the chat stream).
+            static const bool mtp_diag_on = [] {
+                const char* e = std::getenv("NINFER_MTP_DIAG");
+                return e != nullptr && e[0] == '1';
+            }();
+            if (mtp_diag_on) {
+                std::fprintf(stderr,
+                             "[mtp-diag] row=%zu count=%d accepted=%d next=%d width=%d dw=%d cap=%u "
+                             "baseE=%u rem=%u\n",
+                             row, count_i, accepted_i, next_i, static_cast<int>(width),
+                             static_cast<int>(draft_window), static_cast<unsigned>(capacity),
+                             static_cast<unsigned>(base_E),
+                             static_cast<unsigned>(budgets[row].generated_tokens_remaining));
+                std::fflush(stderr);
+            }
             if (count_i <= 0 || count_i > static_cast<std::int32_t>(width) || accepted_i < 0 ||
                 accepted_i + 1 != count_i || next_i < 0 ||
                 next_i > static_cast<std::int32_t>(draft_window) ||

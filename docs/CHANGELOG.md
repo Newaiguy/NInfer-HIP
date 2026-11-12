@@ -1,5 +1,62 @@
 # CHANGELOG
 
+## 0.1.1 - 2026-11-12
+
+第一个正式版。视觉链路从"能读图但答错"修到"九图回归三档全 9/9"，并新增 OpenAI 兼容服务。
+默认文本路径与 0.1.0-pre-r9 参数、性能一致（GATE 三档还有小幅提升）。
+
+### 新增
+- **`infer-serve.exe`：OpenAI 兼容 HTTP 服务**。`POST /v1/chat/completions`（SSE 真流式，
+  首字节约 0.05 s）、`GET /v1/models`、`GET /health`；`content` 支持 `{"type":"text"}` 与
+  `{"type":"image_url"}` 混排。源码 `harness/serve_mini_main.cpp`，构建 `harness/build_serve.py`
+  （独立于 CMake）。
+- **视觉输入可用**：PNG / JPEG / GIF / BMP / TIFF（WIC 解码，无外部依赖，alpha 合成白底），
+  自动缩放到模型约定的 448 网格。
+- **视觉 BF16 覆盖档**（`NINFER_VISION_WEIGHTS=<dir>`）：全 BF16 视觉覆盖档首次可用，
+  与量化档表现一致，可用于量化损失对拍。
+- 正式回归：`tests/ops/softmax_attention/plain_and_packed.cpp` 增加段长 1 的用例
+  （Q=K=0 时注意力输出必须等于 V，用于捕捉 fragment 映射错）。
+
+### 修复
+- **gfx12 WMMA 的 B 操作数打包**（`src/ops/common/mma.cuh`）：硬件 WMMA 的 B 片段按输出列
+  分布（lane L 的列 = `L & 15`，K 半区由 `L < 16` 决定），原实现按行打包，导致 packed
+  attention 输出只剩 1/8 通道、其余 7/8 恒为 0。修好后 identity / 随机数据、tile 16/32/64
+  全部 0 错。
+- **paired D=1152 LayerNorm 的 warp shuffle UB**（`src/ops/kernel/layer_norm.cuh`）：
+  `if (threadIdx.x == 0)` 内用全 mask 调 `__shfl_sync`，单 lane 参与整 warp shuffle 属 UB，
+  使专用核输出的均值/计数变垃圾（正式 `test_layer_norm.cpp` 四个对齐用例产出非有限值）。
+  修好后 norm2 与 NumPy 对拍从 rel 0.067 降到 1.5e-5。
+- **merger 输出不再默认乘 0.1**（`src/models/qwen3_5/execution/vision.cpp`）：merger 的输出
+  本就与文本 embedding 同空间，压到 1/10 会把单个色块的位置信号压没，模型退化成文本先验
+  → 位置题一律答 top-left。现在只有显式设置 `NINFER_VISION_SCALE` 时才缩放。
+- **视觉 BF16 导出**：补 mmproj 的**双帧** patch 权重（`v.patch_embd.weight` 与
+  `v.patch_embd.weight.1`，按通道交错 `[c][t]`），并去掉 layer-norm gamma 上多加的 1.0。
+- **GDN chunked 的前向声明**（`gated_delta_net/chunked/prepare_wy_wu.cuh`）：dispatcher
+  `mma16_swiz_x_raw_d` 引用其后才定义的 `mma16_swiz_x_raw` 且无声明；此前靠陈旧 obj 蒙过去，
+  干净 CMake 构建直接失败。
+- `harness/full_rebuild.py`：归档改用 llvm-ar 响应文件（obj 数量触发命令行长度上限）；
+  并说明必须用 `build/_rearchive_current.py` 归档，否则重复 obj 会引入
+  `duplicate symbol: ternary_dispatch_basis…`。
+
+### 实测
+- 视觉九图（`temperature=0.0` / `seed=42`，每例独立进程）：默认量化档 **9/9**、
+  patch-only BF16 **9/9**、全 BF16 **9/9**。
+- 真实照片（Wikimedia 原图 7 张、16 问）：本引擎 **16/16**、llama.cpp（BF16 mmproj）**16/16**。
+- GATE：8k `36.50 / 985.9`（+8.5% / +5.2%）、96k `25.30 / 428.4`（+4.2% / +1.2%）、
+  mtp `82.11 / 891.3`（+5.4% / +3.6%）。
+- 长上下文维持 r9：192K（196,427 token、窗口 32768）prefill 535.7 / decode 33.8；
+  128K（130,700 token）544.3 / 34.4。
+
+### 二进制
+- `infer-mini.exe` 191,703,040 B / `e89fc926bd3026ac38f5c3a92a5c3dd632bbeb4a9d17b89fcda1ed90f47c9924`
+- `infer-serve.exe` 192,038,912 B / `0b6f04c667b0fbd4621404cfcd046d268ba22f9ae5fd3ceae85a268856eb283b`
+
+### 已知问题
+- NVFP4 的两个 TMA TU 属 CUDA-only 独立 target（`ninfer_nvfp4_non_rdc`），ROCm 不编；
+  `full_rebuild.py` 无差别扫 `.cu` 会报 `CUtensorMap` / `CUresult` 未定义，属预期。
+- `serve_mini` 未注册进 `ninfer/apps/CMakeLists.txt`，发布走 `harness/build_serve.py`。
+- 其余未变（int8 KV 非确定、fp8 KV 桩、dflash2 坏路径、126K+ MTP、256K 需 offload）。
+
 ## 0.1.0-pre-r9 - 2026-11-09
 
 这一版把 **KV 记忆与 MTP 打通**、把长上下文从 98K 推到 192K，并补上与 llama.cpp kvmem 的同机对比。

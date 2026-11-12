@@ -1,10 +1,21 @@
-# NInfer-HIP `0.1.0-pre-r9`
+# NInfer-HIP `0.1.1`
 
 > 把 NInfer 推理引擎推到 AMD RDNA4（gfx1201）—— 一张 16GB 的 RX 9070 XT 上，
 > 27B 模型跑到 **126K 真实上下文**（decode 20.7 t/s · prefill 364），短上下文开 MTP dw2 到 **74.6 t/s**。
 > 同卡同权重下 decode 约为 llama.cpp 的 **1.4–2.5x**（开 MTP 约 2x）；prefill 在 ≥64K 落后于 llama.cpp（0.64x / 0.55x）。
 >
-> **0.1.0-pre-r8 的新东西：KV 记忆（KV memory）。** 显存窗口装不下的老上下文不再被丢弃——
+> **`0.1.1` 的新东西一：视觉链路修好了。** r9 的引擎能读图但答错（单色块位置题一律答
+> top-left）。查出五个真缺陷——gfx12 WMMA 的 B 操作数打包错（packed attention 丢 7/8 通道）、
+> paired D=1152 LayerNorm 的 shuffle UB、merger 输出被默认乘 0.1（位置信号被压没）、
+> 双帧 patch 权重导出缺一半、norm gamma 多加 1——全部修掉。
+> 九图回归 **3/9 → 9/9**（量化档 / patch-only BF16 / 全 BF16 三档全过），
+> 真实照片 16 问与 llama.cpp 打平。详见 [§8](#8-视觉图像输入)。
+>
+> **`0.1.1` 的新东西二：`infer-serve.exe`——OpenAI 兼容 HTTP 服务。** 真 SSE 流式
+> （首字节约 0.05 s）+ WIC 图像解码（PNG/JPEG/GIF/BMP/TIFF，无外部依赖）+ 视觉输入。
+> 详见 [§9](#9-openai-兼容服务infer-serveexe)。
+>
+> **`0.1.0-pre-r8` 的东西：KV 记忆（KV memory）。** 显存窗口装不下的老上下文不再被丢弃——
 > 滑出窗口的 KV 页会归档到内存，等 prompt 读完、问题已知时再挑出相关的一段换回显存继续参与注意力。
 > 96K 长文里埋在 25% / 50% / 75% 深度的答案，从「答不出来」变成「逐 token 正确」。详见 [§2](#2-kv-记忆显存装不下的上下文捞回来)。
 
@@ -16,9 +27,41 @@
 NInfer 引擎（原生 CUDA 项目，Apache-2.0）到 **AMD RDNA4 / gfx1201** 的 HIP 移植分支。
 目标机型：RX 9070 XT 16GB（256-bit GDDR6，标称 640 GB/s），Windows 11 26200 + HIP SDK 7.2.3。
 模型：`WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3`（官方 v3 单文件 artifact，15,017,456,896 B，
-内含 text + vision + mtp + dflash2 四个组件，本版本只用 text 与 mtp）。
+内含 text + vision + mtp + dflash2 四个组件，本版本使用 text、mtp 与 vision）。
 
-## 0. 这一版（pre-r9）更新了什么
+## 0. 这一版（0.1.1）更新了什么
+
+一句话：**图像输入从"能读但答错"变成"答对"，并新增 OpenAI 兼容的 HTTP 服务。**
+
+1. **修 gfx12 WMMA 的 B 操作数打包**（`src/ops/common/mma.cuh`）：硬件 WMMA 的 B 片段按
+   **输出列**分布，原实现按行打包，导致 packed attention 的输出只剩 1/8 通道、其余 7/8 恒为 0。
+   定位靠 identity softmax（Q=K=0、段长 1 时输出必须等于 V）：9216 个元素错 8064 个，正好 7/8；
+   再用孤立 16×16×16 identity GEMM 分别跑软件 MMA 与硬件 WMMA（软件 0 错、硬件 120/128 错），
+   把范围锁死到硬件片段映射。修好后 tile 16/32/64 全部 0 错，并加进正式回归
+   （`tests/ops/softmax_attention/plain_and_packed.cpp` 增加段长 1 用例）。
+2. **修 paired D=1152 LayerNorm 的 warp shuffle UB**（`src/ops/kernel/layer_norm.cuh`）：
+   诊断统计分支在 `if (threadIdx.x == 0)` 内用全 mask 调 `__shfl_sync`，单 lane 参与整 warp
+   shuffle 属未定义行为，使专用核输出垃圾。正式 `test_layer_norm.cpp` 默认路径四个对齐
+   D=1152 用例原本全部产出非有限值；修好后 `OK layer_norm correctness`，真实图片的 norm2
+   与独立 NumPy 对拍从 rel 0.067 降到 **1.5e-5**。
+3. **merger 输出默认不再乘 0.1**（`src/models/qwen3_5/execution/vision.cpp`）：merger 的训练
+   目标就是把视觉特征投到文本 embedding 同一空间，拼接必须原幅。压到 1/10 后大面积内容还
+   读得出，但**单个色块的位置信号被压到读不出来**，模型退化成文本先验 → 一律答 top-left。
+   这一条解释了此前所有坐标类实验（MRoPE 轴序 / `POS_ZERO` / `HW_SWAP` / 注入尺度）为何全无效。
+   现在只有显式设置 `NINFER_VISION_SCALE` 时才缩放。
+4. **视觉 BF16 覆盖档修好**：补上 mmproj 里**双帧** patch 权重（`v.patch_embd.weight` 与
+   `v.patch_embd.weight.1`，按通道交错 `[c][t]` 排列），并去掉 layer-norm gamma 上多加的 1.0
+   （导出的是最终 gamma，含负值，不是 delta）。
+5. **新增 `infer-serve.exe`**：OpenAI Chat Completions 兼容接口，SSE 真流式，WIC 解码
+   PNG/JPEG/GIF/BMP/TIFF，支持图片 + 文本混排。源码 `harness/serve_mini_main.cpp`，
+   构建脚本 `harness/build_serve.py`（不依赖 CMake）。
+6. **修干净构建的阻塞缺陷**：`gated_delta_net/chunked/prepare_wy_wu.cuh` 里 dispatcher 引用了
+   之后才定义的 `mma16_swiz_x_raw` 且无前向声明——此前靠陈旧 obj 蒙过去，干净 CMake 构建会
+   直接失败。本版加了前向声明。
+7. **性能无回退**：GATE 8k `36.50 / 985.9`（+8.5%/+5.2%）、96k `25.30 / 428.4`（+4.2%/+1.2%）、
+   mtp `82.11 / 891.3`（+5.4%/+3.6%）。
+
+## 0.1 这一版（pre-r9）更新了什么
 
 一句话：**KV 记忆与 MTP 可以同时开了，长上下文从 98K 推到 192K，并做了与 llama.cpp kvmem 的同机对比。**
 
@@ -71,7 +114,8 @@ NInfer 引擎（原生 CUDA 项目，Apache-2.0）到 **AMD RDNA4 / gfx1201** �
 | fp8 KV | ❌ 不可用（QK 的 MMA 是未移植的 trap 桩；容量也只到 ~96K） |
 | dflash2 | ⚠ 已修好（输出与 AR 逐 token 相同）但**只有 12.8–14.9 t/s**，约为 MTP 的 1/6，未启用 |
 | 256K | ❌ 直接塞不下（int4 KV 8.86GB + 权重 11.77GB > 16GB）；KV 记忆提供的是「长文可读」而非「显存装得下」 |
-| **多模态（图像输入）** | ❌ **本版不支持**（artifact 内含 vision 组件、引擎也编入了 vision 通路，但本版的 harness 没有图像入口；下一版接） |
+| **多模态（图像输入）** | ✅ **本版支持**：`infer-serve.exe` 走 OpenAI 兼容接口，PNG/JPEG/GIF/BMP/TIFF + 文本混排；九图回归三档全 9/9，真实照片 16/16 与 llama.cpp 打平（详见 [§8](#8-视觉图像输入)） |
+| **OpenAI 兼容服务** | ✅ `infer-serve.exe`：`/v1/chat/completions`（SSE 真流式，首字节 ~0.05 s）、`/v1/models`、`/health`（详见 [§9](#9-openai-兼容服务infer-serveexe)） |
 | 并发 | ❌ 只支持 1（`--max-concurrency 1`） |
 
 ## 2. KV 记忆：显存装不下的上下文，捞回来
@@ -149,7 +193,7 @@ RoPE 之前采集 `kn` / `qn`，用 kernel 把这一页 64 个 token 的 K 按�
 一条完整的长文命令：
 
 ```bat
-ninfer_mini_nordc.exe ^
+infer-mini.exe ^
     E:\ninfer-models\Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer ^
     --chat --kv rk4v4-e8 --ctx 262144 ^
     --resident-tokens 20480 --sink-tokens 2048 --archive-mib 4096 --kv-retrieval 1
@@ -352,7 +396,7 @@ prefill chunk 现在**自动分档**：`--ctx` ≤65536 用 2048、>65536 用 10
 
 ### A. 双击开聊（推荐，不需要命令行的方式）
 
-1. 把 `ninfer_mini_nordc.exe` 和 `chat.bat` 放在同一个文件夹里；
+1. 把 `infer-mini.exe` 和 `chat.bat` 放在同一个文件夹里；
 2. 双击 `chat.bat`，第一次会问模型路径（把 `.ninfer` 文件拖进窗口回车即可，会记在 `model.txt`）；
 3. 选场景：
 
@@ -413,16 +457,79 @@ python probe_rebuilt\run_capture.py build\infer_mini_nordc.exe ^
 ## 7. 目录
 
 ```
-（引擎 exe 不在仓库里：从 Releases 下载 ninfer_mini_nordc.exe，191,691,776 B，
-          sha256 见 VERSION.txt；把它和 harness/launchers/chat.bat 放同一个文件夹即可双击开聊）
+（引擎 exe 不在仓库里：从 Releases 下载 infer-mini.exe 191,703,040 B /
+          infer-serve.exe 192,038,912 B，sha256 见 VERSION.txt；
+          把它们和 harness/launchers/chat.bat 放同一个文件夹即可双击开聊 / 起服务）
 src/      infer/{include,src,third_party} + shim（HIP 兼容层），全量可重建源码
           新增 kv_archive.{h,cpp} / kv_retrieval.{h,cu}（KV 记忆）
+          新增 ops/linear/bf16/bf16_generic.cu（BF16 视觉覆盖回退路径）
 harness/  构建与跑测工具（compile_one / swap_lib / link_exe / run_capture）
+          harness/serve_mini_main.cpp  OpenAI 兼容服务源码
+          harness/build_serve.py       serve_mini 独立构建脚本
           harness/launchers/chat.bat  双击启动器（+ model.txt.example）
 tasks/    验收语料（含 126K needle 语料、96K 多深度 needle 语料 q25/q50/q75/q92）
-docs/     STORY / VALIDATION / PERF-CAPACITY / KVMEM / CHANGELOG / PATCHLIST / BUILD
+docs/     STORY / VALIDATION / PERF-CAPACITY / KVMEM / VISION / VISION_STATE
+          / CHANGELOG / PATCHLIST / BUILD
 VERSION.txt  版本、实测指标、引擎 sha256、环境变量与纪律
 ```
 
 构建方式见 [`docs/BUILD.md`](docs/BUILD.md)；每个改动的回滚点见 [`docs/PATCHLIST.md`](docs/PATCHLIST.md)；
-KV 记忆的实现细节与全部实测数据见 [`docs/KVMEM.md`](docs/KVMEM.md)。
+KV 记忆的实现细节与全部实测数据见 [`docs/KVMEM.md`](docs/KVMEM.md)；
+视觉链路的结论与证据见 [`docs/VISION.md`](docs/VISION.md)。
+
+## 8. 视觉（图像输入）
+
+**怎么用**：用 `infer-serve.exe`（§9），`content` 里混排 `{"type":"text"}` 与
+`{"type":"image_url"}`。图像格式 PNG/JPEG/GIF/BMP/TIFF，带 alpha 时合成白底，
+自动缩放到模型约定的 448 网格。支持的视觉提示包括：颜色、计数、物体识别、场景描述、
+文字/数字读取（OCR）、相对空间位置（左上/右上/左下/右下、上下/左右分半）、朝向等。
+
+**修好了什么**（详见 [RELEASE_NOTES_0.1.1.md](RELEASE_NOTES_0.1.1.md) 与
+[docs/VISION.md](docs/VISION.md)）：
+
+| 缺陷 | 位置 | 后果 |
+|---|---|---|
+| gfx12 WMMA B 操作数按行而非按输出列打包 | `src/ops/common/mma.cuh` | packed attention 只剩 1/8 输出通道 |
+| paired D=1152 LayerNorm 单 lane 全 mask shuffle（UB） | `src/ops/kernel/layer_norm.cuh` | norm2 全错、产出非有限值 |
+| merger 输出默认乘 0.1 | `src/models/qwen3_5/execution/vision.cpp` | 单色块位置信号被压没 → 一律答 top-left |
+| 双帧 patch 权重只导出 t0 | BF16 覆盖导出 | 全 BF16 档颜色/空间全错 |
+| norm gamma 多加 1.0 | BF16 覆盖导出 | 全 BF16 档塌成银灰 |
+
+**回归**（`temperature=0.0`、`seed=42`，每例独立进程）：
+
+- 九图（纯红 / 四象限 / 三色条 / 左右分色 / 上下分色 / 四个单色块位置题）：
+  默认量化档 **9/9** · patch-only BF16 **9/9** · 全 BF16 **9/9**
+- 真实照片（Wikimedia 原图 7 张、16 问）：本引擎 **16/16** · llama.cpp（BF16 mmproj）**16/16**
+- 泛化：320/480 非正方形、一图两目标、一请求两图、48×48 小目标 全部正确
+
+**已知限制**：默认档用 artifact 内置的 q4/q5/q6 量化视觉线性层（相对 BF16 权重误差
+42%~59%），与 llama.cpp 的 BF16 mmproj 同源不同精度。想用高精度档：
+`set NINFER_VISION_WEIGHTS=<BF16 导出目录>`（本版该档已修好，九图同样 9/9）。
+尚未找到能稳定区分两个精度档的硬用例，所以"量化损失多少"目前量不出来。
+
+## 9. OpenAI 兼容服务（`infer-serve.exe`）
+
+```bat
+set PATH=C:\Program Files\AMD\ROCm\7.2\bin;%PATH%
+infer-serve.exe --model E:\infer-models\Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer ^
+                --ctx 32768 --kv rk4v4-e8 --spec mtp --draft-tokens 2 --port 8099
+```
+
+| 路由 | 说明 |
+|---|---|
+| `POST /v1/chat/completions` | 兼容 OpenAI；`stream=true` 时 SSE 真流式（首字节约 0.05 s，非伪流式）；`content` 支持文本与 `image_url` 混排 |
+| `GET /v1/models` | 列出模型名 |
+| `GET /health` | 存活 + 视觉是否可用 |
+
+注意：`image_url` 项**必须带** `"type":"image_url"`，否则会被当成纯文本、视觉通路不启动。
+
+```bash
+curl http://127.0.0.1:8099/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "ninfer", "stream": true, "max_tokens": 64,
+  "messages": [{"role":"user","content":[
+    {"type":"text","text":"左上角是什么颜色？"},
+    {"type":"image_url","image_url":{"url":"data:image/png;base64,...."}}]}]}'
+```
+
+源码 `harness/serve_mini_main.cpp`；构建 `python harness/build_serve.py`
+（独立于 CMake，直接编 `serve_mini.obj` 后与 `ninfer_hip.lib` 链接）。

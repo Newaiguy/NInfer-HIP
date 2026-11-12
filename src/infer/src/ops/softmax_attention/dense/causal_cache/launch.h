@@ -24,6 +24,11 @@ enum class CausalAttentionRoute { SmallT, ChunkedSmallT, Prompt };
 struct CausalSmallTInvocation {
     const Tensor* valid_columns = nullptr;
     const Tensor* table_rows    = nullptr;
+    // Windowed recall: retained slots are no longer contiguous in token space, so the
+    // slot->absolute-position map replaces the "slot index == token position" assumption
+    // in the causal test. Null keeps the default (slot index is the position).
+    const std::int32_t* key_position_map = nullptr;
+    std::int32_t resident_slots         = 0;
     std::int32_t full_width     = 0;
     std::int32_t column_begin   = 0;
     std::int32_t width          = 0;

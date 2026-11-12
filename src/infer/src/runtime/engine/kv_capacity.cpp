@@ -120,10 +120,42 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
 
     const std::size_t reservation = curve.reservation_bytes(pages);
     if (reservation > capacity_budget) {
+        // Largest page group count whose reservation still fits; searched rather than
+        // derived so the message stays correct for any curve shape.
+        std::uint32_t affordable_pages = 0;
+        {
+            std::uint32_t lo = curve.minimum_main_page_groups;
+            std::uint32_t hi = curve.maximum_main_page_groups;
+            while (lo <= hi) {
+                const std::uint32_t mid = lo + (hi - lo) / 2;
+                if (curve.reservation_bytes(mid) <= capacity_budget) {
+                    affordable_pages = mid;
+                    if (mid == std::numeric_limits<std::uint32_t>::max()) {
+                        break;
+                    }
+                    lo = mid + 1;
+                } else {
+                    if (mid == 0) {
+                        break;
+                    }
+                    hi = mid - 1;
+                }
+            }
+        }
+        // An explicit policy resolves to a single point, so the curve cannot be walked
+        // downwards; scale the request by the shortfall instead (KV dominates it).
+        const std::uint32_t requested_tokens = curve.resolved_tokens(pages);
+        const std::uint64_t scaled_tokens =
+            requested_tokens == 0
+                ? 0
+                : (static_cast<std::uint64_t>(requested_tokens) * capacity_budget) / reservation;
+        const std::string affordable_text =
+            "about " + std::to_string(scaled_tokens) + " tokens or less";
         throw std::invalid_argument("requested Engine runtime reservation requires " +
                                     std::to_string(reservation) + " bytes, but only " +
                                     std::to_string(capacity_budget) +
-                                    " bytes are available for runtime capacity");
+                                    " bytes are available for runtime capacity; the largest " +
+                                    "capacity this device can hold is " + affordable_text);
     }
 
     return KvCapacityResolution{

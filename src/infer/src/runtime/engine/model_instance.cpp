@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <set>
 #include <stdexcept>
@@ -60,11 +62,31 @@ void validate_options(const EngineOptions& options) {
     }
 }
 
+// The driver keeps a slice of the adapter's VRAM out of reach without saying so:
+// cudaMemGetInfo still reports it as free, but committing past it does not fail --
+// every kernel just runs 4-6x slower (see OPTIMIZATION-LOG.md). Calibrated on
+// gfx1201 16 GB / ROCm 7.2 with a 4 KiB int4 KV: 4.06 GB of runtime reservations
+// still ran at 860 t/s prefill one day and 153 t/s the next, with an unchanged
+// hipMemGetInfo, so the edge drifts by ~0.4 GB with ambient desktop load. Reserve
+// 1.25 GiB to stay clear of the drift; NINFER_DRIVER_RESERVE_MB overrides it.
+constexpr std::size_t kUnreachableDeviceReserveBytes = 1280ULL * 1024ULL * 1024ULL;
+
+std::size_t unreachable_device_reserve_bytes() {
+    if (const char* env = std::getenv("NINFER_DRIVER_RESERVE_MB")) {
+        const unsigned long mb = std::strtoul(env, nullptr, 10);
+        if (mb != 0) {
+            return static_cast<std::size_t>(mb) * 1024ULL * 1024ULL;
+        }
+    }
+    return kUnreachableDeviceReserveBytes;
+}
+
 std::size_t current_free_device_bytes() {
     std::size_t free_bytes  = 0;
     std::size_t total_bytes = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-    return free_bytes;
+    const std::size_t reserve = unreachable_device_reserve_bytes();
+    return free_bytes > reserve ? free_bytes - reserve : 0;
 }
 
 } // namespace
@@ -86,12 +108,33 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     default:
         throw std::invalid_argument("Engine purpose is invalid");
     }
+    if (const char* env_chunk = std::getenv("NINFER_PREFILL_CHUNK")) {
+        options.prefill_chunk = static_cast<std::uint32_t>(std::strtoul(env_chunk, nullptr, 10));
+    }
+    if (const char* env_resident = std::getenv("NINFER_RESIDENT_TOKENS")) {
+        const unsigned long value = std::strtoul(env_resident, nullptr, 10);
+        if (value != 0 && value < options.max_context) {
+            // Resident-window mode rewrites the attention positions between steps, so a captured
+            // graph would bake the capture-time scan bound: run windowed sessions graph-free.
+            options.use_cuda_graph = false;
+        }
+        std::fprintf(stderr, "[opt] resident_env=%lu ctx=%u graph=%d\n", value, options.max_context,
+                     options.use_cuda_graph ? 1 : 0);
+        std::fflush(stderr);
+    }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
 
     ContextCacheOptions& cache      = options.context_cache;
     const std::uint32_t concurrency = options.max_concurrency;
+    if (const char* env_host = std::getenv("NINFER_HOST_KV_MIB")) {
+        const unsigned long mib = std::strtoul(env_host, nullptr, 10);
+        if (mib != 0) {
+            cache.enabled                = true;
+            cache.host_kv_capacity_bytes = static_cast<std::size_t>(mib) << 20;
+        }
+    }
     if (!cache.enabled) {
         if ((cache.device_state_slots && *cache.device_state_slots != 0) ||
             (cache.max_private_continuations && *cache.max_private_continuations != concurrency) ||
@@ -195,8 +238,15 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
     auto planner    = models::qwen3_5::make_sequence_planner(instance->parameters, device, options);
     std::cerr << "[mini] cm-kv\n";
     std::cerr.flush();
-    auto resolution = resolve_kv_capacity(options.kv_capacity, planner.capacity_curve(),
-                                          current_free_device_bytes());
+    std::uint32_t resident_tokens = options.max_context;
+    if (const char* env_resident = std::getenv("NINFER_RESIDENT_TOKENS")) {
+        const unsigned long value = std::strtoul(env_resident, nullptr, 10);
+        if (value != 0) {
+            resident_tokens = std::min<std::uint32_t>(static_cast<std::uint32_t>(value), options.max_context);
+        }
+    }
+    auto resolution = resolve_kv_capacity(KvCapacityPolicy::explicit_capacity(resident_tokens),
+                                          planner.capacity_curve(), current_free_device_bytes());
     auto sequence   = std::move(planner).finalize(resolution.main_page_groups);
     if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
         sequence.kv_capacity() != resolution.resolved_tokens) {

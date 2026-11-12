@@ -2,6 +2,7 @@
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/program/planning/rebuild_work.h"
+#include "models/qwen3_5/execution/kv_window.h"
 
 #include <algorithm>
 #include <chrono>
@@ -269,11 +270,19 @@ execution::MtpCausalAttentionEnvelopes mtp_causal_attention_envelopes(std::uint3
     const auto visible = [capacity](std::uint64_t value) {
         return static_cast<std::uint32_t>(std::min<std::uint64_t>(capacity, value));
     };
+    // Resident window: the attention kernels address compact slots, not absolute tokens, so the
+    // envelope has to drop the same base the ordinary decode path drops (decode.cpp:342). Slot 0 is
+    // the kernel's sentinel, so the lower bound never goes below 1.
+    const std::uint32_t window_base = g_ninfer_kv_window_base_tokens;
+    const auto compact             = [window_base, &visible](std::uint64_t value) {
+        const std::uint32_t absolute = visible(value);
+        return absolute > window_base ? absolute - window_base : 1U;
+    };
     execution::MtpCausalAttentionEnvelopes out;
-    out.target_verify = {1, visible(static_cast<std::uint64_t>(max_frontier) + k + 1ULL)};
+    out.target_verify = {1, compact(static_cast<std::uint64_t>(max_frontier) + k + 1ULL)};
     out.batch         = out.target_verify;
     for (std::uint32_t step = 0; step + 1 < k; ++step) {
-        out.ar[step] = {1, visible(static_cast<std::uint64_t>(max_frontier) + k + step + 2ULL)};
+        out.ar[step] = {1, compact(static_cast<std::uint64_t>(max_frontier) + k + step + 2ULL)};
     }
     return out;
 }

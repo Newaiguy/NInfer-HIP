@@ -231,6 +231,11 @@ void ProgramImpl::release_continuation_slot_best_effort(std::uint32_t index) noe
         return;
     }
     SequenceState& sequence = continuation_states[index];
+    if (std::getenv("NINFER_KV_RELEASE_TRACE") != nullptr) {
+        std::fprintf(stderr, "[kv-slot] retire index=%u seq=%p\n", index,
+                     static_cast<const void*>(&sequence));
+        std::fflush(stderr);
+    }
     release_active_shared_references(sequence);
     release_sequence_kv(sequence);
     release_sequence_state(sequence);
@@ -1373,6 +1378,10 @@ std::uint32_t ProgramImpl::backend_kv_valid(const SequenceState& sequence) const
 
 void ProgramImpl::resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,
                                                  std::uint32_t backend_pages) {
+    if (std::getenv("NINFER_KV_OP_TRACE") != nullptr) {
+        std::fprintf(stderr, "[kv-op] resize text=%u backend=%u\n", text_pages, backend_pages);
+        std::fflush(stderr);
+    }
     if (!sequence.kv || text_pages == 0 ||
         (sequence.kv->backend.has_value() != (backend_pages != 0))) {
         throw std::invalid_argument("KV resize entitlement does not match the sequence bundle");
@@ -1384,6 +1393,11 @@ void ProgramImpl::resize_sequence_kv_entitlement(SequenceState& sequence, std::u
 }
 
 void ProgramImpl::bind_sequence_kv(SequenceState& sequence) {
+    if (std::getenv("NINFER_KV_OP_TRACE") != nullptr) {
+        std::fprintf(stderr, "[kv-op] bind active=%d\n",
+                     text_kv_addresses->active(sequence.kv->text) ? 1 : 0);
+        std::fflush(stderr);
+    }
     if (!sequence.kv) { throw std::logic_error("KV allocation bundle is unavailable"); }
     const std::int32_t row = static_cast<std::int32_t>(sequence.lane);
     const bool text_active = text_kv_addresses->active(sequence.kv->text);
@@ -1439,6 +1453,8 @@ namespace {
 std::uint32_t kv_window_sink_tokens() {
     static const std::uint32_t value = [] {
         const char* env          = std::getenv("NINFER_SINK_TOKENS");
+        // A pinned sink compresses the tail and the recall region has to be carved out of it, so the
+        // default stays at zero; --sink-tokens opts into keeping the prefix.
         const unsigned long raw  = env != nullptr ? std::strtoul(env, nullptr, 10) : 0UL;
         return static_cast<std::uint32_t>(raw / kPagedKVPageSize * kPagedKVPageSize);
     }();
@@ -1450,7 +1466,10 @@ std::uint32_t kv_window_sink_tokens() {
 std::uint32_t kv_window_recall_pages() {
     static const std::uint32_t value = [] {
         const char* env         = std::getenv("NINFER_KV_RECALL_PAGES");
-        const unsigned long raw = env != nullptr ? std::strtoul(env, nullptr, 10) : 0UL;
+        // 112 pages (7168 tokens) is the validated default: the recall region must be at least as
+        // wide as the block the multi-peak selector hands back, otherwise the slide path stops
+        // skipping it and archives recalled pages as if they were recent window tokens.
+        const unsigned long raw = env != nullptr ? std::strtoul(env, nullptr, 10) : 112UL;
         return static_cast<std::uint32_t>(raw);
     }();
     return value;
@@ -1470,6 +1489,10 @@ std::uint32_t g_kv_archive_watermark = 0;
 
 void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                             std::uint32_t backend_tokens) {
+    if (std::getenv("NINFER_KV_OP_TRACE") != nullptr) {
+        std::fprintf(stderr, "[kv-op] map main=%u backend=%u\n", main_tokens, backend_tokens);
+        std::fflush(stderr);
+    }
     if (!sequence.kv || main_tokens > capacity || backend_tokens > capacity) {
         throw std::logic_error("KV materialization request is outside the sequence bundle");
     }
@@ -1479,12 +1502,21 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32
     // Resident-window mode (Leg B): the Main KV address space holds only the newest pages, so the
     // execution path addresses it in COMPACT coordinates (absolute position minus the window base);
     // RoPE positions stay absolute. Sliding itself happens at chunk boundaries in ensure_kv_window().
-    std::uint32_t compact_tokens = main_tokens;
+    std::uint32_t compact_tokens  = main_tokens;
+    // The speculative (MTP) cache lives in the same windowed address space, so it is compacted the
+    // same way; leaving it absolute asked for one page per context token and blew the entitlement.
+    std::uint32_t compact_backend = backend_tokens;
     static const bool resident_windowed = [] {
         const char* env = std::getenv("NINFER_RESIDENT_TOKENS");
         return env != nullptr && env[0] != '\0';
     }();
     if (resident_windowed) {
+        if (std::getenv("NINFER_KV_OP_TRACE") != nullptr) {
+            std::fprintf(stderr, "[kv-op] map-resident lane=%u active=%d\n",
+                         static_cast<unsigned>(sequence.lane),
+                         text_kv_addresses->active(sequence.kv->text) ? 1 : 0);
+            std::fflush(stderr);
+        }
         const std::uint32_t window_base = text_kv_addresses->window_base_tokens(sequence.kv->text);
         const std::uint32_t resident_pages = text_kv_addresses->entitlement(sequence.kv->text);
         const std::uint32_t sink_tokens =
@@ -1492,6 +1524,18 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32
         // Absolute -> compact: the retained sink occupies the low slots, so the tail shift is the
         // window base minus the sink that is still mapped in front of it.
         const std::uint32_t shift = window_base == 0 ? 0U : window_base - sink_tokens;
+        compact_backend = backend_tokens > shift ? backend_tokens - shift : 0U;
+        // Only clamp against the speculative cache when this sequence actually owns one: dereferencing
+        // the empty optional handed a garbage handle to entitlement() and every windowed run died with
+        // "KV address-space handle is stale" before the first chunk.
+        if (sequence.kv->backend) {
+            const std::uint32_t backend_capacity =
+                backend_kv_addresses->entitlement(*sequence.kv->backend) *
+                static_cast<std::uint32_t>(kPagedKVPageSize);
+            if (compact_backend > backend_capacity) { compact_backend = backend_capacity; }
+        } else {
+            compact_backend = 0;
+        }
         g_ninfer_kv_window_base_tokens = shift;
         const std::uint32_t window_tokens  = resident_pages * kPagedKVPageSize;
         compact_tokens = main_tokens > shift ? main_tokens - shift : 0U;
@@ -1504,9 +1548,15 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32
             std::fflush(stderr);
         }
     }
+    if (std::getenv("NINFER_KV_OP_TRACE") != nullptr) {
+        std::fprintf(stderr, "[kv-op] map main=%u backend=%u compact=%u active=%d\n", main_tokens,
+                     backend_tokens, compact_tokens,
+                     text_kv_addresses->active(sequence.kv->text) ? 1 : 0);
+        std::fflush(stderr);
+    }
     text_kv_addresses->ensure_mapped_to_tokens(sequence.kv->text, compact_tokens, device.stream);
     if (backend_tokens != 0) {
-        backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend, backend_tokens,
+        backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend, compact_backend,
                                                       device.stream);
     }
 }
@@ -1593,6 +1643,22 @@ void ProgramImpl::ensure_kv_window(SequenceState& sequence, std::uint32_t absolu
         }
         text_kv_addresses->slide_prefix_pages(
             sequence.kv->text, drop_pages, device.stream, sink_pages);
+        // The speculative cache addresses the same tokens, so it has to slide with the main cache or
+        // its compact frontier goes backwards and commit_frontier rejects it.
+        if (sequence.kv->backend) {
+            // The draft rows grow lazily, so they may still be narrower than the main row when a
+            // slide arrives; widen them to the same span before dropping the prefix.
+            const std::uint32_t backend_pages = std::min(
+                text_kv_addresses->mapped_pages(sequence.kv->text),
+                backend_kv_addresses->entitlement(*sequence.kv->backend));
+            backend_kv_addresses->ensure_mapped_to_tokens(
+                *sequence.kv->backend, backend_pages * static_cast<std::uint32_t>(kPagedKVPageSize),
+                device.stream);
+            backend_kv_addresses->slide_prefix_pages(
+                *sequence.kv->backend, drop_pages, device.stream, sink_pages);
+            // The draft rows slid with the main rows, so their compact coverage follows the same
+            // base; mtp_kv_valid stays absolute and needs no correction.
+        }
         slid = true;
         if (std::getenv("NINFER_WINDOW_TRACE") != nullptr) {
             std::fprintf(stderr, "[win] slide -> base=%u (abs_end=%u) frontier=%u\n",
@@ -1637,6 +1703,7 @@ void ProgramImpl::ensure_kv_window(SequenceState& sequence, std::uint32_t absolu
 // absolute positions at write time, so the scores are the full-context ones -- the slot index only
 // decides visibility, not the rotation.
 void ProgramImpl::recall_into_tail(SequenceState& sequence) {
+    static thread_local std::uint32_t recall_calls = 0;
     static const std::uint32_t recall_first_token = [] {
         const char* env = std::getenv("NINFER_KV_RECALL_TOKEN");
         return env != nullptr ? static_cast<std::uint32_t>(std::strtoul(env, nullptr, 10)) : 0U;
@@ -1657,7 +1724,29 @@ void ProgramImpl::recall_into_tail(SequenceState& sequence) {
     // Default window is wide enough that a peak sitting a few pages early still covers the
     // document it points at; the backoff below keeps it symmetric around that peak.
     const std::uint32_t want = recall_slots != 0 ? recall_slots : 112U;
-    const std::uint32_t slots = std::min(want, mapped - sink_pages);
+    // Never recall more pages than the archive actually holds: a window wider than the archived
+    // set would overwrite live KV with pages that were never stored, which shows up as a window
+    // that suddenly answers nonsense while every trace line still looks healthy.
+    const std::uint32_t archived = static_cast<std::uint32_t>(archive->stats().pages);
+    const std::uint32_t tail       = mapped > sink_pages ? mapped - sink_pages : 0U;
+    const std::uint32_t reserve    = std::max<std::uint32_t>(16U, tail / 4U);
+    const std::uint32_t capacity   = tail > reserve ? tail - reserve : 0U;
+    // Never take more than half of the archive: a short conversation stores only a few blocks, and
+    // recalling most of them turns the window into a copy of the document head.
+    const std::uint32_t slots      = std::min({want, capacity, archived});
+    if (slots == 0) { return; }
+    // A window that is still wider than what has scrolled out does not need a recall: everything
+    // is already resident, and writing recalled pages would trade live context for a copy of the
+    // document head. Skip until the archive can actually supply a full block.
+    if (archived < want) { return; }
+    if (std::getenv("NINFER_KV_RETRIEVE_TRACE") != nullptr) {
+        std::fprintf(stderr,
+                     "[kv-recall] attempt #%u mapped=%u sink=%u want=%u archived=%u slots=%u base=%u\n",
+                     ++recall_calls,
+                     mapped, sink_pages, want, archived, slots,
+                     text_kv_addresses->window_base_tokens(sequence.kv->text));
+        std::fflush(stderr);
+    }
     // Evict-then-fill, and in this order: the destination slots hold real window tokens at this
     // instant (the slide just shifted the tail down into them), so index those bytes under their
     // true absolute positions BEFORE overwriting them. Without this the archive would freeze at the
@@ -1690,18 +1779,107 @@ void ProgramImpl::recall_into_tail(SequenceState& sequence) {
     if (retrieval != nullptr) {
         // W4: rank every archived page against the current query instead of trusting a hand-picked
         // absolute token. Each block carries its own device mean-key record, one pointer per page.
-        std::vector<const void*> means;
+        std::vector<std::uint16_t> means;
         std::vector<std::uint32_t> pages;
+        const std::size_t mean_halves = static_cast<std::size_t>(kRetrievalPageMeanBytes) / 2U;
+        // A page can be archived twice (a range that slid out, was recalled, then slid out again).
+        // The newer copy may have been captured after its ring slot was recycled and therefore be
+        // all zeros, so keep whichever copy actually carries a summary.
+        std::unordered_map<std::uint32_t, std::size_t> slot_of_page;
         for (const KVArchive::Block& block : archive->blocks()) {
-            if (block.means == nullptr) { continue; }
+            if (block.means_host.size() < static_cast<std::size_t>(block.pages) * mean_halves) {
+                continue;
+            }
             for (std::uint32_t index = 0; index < block.pages; ++index) {
-                means.push_back(static_cast<const char*>(block.means) +
-                                static_cast<std::size_t>(index) * kRetrievalPageMeanBytes);
-                pages.push_back(block.begin_token / static_cast<std::uint32_t>(kPagedKVPageSize) +
-                                index);
+                const std::uint32_t page =
+                    block.begin_token / static_cast<std::uint32_t>(kPagedKVPageSize) + index;
+                const std::uint16_t* source = block.means_host.data() + index * mean_halves;
+                const auto found = slot_of_page.find(page);
+                if (found == slot_of_page.end()) {
+                    slot_of_page.emplace(page, pages.size());
+                    pages.push_back(page);
+                    means.insert(means.end(), source, source + mean_halves);
+                } else if (means[found->second * mean_halves] == 0U && source[0] != 0U) {
+                    std::copy(source, source + mean_halves,
+                              means.begin() + static_cast<std::ptrdiff_t>(found->second * mean_halves));
+                }
             }
         }
-        const auto ranked = retrieval->rank(means, pages, device.stream);
+        if (std::getenv("NINFER_KV_PROBE_PAGE") != nullptr) {
+            for (const KVArchive::Block& block : archive->blocks()) {
+                const std::uint16_t sample =
+                    block.means_host.size() > 2U ? block.means_host[1] : 0xFFFFU;
+                std::fprintf(stderr, "[kv-blk] begin=%u pages=%u halves=%zu sample=%u buf=%p\n",
+                             block.begin_token, block.pages, block.means_host.size(),
+                             static_cast<unsigned>(sample),
+                             static_cast<const void*>(block.means_host.data()));
+            }
+            std::fflush(stderr);
+        }
+        const auto ranked =
+            retrieval->rank(means.empty() ? nullptr : static_cast<const void*>(means.data()), pages,
+                            device.stream);
+        if (const char* probe_env = std::getenv("NINFER_KV_PROBE_PAGE"); probe_env != nullptr) {
+            const std::uint32_t probe = static_cast<std::uint32_t>(std::atoi(probe_env));
+            for (std::size_t index = 0; index < pages.size(); ++index) {
+                if (pages[index] != probe) { continue; }
+                const std::uint16_t* entry = means.data() + index * mean_halves;
+                std::fprintf(stderr, "[kv-host] page=%u index=%zu h0=%u h1=%u h2=%u\n", probe, index,
+                             static_cast<unsigned>(entry[0]), static_cast<unsigned>(entry[1]),
+                             static_cast<unsigned>(entry[2]));
+            }
+            std::fflush(stderr);
+        }
+        // Two-stage rerank: the mean summaries are only a coarse filter, so the best candidates are
+        // re-scored against their decoded int4 keys before the swap-in choice is made.
+        std::vector<std::decay_t<decltype(ranked[0])>> rescored(ranked.begin(), ranked.end());
+        const char* rerank_env = std::getenv("NINFER_KV_RERANK");
+        const bool rerank_on = rerank_env == nullptr || rerank_env[0] != '0';
+        if (rerank_on && rescored.size() > 1U) {
+            std::vector<float> query_rows(static_cast<std::size_t>(kRetrievalLayers) *
+                                              kRetrievalKVHeads * 256U,
+                                          0.0F);
+            retrieval->export_query(query_rows.data(), device.stream);
+            std::unordered_map<std::uint32_t, const void*> bytes_of_page;
+            for (const auto& source : sources) {
+                bytes_of_page.emplace(source.absolute_token / kPagedKVPageSize, source.source.data());
+            }
+            const std::size_t limit = std::min<std::size_t>(rescored.size(), 256U);
+            for (std::size_t index = 0; index < limit; ++index) {
+                // The sink pages hold the prompt template and the task statement, which match the
+                // query strongly without containing the answer; keep them out of the rerank.
+                if (rescored[index].absolute_page < 32U) {
+                    rescored[index].score = -1.0e30F;
+                    continue;
+                }
+                const auto found = bytes_of_page.find(rescored[index].absolute_page);
+                if (found != bytes_of_page.end()) {
+                    rescored[index].score =
+                        KVRetrieval::score_page_keys(found->second, query_rows.data());
+                }
+            }
+            std::stable_sort(rescored.begin(), rescored.begin() + static_cast<std::ptrdiff_t>(limit),
+                             [](const auto& lhs, const auto& rhs) { return lhs.score > rhs.score; });
+            if (std::getenv("NINFER_KV_RETRIEVE_TRACE") != nullptr) {
+                std::fprintf(stderr, "[kv-refine] top3:");
+                for (std::size_t index = 0; index < limit && index < 3U; ++index) {
+                    std::fprintf(stderr, " %u@%.5f", rescored[index].absolute_page,
+                                 static_cast<double>(rescored[index].score));
+                }
+                if (const char* probe_env = std::getenv("NINFER_KV_PROBE_PAGE");
+                    probe_env != nullptr) {
+                    const std::uint32_t probe = static_cast<std::uint32_t>(std::atoi(probe_env));
+                    for (std::size_t index = 0; index < limit; ++index) {
+                        if (rescored[index].absolute_page != probe) { continue; }
+                        std::fprintf(stderr, " | probe=%u rank=%zu score=%.5f", probe, index,
+                                     static_cast<double>(rescored[index].score));
+                        break;
+                    }
+                }
+                std::fprintf(stderr, "\n");
+                std::fflush(stderr);
+            }
+        }
         if (std::getenv("NINFER_KV_RETRIEVE_TRACE") != nullptr) {
             const KVArchiveStats archive_stats = archive->stats();
             std::fprintf(stderr, "[kv-rank] blocks=%llu pages=%llu evicted=%llu candidates=%zu top:",
@@ -1738,21 +1916,82 @@ void ProgramImpl::recall_into_tail(SequenceState& sequence) {
         // The ranker peaks near the document that holds the answer rather than exactly on it, so
         // each hit expands forward into its neighbours before the next hit is considered.
         if (!ranked.empty()) {
-            static const std::uint32_t backoff = [] {
-                const char* env = std::getenv("NINFER_KV_RECALL_BACKOFF");
-                return env != nullptr ? static_cast<std::uint32_t>(std::atoi(env)) : 0U;
-            }();
-            const std::uint32_t peak  = ranked.front().absolute_page;
-            const std::uint32_t shift = backoff != 0 ? backoff : static_cast<std::uint32_t>(slots) / 2U;
-            const std::uint32_t start = peak > shift ? peak - shift : 0U;
-            const std::vector<KVArchive::RecallPage> run =
-                archive->recall_pages(start * kPagedKVPageSize, static_cast<std::uint32_t>(slots));
-            sources.assign(run.begin(), run.end());
+            const char* div_env = std::getenv("NINFER_KV_RECALL_DIV");
+            const std::uint32_t divisor =
+                div_env != nullptr ? std::max<std::uint32_t>(1U, static_cast<std::uint32_t>(
+                                                                         std::strtoul(div_env, nullptr, 10)))
+                                   : (archived < 8U * static_cast<std::uint32_t>(slots) ? 4U : 2U);
+            const std::uint32_t block =
+                std::max<std::uint32_t>(16U, static_cast<std::uint32_t>(slots) / divisor);
+            std::vector<std::uint32_t> centres;
+            std::vector<std::uint32_t> taken;
+            for (const auto& candidate : rescored) {
+                if (sources.size() >= slots) { break; }
+                const std::uint32_t page = candidate.absolute_page;
+                bool already = false;
+                for (const std::uint32_t done : taken) {
+                    if (done == page) { already = true; break; }
+                }
+                if (already) { continue; }
+                const std::uint32_t left = static_cast<std::uint32_t>(slots) -
+                                           static_cast<std::uint32_t>(sources.size());
+                const std::uint32_t width = std::max<std::uint32_t>(16U, std::min(block, left));
+                // Centre the block on the peak: a peak that lands a few pages past the needle would
+                // otherwise start the block at the needle and run away from it.
+                const std::uint32_t back  = block / 2U;
+                const std::uint32_t begin = page > back ? page - back : 0U;
+                const std::vector<KVArchive::RecallPage> run =
+                    archive->recall_pages(begin * kPagedKVPageSize, width);
+                if (run.empty()) { continue; }
+                centres.push_back(page);
+                sources.insert(sources.end(), run.begin(), run.end());
+                for (std::uint32_t offset = 0; offset < run.size(); ++offset) {
+                    taken.push_back(begin + offset);
+                }
+            }
+            // A small window leaves budget after the wide peaks; spend it on the next ranked pages so a
+            // second peak sitting outside every block still gets pulled in.
+            const char* fill_env = std::getenv("NINFER_KV_RECALL_FILL");
+            const bool fill_extra = fill_env == nullptr || fill_env[0] != '0';
+            for (const auto& candidate : rescored) {
+                if (!fill_extra || sources.size() >= slots) { break; }
+                const std::uint32_t page = candidate.absolute_page;
+                bool covered = false;
+                for (const std::uint32_t done : taken) {
+                    if (done == page) { covered = true; break; }
+                }
+                if (covered) { continue; }
+                const std::vector<KVArchive::RecallPage> run =
+                    archive->recall_pages(page * kPagedKVPageSize, 1);
+                if (run.empty()) { continue; }
+                taken.push_back(page);
+                sources.insert(sources.end(), run.begin(), run.end());
+            }
+            if (sources.size() > slots) { sources.resize(slots); }
+            if (std::getenv("NINFER_KV_RETRIEVE_TRACE") != nullptr) {
+                std::fprintf(stderr, "[kv-recall] pages:");
+                for (std::size_t index = 0; index < sources.size() && index < 24; ++index) {
+                    std::fprintf(stderr, " %u", sources[index].absolute_token / kPagedKVPageSize);
+                }
+                std::fprintf(stderr, " ... tail:");
+                for (std::size_t index = sources.size() > 8 ? sources.size() - 8 : 0; index < sources.size(); ++index) {
+                    std::fprintf(stderr, " %u", sources[index].absolute_token / kPagedKVPageSize);
+                }
+                std::fprintf(stderr, " (of %zu)\n", sources.size());
+                std::fflush(stderr);
+            }
         }
     } else {
         sources = archive->recall_pages(recall_first_token, slots);
     }
     if (sources.empty()) { return; }
+    if (std::getenv("NINFER_KV_DEQ_TRACE") != nullptr) {
+        for (std::size_t index = 0; index < sources.size() && index < 2U; ++index) {
+            KVRetrieval::debug_scan_page_keys(sources[index].source.data(),
+                                              static_cast<std::uint32_t>(sources[index].absolute_token /
+                                                                         kPagedKVPageSize));
+        }
+    }
     for (std::size_t index = 0; index < sources.size(); ++index) {
         const DeviceKVPageHandle destination =
             text_kv_addresses->physical_page(sequence.kv->text, sink_pages + index);
@@ -1760,7 +1999,8 @@ void ProgramImpl::recall_into_tail(SequenceState& sequence) {
             sources[index].source, std::span<const DeviceKVPageHandle>(&destination, 1),
             device.stream);
     }
-    g_kv_recall_armed = true;
+    g_kv_recall_armed  = true;
+    g_kv_recall_loaded = true;
     if (std::getenv("NINFER_KV_ARCHIVE_TRACE") != nullptr) {
         std::fprintf(stderr,
                      "[kv-recall] %zu pages from token %u -> slots [%u,%zu) (mapped %u)\n",
@@ -1772,13 +2012,18 @@ void ProgramImpl::recall_into_tail(SequenceState& sequence) {
 
 void ProgramImpl::commit_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                                      std::uint32_t backend_tokens) {
+    if (std::getenv("NINFER_KV_OP_TRACE") != nullptr) {
+        std::fprintf(stderr, "[kv-op] commit main=%u backend=%u\n", main_tokens, backend_tokens);
+        std::fflush(stderr);
+    }
     if (!sequence.kv || main_tokens > capacity || backend_tokens > capacity ||
         (backend_tokens != 0 && !sequence.kv->backend)) {
         throw std::logic_error("KV commit request is outside the sequence bundle");
     }
     // Resident-window mode: the address space is addressed in compact coordinates, so the committed
     // frontier must be expressed relative to the window base (absolute positions stay untouched).
-    std::uint32_t main_frontier = main_tokens;
+    std::uint32_t main_frontier    = main_tokens;
+    std::uint32_t backend_frontier = backend_tokens;
     static const bool resident_windowed = [] {
         const char* env = std::getenv("NINFER_RESIDENT_TOKENS");
         return env != nullptr && env[0] != '\0';
@@ -1790,10 +2035,21 @@ void ProgramImpl::commit_sequence_kv(SequenceState& sequence, std::uint32_t main
         main_frontier = main_tokens > g_ninfer_kv_window_base_tokens
                             ? main_tokens - g_ninfer_kv_window_base_tokens
                             : 0U;
+        if (sequence.kv->backend && backend_tokens != 0) {
+            backend_frontier = backend_tokens > g_ninfer_kv_window_base_tokens
+                                   ? backend_tokens - g_ninfer_kv_window_base_tokens
+                                   : 0U;
+            const std::uint32_t backend_page_size = static_cast<std::uint32_t>(kPagedKVPageSize);
+            const std::uint32_t backend_capacity =
+                std::min(backend_kv_addresses->entitlement(*sequence.kv->backend),
+                         backend_kv_addresses->mapped_pages(*sequence.kv->backend)) *
+                backend_page_size;
+            if (backend_frontier > backend_capacity) { backend_frontier = backend_capacity; }
+        }
     }
     text_kv_addresses->commit_frontier(sequence.kv->text, main_frontier);
     if (sequence.kv->backend) {
-        backend_kv_addresses->commit_frontier(*sequence.kv->backend, backend_tokens);
+        backend_kv_addresses->commit_frontier(*sequence.kv->backend, backend_frontier);
     }
 }
 
@@ -1828,7 +2084,15 @@ void ProgramImpl::trim_sequence_kv(SequenceState& sequence, std::uint32_t main_t
     }
     text_kv_addresses->destructive_truncate(sequence.kv->text, main_trim);
     if (sequence.kv->backend) {
-        backend_kv_addresses->destructive_truncate(*sequence.kv->backend, backend_tokens);
+        // Same compact coordinates as the commit above: the speculative cache is window addressed.
+        std::uint32_t backend_trim =
+            backend_tokens > g_ninfer_kv_window_base_tokens
+                ? backend_tokens - g_ninfer_kv_window_base_tokens
+                : 0U;
+        const std::uint32_t backend_committed =
+            backend_kv_addresses->committed_frontier(*sequence.kv->backend);
+        if (backend_trim > backend_committed) { backend_trim = backend_committed; }
+        backend_kv_addresses->destructive_truncate(*sequence.kv->backend, backend_trim);
     }
 }
 
@@ -1850,6 +2114,13 @@ void ProgramImpl::release_active_sequence_kv_strict(SequenceState& sequence) noe
           !backend_kv_addresses->can_release_after_deactivate(*sequence.kv->backend)))) {
         std::terminate();
     }
+    if (std::getenv("NINFER_KV_RELEASE_TRACE") != nullptr) {
+        std::fprintf(stderr, "[kv-release] active seq=%p pages=%u frontier=%u\n",
+                     static_cast<const void*>(&sequence),
+                     text_kv_addresses->entitlement(sequence.kv->text),
+                     text_kv_addresses->committed_frontier(sequence.kv->text));
+        std::fflush(stderr);
+    }
     if (sequence.kv->backend &&
         !backend_kv_addresses->release_after_deactivate(*sequence.kv->backend)) {
         std::terminate();
@@ -1867,6 +2138,13 @@ void ProgramImpl::release_sequence_kv_strict(SequenceState& sequence) noexcept {
         (!backend_kv_addresses || !backend_kv_addresses->can_release(*sequence.kv->backend))) {
         std::terminate();
     }
+    if (std::getenv("NINFER_KV_RELEASE_TRACE") != nullptr) {
+        std::fprintf(stderr, "[kv-release] strict seq=%p pages=%u frontier=%u\n",
+                     static_cast<const void*>(&sequence),
+                     text_kv_addresses->entitlement(sequence.kv->text),
+                     text_kv_addresses->committed_frontier(sequence.kv->text));
+        std::fflush(stderr);
+    }
     if (sequence.kv->backend && !backend_kv_addresses->release(*sequence.kv->backend)) {
         std::terminate();
     }
@@ -1877,6 +2155,13 @@ void ProgramImpl::release_sequence_kv_strict(SequenceState& sequence) noexcept {
 
 void ProgramImpl::release_sequence_kv(SequenceState& sequence) noexcept {
     if (!sequence.kv) { return; }
+    if (std::getenv("NINFER_KV_RELEASE_TRACE") != nullptr) {
+        std::fprintf(stderr, "[kv-release] plain seq=%p pages=%u frontier=%u\n",
+                     static_cast<const void*>(&sequence),
+                     text_kv_addresses->entitlement(sequence.kv->text),
+                     text_kv_addresses->committed_frontier(sequence.kv->text));
+        std::fflush(stderr);
+    }
     unbind_sequence_kv(sequence);
     if (sequence.kv->backend && backend_kv_addresses) {
         (void)backend_kv_addresses->release(*sequence.kv->backend);

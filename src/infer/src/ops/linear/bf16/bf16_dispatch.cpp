@@ -4,6 +4,8 @@
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
+void bf16_generic_launch(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
+
 namespace {
 struct ShapeEntry {
     std::int32_t n, k;
@@ -22,7 +24,9 @@ Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t
     for (const auto& entry : kShapes) {
         if (entry.n == n && entry.k == k) return entry.select(t);
     }
-    throw std::invalid_argument("bf16 linear: unsupported shape");
+    // Any other shape falls back to the generic SIMT kernel, which keeps the vision tower off the
+    // 4 bit kernels that used to be its only option.
+    return &bf16_generic_launch;
 }
 
 Bf16Launch select_bf16_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {

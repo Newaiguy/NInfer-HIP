@@ -143,14 +143,17 @@ __device__ __forceinline__ void ldmatrix_x4_t(unsigned& r0, unsigned& r1, unsign
 // register-level repacking of the NVIDIA m16n8k16 fragments. No LDS round
 // trip, no rocwmma dependency (plain attribute-vector carriers).
 //
-// Hardware layouts (empirically verified, probe/lds_relay_probe.cu):
+// Hardware layouts (empirically verified against gfx12 WMMA fragment probes):
 //   A: lane L<16  = row L     K0..7  (u32[i] = {A(L,2i),     A(L,2i+1)})
 //      lane L>=16 = row L-16  K8..15 (u32[i] = {A(L-16,8+2i), A(L-16,9+2i)})
-//   B: lane L<16  = K L     col 0..7  (u32[i] = {B(L,2i),     B(L,2i+1)})
-//      lane L>=16 = K L-16  col 8..15 (u32[i] = {B(L-16,8+2i), B(L-16,9+2i)})
+//   B: lane L<16  = output column L     K0..7  (u32[i] = {B(2i,L),     B(2i+1,L)})
+//      lane L>=16 = output column L-16  K8..15 (u32[i] = {B(8+2i,L-16), B(9+2i,L-16)})
+//      Logical NVIDIA m16n8 only uses columns 0..7; physical columns 8..15 are zeroed.
 //   C: f32[i] @ lane L = D(i + 8*(L>=16), L%16)
 //
-// Validation: 64 random ops vs full CPU reference, max_err = 0.
+// Validation: varied raw 16x16 WMMA A/B vs CPU oracle 0/256 mismatches; chained wrapper
+// GEMM vs CPU oracle 0/128 mismatches. The production packed-attention identity and
+// nonzero segmented CPU-oracle tests are recorded in the vision state/documentation.
 // ============================================================================
 #ifdef NINFER_HW_WMMMA
 
@@ -173,24 +176,19 @@ static __device__ __forceinline__ void mma_hw_pack_ab(float aw[4], float bw[4], 
         aw[i] = __uint_as_float((L < 16u) ? ((rc < 8u) ? v0 : v1) : ((rc < 8u) ? v2 : v3));
     }
     {
-        const unsigned k = (L < 16u) ? L : (L - 16u);   // B: K index 0..15 (destination)
+        // gfx12 B lanes follow the output-column axis: lane L<16 holds column L,
+        // K[0:8], and lane L>=16 holds column L-16, K[8:16]. The logical
+        // NVIDIA fragment is 16x8, so physical columns 8..15 must be zero.
+        const unsigned col = L & 15u;
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            const unsigned cc = (L < 16u) ? (2u * i) : (8u + 2u * i);
-            const unsigned s0 = (4u * cc + (k >> 1u)) & 31u;
-            const unsigned s1 = (4u * (cc + 1u) + (k >> 1u)) & 31u;
-            // NOTE: both registers are shuffled and the k<8 choice is made at the
-            // DESTINATION. Selecting inside the shfl argument would be evaluated with
-            // the SOURCE lane's k (shfl evaluates var per source lane) — wrong register.
-            const unsigned a0w = __shfl_sync(m, b0, s0);
-            const unsigned a1w = __shfl_sync(m, b0, s1);
-            const unsigned b0w = __shfl_sync(m, b1, s0);
-            const unsigned b1w = __shfl_sync(m, b1, s1);
-            const unsigned w0 = (k < 8u) ? a0w : b0w;
-            const unsigned w1 = (k < 8u) ? a1w : b1w;
-            const unsigned lo16 = (k & 1u) ? (w0 >> 16) : (w0 & 0xffffu);
-            const unsigned hi16 = (k & 1u) ? (w1 >> 16) : (w1 & 0xffffu);
-            bw[i] = __uint_as_float((hi16 << 16) | lo16);
+            // NVIDIA B fragment lane 4*col+i carries K pair (2i,2i+1)
+            // in b0 and (8+2i,9+2i) in b1.
+            const unsigned src = 4u * (col & 7u) + i; // keep dummy-column gathers within wave32
+            const unsigned low_k = __shfl_sync(m, b0, src);
+            const unsigned high_k = __shfl_sync(m, b1, src);
+            const unsigned pair = (L < 16u) ? low_k : high_k;
+            bw[i] = __uint_as_float((col < 8u) ? pair : 0u);
         }
     }
 }

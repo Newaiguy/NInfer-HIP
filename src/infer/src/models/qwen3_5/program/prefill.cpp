@@ -232,6 +232,14 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
         const bool text_prefix_fork    = request_plan.text_prefix_fork_required;
         const bool backend_prefix_fork = request_plan.backend_prefix_fork_required;
         if (request_plan.reuse == ReusePath::Root) {
+            const bool same_as_root =
+                transaction.root_text_address.has_value() &&
+                sequence.kv.has_value() && sequence.kv->text == *transaction.root_text_address;
+            if (std::getenv("NINFER_KV_RELEASE_TRACE") != nullptr) {
+                std::fprintf(stderr, "[kv-root] same_as_root=%d before_release\n",
+                             static_cast<int>(same_as_root));
+                std::fflush(stderr);
+            }
             if (transaction.reserved_state_count != state_slots || state_slots == 0 ||
                 !transaction.root_text_address || !transaction.text_activation ||
                 transaction.root_backend_address.has_value() !=
@@ -258,6 +266,11 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                 transaction.root_backend_address.reset();
             }
             sequence.kv.emplace(bundle);
+            if (std::getenv("NINFER_KV_RELEASE_TRACE") != nullptr) {
+                std::fprintf(stderr, "[kv-root] root_valid=%d\n",
+                             static_cast<int>(text_kv_addresses->valid(sequence.kv->text)));
+                std::fflush(stderr);
+            }
         } else if (preserving_source) {
             const bool private_source_ready = transaction.has_source &&
                                               transaction.source_index < continuation_capacity &&
@@ -324,6 +337,11 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                 transaction.root_backend_address.reset();
             }
             sequence.kv.emplace(bundle);
+            if (std::getenv("NINFER_KV_RELEASE_TRACE") != nullptr) {
+                std::fprintf(stderr, "[kv-root] root_valid=%d\n",
+                             static_cast<int>(text_kv_addresses->valid(sequence.kv->text)));
+                std::fflush(stderr);
+            }
         } else {
             if (request_plan.state_fork_required !=
                 transaction.state_fork_destination.has_value()) {
@@ -505,6 +523,14 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             transaction.state_fork_destination.reset();
         };
         if (request_plan.reuse == ReusePath::Root) {
+            const bool same_as_root =
+                transaction.root_text_address.has_value() &&
+                sequence.kv.has_value() && sequence.kv->text == *transaction.root_text_address;
+            if (std::getenv("NINFER_KV_RELEASE_TRACE") != nullptr) {
+                std::fprintf(stderr, "[kv-root] same_as_root=%d before_release\n",
+                             static_cast<int>(same_as_root));
+                std::fflush(stderr);
+            }
             sequence.rewrite_checkpoint = {};
             ordered_reset(sequence);
             sequence.ledger.clear();
@@ -1174,7 +1200,9 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 // final chunk's own attention: replay it so the recalled pages are actually seen
                 // by the forward pass that reads the question.
                 static thread_local bool in_recall_replay = false;
-                if (staged.cursor == staged.prompt_tokens && !in_recall_replay &&
+                bool recall_loaded = ninfer::models::qwen3_5::detail::g_kv_recall_loaded;
+                ninfer::models::qwen3_5::detail::g_kv_recall_loaded = false;
+                if (recall_loaded && staged.cursor == staged.prompt_tokens && !in_recall_replay &&
                     ninfer::models::qwen3_5::detail::KVRetrieval::instance() != nullptr &&
                     (std::getenv("NINFER_KV_REPLAY") == nullptr ||
                      std::getenv("NINFER_KV_REPLAY")[0] != '0')) {
@@ -1186,6 +1214,21 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                         static_cast<std::uint32_t>(result.processed_tokens), std::nullopt, true);
                     in_recall_replay = false;
                     timing.include(replay.timing);
+                    sequence.text_kv_valid = staged.cursor;
+                    // The draft rows still describe the pre-recall forward. Re-running the last
+                    // token rebuilds draft0/ar_hidden from the replayed hidden state.
+                    const char* refresh_env = std::getenv("NINFER_KV_DRAFT_REFRESH");
+                    if (refresh_env != nullptr && refresh_env[0] != '0') {
+                    _putenv_s("NINFER_KV_DRAFT_ONLY", "1");
+                    const std::uint32_t base_before_refresh = schedule_state.text_kv_base;
+                    schedule_state.text_kv_base = staged.cursor - 1U;
+                    const execution::PrefillChunkResult refresh = execution::prefill_text_chunk(
+                        schedule_state, std::span<const TokenId>(staged.prompt.token_ids), 1U,
+                        std::nullopt, false);
+                    _putenv_s("NINFER_KV_DRAFT_ONLY", "");
+                    schedule_state.text_kv_base = base_before_refresh;
+                    timing.include(refresh.timing);
+                    }
                     sequence.text_kv_valid = staged.cursor;
                     std::fprintf(stderr, "[kv-replay] replayed %u tokens from %u\n",
                                  static_cast<unsigned>(result.processed_tokens),

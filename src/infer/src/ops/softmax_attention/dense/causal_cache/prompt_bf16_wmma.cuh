@@ -121,9 +121,13 @@ inline constexpr int kCausalPromptWmmaInt8QBytes =
     kCausalPromptBr * kCausalPromptHeadDim;  // 16 KiB rotated int8 codes
 inline constexpr int kCausalPromptWmmaInt8QScaleBytes =
     kCausalPromptBr * kKVCacheInt8Groups * static_cast<int>(sizeof(__half));  // 512 B
+// KInt4 only: the dequantized K tile lives in the Vt region (Vt is dead until PV), so
+// the whole 16-slice tile is staged once per key block and V overwrites it afterwards.
+// Costs no extra shared memory.
+inline constexpr int kCausalPromptWmmaKtBytes = 0;
 inline constexpr int kCausalPromptWmmaInt8SmemBytes =
     kCausalPromptWmmaSmemBytes + kCausalPromptWmmaInt8QBytes +
-    kCausalPromptWmmaInt8QScaleBytes;
+    kCausalPromptWmmaInt8QScaleBytes + kCausalPromptWmmaKtBytes;
 static_assert(kCausalPromptWmmaInt8SmemBytes <= 64 * 1024,
               "the KInt8 WMMA prompt kernel must fit the gfx12 64 KiB per-block cap");
 
@@ -208,12 +212,24 @@ __device__ __forceinline__ void causal_prompt_wmma_stage_vt(
                     reinterpret_cast<const std::uint8_t*>(cache_v) + code_off);
                 const float vsf = __half2float(cache_v_scale[kv_cache_int4_value_scale_index<
                         Geometry>(physical_page, kv_head, d >> 5, key_off)]);
+#ifdef NINFER_V4_NOALU
+                const float probe_v = 0.5f + static_cast<float>(codes4 >> 31) +
+                                      ((vsf > 1.0e30f) ? 1.0f : 0.0f);
+                (void)probe_v;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    vt[causal_prompt_wmma_vt(d + i, key_l)] =
+                        __float2bfloat16_rn(0.5000f + static_cast<float>(codes4 >> 31) +
+                                            ((vsf > 1.0e30f) ? 0.0625f : 0.0f));
+                }
+#else
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
                     const int nib = (codes4 >> (8 * (i >> 1) + 4 * ((d + i) & 1))) & 0x0fu;
                     vt[causal_prompt_wmma_vt(d + i, key_l)] =
                         __float2bfloat16_rn(static_cast<float>((nib ^ 8) - 8) * vsf);
                 }
+#endif
             } else {
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
@@ -333,6 +349,9 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
     // causal_prompt_store_byte_swizzled) + one fp16 G64 scale per row.
     std::int8_t* q_i8 = reinterpret_cast<std::int8_t*>(ps + Br * Bc);
     __half* q_scale   = reinterpret_cast<__half*>(q_i8 + Br * D);
+    // KInt4 only: the whole dequantized K tile aliases the Vt region (staged before QK,
+    // overwritten by the V staging after QK), so it costs no extra shared memory.
+    __nv_bfloat16* kt = vt;
 
     const int q_block = static_cast<int>(blockIdx.x);
     const int q_head  = static_cast<int>(blockIdx.y);
@@ -441,12 +460,41 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
         const int k0 = kb * Bc;
         physical_page = block_table[kb];
 
-        // ---- stage V(kb) transposed (cache -> Vt tile) -----------------------------
+        // ---- stage the KV tile for this key block ----------------------------------
+        // KInt4: the whole K tile (QKKs slices x Bc keys x 16 dims = exactly the 32 KiB Vt
+        // buffer) is dequantized here into the Vt region, then QK reads it and the V staging
+        // below overwrites it. One __syncthreads per key tile instead of one per ki.
+        // Other storages stage V first (they never need the Vt region for K).
         __syncthreads();  // previous tile's Vt/Ps consumers are done
-        causal_prompt_wmma_stage_vt<Geometry, KFp16, KQ4, KInt8, KInt4>(vt, cache_v, cache_v_scale,
-                                                                  kv_head, k0, max_query_abs,
-                                                                  physical_page, tid, Threads);
-        __syncthreads();
+        if constexpr (KInt4) {
+            for (int ki_s = 0; ki_s < QKKs; ++ki_s) {
+                const int key_local = tid >> 1;                  // 0..Bc-1
+                const int dhalf     = (tid & 1) * 8;             // low / high half of the 16
+                const int key_l     = k0 + key_local;
+                const int page_off  = key_l & kPagedKVPageMask;
+                const int key_page  = block_table[key_l >> kPagedKVPageShift];
+                const int d0        = ki_s * 16 + dhalf;
+                const std::int64_t code_off = kv_cache_int4_value_code_index<Geometry>(
+                    key_page, kv_head, d0 >> 1, page_off);
+                const std::uint32_t codes4 = *reinterpret_cast<const std::uint32_t*>(
+                    reinterpret_cast<const std::uint8_t*>(cache_k) + code_off);
+                const float ksf = __half2float(cache_k_scale[
+                    kv_cache_int8_quant_scale_index<Geometry>(key_page, kv_head, d0 >> 6,
+                                                              page_off)]);
+                __nv_bfloat16* kts = kt + ki_s * Bc * 16 + key_local * 16 + dhalf;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int nib = (codes4 >> (8 * (i >> 1) + 4 * ((d0 + i) & 1))) & 0x0fu;
+                    kts[i] = __float2bfloat16_rn(static_cast<float>((nib ^ 8) - 8) * ksf);
+                }
+            }
+            __syncthreads();
+        } else {
+            causal_prompt_wmma_stage_vt<Geometry, KFp16, KQ4, KInt8, KInt4>(
+                vt, cache_v, cache_v_scale, kv_head, k0, max_query_abs, physical_page, tid,
+                Threads);
+            __syncthreads();
+        }
 
         // ---- S = Q K^T for this warp's 16 rows over all Bc keys ------------------
         // Score tiles in HW C layout: score[tile][slot] with slot i at
@@ -459,6 +507,7 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
         }
 #pragma unroll 2
         for (int ki = 0; ki < QKKs; ++ki) {
+            // KInt4 reads its slice from the fully staged K tile (see the kb loop head).
             // A = Q: one 16B global load (token-major, d contiguous). For the fp16
             // WMMA the 8 bf16 halves are converted to fp16 in registers. KInt8 uses
             // the staged rotated-Q int8 codes raw (no dequant) and contracts them on
@@ -587,32 +636,17 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
                     bw[2] = __uint_as_float(static_cast<unsigned>(ki4.z));
                     bw[3] = __uint_as_float(static_cast<unsigned>(ki4.w));
                 } else if constexpr (KInt4) {
-                    // RotatedInt4 K: 8 values = 4 code bytes + one G64 scale. d0 is a
-                    // multiple of 16 and the K row is 128 packed bytes, so the 4 bytes
-                    // never cross the row (d0>>1 in {0,4,...,124}).
-                    const int d0 = ki * 16 + d_half;
-                    const std::int64_t code_off =
-                        kv_cache_int4_value_code_index<Geometry>(
-                            key_page, kv_head, d0 >> 1, page_off);
-                    const std::uint32_t codes4 = *reinterpret_cast<const std::uint32_t*>(
-                        reinterpret_cast<const std::uint8_t*>(cache_k) + code_off);
-                    const float ksf = __half2float(cache_k_scale[
-                        kv_cache_int8_quant_scale_index<Geometry>(key_page, kv_head, d0 >> 6,
-                                                                  page_off)]);
-                    alignas(16) __nv_bfloat16 bv8[8];
-#pragma unroll
-                    for (int i = 0; i < 8; ++i) {
-                        const int nib = (codes4 >> (8 * (i >> 1) + 4 * ((d0 + i) & 1))) & 0x0fu;
-                        bv8[i] = __float2bfloat16_rn(static_cast<float>((nib ^ 8) - 8) * ksf);
-                    }
-                    const uint4 kv4 = *reinterpret_cast<const uint4*>(bv8);
+                    // KInt4: this k-slice was dequantized once per CTA into `kt` above
+                    // (one thread per (key, 8 dims) pair), so the B fragment is a single
+                    // 16B LDS instead of a scattered 4B code + 2B scale global load.
+                    const int key_local = nt * 16 + (lane & 15);
+                    const uint4 kv4 = *reinterpret_cast<const uint4*>(
+                        &kt[ki * Bc * 16 + key_local * 16 + d_half]);
                     bw[0] = __uint_as_float(kv4.x);
                     bw[1] = __uint_as_float(kv4.y);
                     bw[2] = __uint_as_float(kv4.z);
                     bw[3] = __uint_as_float(kv4.w);
                 } else if constexpr (KQ4) {
-                    // q4_0 K: 8 values = 8 code bytes + 1 scale, dequant per lane
-                    // (d0%32 in {0,8,16,24}, window never crosses blocks).
                     const int d0 = ki * 16 + d_half;
                     const std::int64_t code_off =
                         q4_0_code_offset<Geometry::KVHeads>(
@@ -676,6 +710,15 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
                     wmma16(score[nt], aw, bw, score[nt]);
                 }
             }
+        }
+
+        // ---- KInt4: QK is done with the K tile, stage V over it for PV -------------
+        if constexpr (KInt4) {
+            __syncthreads();
+            causal_prompt_wmma_stage_vt<Geometry, KFp16, KQ4, KInt8, KInt4>(
+                vt, cache_v, cache_v_scale, kv_head, k0, max_query_abs, physical_page, tid,
+                Threads);
+            __syncthreads();
         }
 
         // ---- online softmax over the whole Bc tile (scores all in registers) -----

@@ -25,14 +25,26 @@ namespace {
 
 constexpr std::int32_t kCausalDecodeHeadDim = 256;  // kCausalHeadDim
 
+// AMD port 2026-11-04: multi-token verify batch context. causal_decode_t1_simt_multi_token_launch
+// sets it immediately before its single partial launch and clears it right after, so every other
+// call site (all of which launch grid.z == 1) keeps the exact previous behaviour.
+struct SimtBatchCtx {
+    int tokens      = 1;
+    int acc_stride  = 0;
+    int stat_stride = 0;
+};
+SimtBatchCtx g_simt_batch;
+
 // Partials in the layout the production reducer consumes (acc [D, QHeads, tokens,
 // splits], m/l [QHeads, tokens, splits]).
-Tensor allocate_acc(WorkspaceArena& workspace, std::int32_t q_heads, std::int32_t splits) {
+Tensor allocate_acc(WorkspaceArena& workspace, std::int32_t q_heads, std::int32_t splits,
+                    std::int32_t tokens = 1) {
     // +8 floats tail for NINFER_ATTN_PROFILE stage-cycle accumulation.
-    return workspace.alloc(DType::FP32, {kCausalDecodeHeadDim, q_heads, 1, splits + 8});
+    return workspace.alloc(DType::FP32, {kCausalDecodeHeadDim, q_heads, tokens, splits + 8});
 }
-Tensor allocate_stat(WorkspaceArena& workspace, std::int32_t q_heads, std::int32_t splits) {
-    return workspace.alloc(DType::FP32, {q_heads, 1, splits});
+Tensor allocate_stat(WorkspaceArena& workspace, std::int32_t q_heads, std::int32_t splits,
+                     std::int32_t tokens = 1) {
+    return workspace.alloc(DType::FP32, {q_heads, tokens, splits});
 }
 
 template <typename CacheInput, bool KFp16, bool KQ4, bool KFp8 = false, bool KInt4E8 = false,
@@ -99,12 +111,13 @@ void launch_partials(std::int32_t q_heads, std::int32_t splits, std::int32_t kv_
                          dv_env == nullptr ? "unset" : dv_env);
             std::fflush(stderr);
         }
-        const dim3 sg(q_heads / 2, launch_splits, 1);
+        const int batch_tokens_z = g_simt_batch.tokens;
+        const dim3 sg(q_heads / 2, launch_splits, batch_tokens_z);
         // gfx1201 full-group variant: one CTA per (kv_head, split) covering EVERY q row
         // that shares that kv head (GroupSize = q_heads / kv_heads). The cached K/V row is
         // then decoded+loaded once for GroupSize rows instead of once per 2-row CTA, which
         // removes (GroupSize/2)-fold redundant dequant / load work from the decode step.
-        const dim3 sg_group(kv_heads, launch_splits, 1);
+        const dim3 sg_group(kv_heads, launch_splits, batch_tokens_z);
         constexpr int kGroupRows = CausalD256H24Kv4::QHeads / CausalD256H24Kv4::KVHeads;
         auto* k_scale = cache.k_scale_pages.data != nullptr
                             ? static_cast<__half*>(cache.k_scale_pages.data)
@@ -134,10 +147,13 @@ void launch_partials(std::int32_t q_heads, std::int32_t splits, std::int32_t kv_
         }();
         // NINFER_SKIP_ATTN_SIMT=1 makes the SIMT partial kernel write neutral partials and
         // return, which isolates the K/V read + online softmax cost from the projections.
+        // 3 = keep computing but print per-CTA SM cycles for the int4 key loop
+        // (NINFER_SKIP_ATTN_SIMT=3). Any other non-zero value keeps the old neutral-partial mode.
         static const int simt_skip_attn = [] {
             if (std::getenv("NINFER_SIMT_DBGP") != nullptr) { return 2; }
             const char* e = std::getenv("NINFER_SKIP_ATTN_SIMT");
-            return (e != nullptr && e[0] != '0') ? 1 : 0;
+            if (e == nullptr || e[0] == '0') { return 0; }
+            return (e[0] == '3') ? 3 : 1;
         }();
         if (std::getenv("NINFER_ATTN_OCC") != nullptr) {
             static bool occ_printed = false;
@@ -191,7 +207,8 @@ void launch_partials(std::int32_t q_heads, std::int32_t splits, std::int32_t kv_
                         table_stride, static_cast<const std::int32_t*>(positions.data), scale,
                         static_cast<float*>(partial_acc.data),
                         static_cast<float*>(partial_m.data),
-                        static_cast<float*>(partial_l.data), simt_skip_attn, token_base);
+                        static_cast<float*>(partial_l.data), simt_skip_attn, token_base,
+                        g_simt_batch.acc_stride, g_simt_batch.stat_stride);
             } else {
                 causal_decode_t1_simt_partial_kernel<CausalD256H24Kv4, CacheInput, KFp16, KQ4,
                                                      KFp8, KInt4E8, 2>
@@ -203,7 +220,8 @@ void launch_partials(std::int32_t q_heads, std::int32_t splits, std::int32_t kv_
                         table_stride, static_cast<const std::int32_t*>(positions.data), scale,
                         static_cast<float*>(partial_acc.data),
                         static_cast<float*>(partial_m.data),
-                        static_cast<float*>(partial_l.data), simt_skip_attn, token_base);
+                        static_cast<float*>(partial_l.data), simt_skip_attn, token_base,
+                        g_simt_batch.acc_stride, g_simt_batch.stat_stride);
             }
             {
                 static const bool pdbg_on = [] {
@@ -369,7 +387,8 @@ void launch_partials(std::int32_t q_heads, std::int32_t splits, std::int32_t kv_
                     table_stride, static_cast<const std::int32_t*>(positions.data), scale,
                     static_cast<float*>(partial_acc.data),
                     static_cast<float*>(partial_m.data),
-                    static_cast<float*>(partial_l.data), simt_skip_attn, token_base);
+                    static_cast<float*>(partial_l.data), simt_skip_attn, token_base,
+                        g_simt_batch.acc_stride, g_simt_batch.stat_stride);
             constexpr int kDChunkH16S = 64;
             const dim3 rs(CausalD256H16Kv2::QHeads, div_up(kCausalHeadDim, kDChunkH16S), 1);
             if (token_base == 0) {
@@ -863,11 +882,23 @@ bool causal_decode_t1_simt_multi_token_launch(const Tensor& q, const Tensor& k, 
     if (simt_off) { return false; }
 
     const std::int32_t kv_heads = cache.num_kv_heads;
-    const std::int32_t splits =
-        causal_attention_split_capacity(q_heads, 1, cache.storage, envelope);
-    Tensor partial_acc = allocate_acc(workspace, q_heads, splits);
-    Tensor partial_m   = allocate_stat(workspace, q_heads, splits);
-    Tensor partial_l   = allocate_stat(workspace, q_heads, splits);
+    // AMD debug 2026-11-06: the multi-token verify shares the single-token split capacity, so
+    // raising SmallTMaximumSplits (85 -> 256) for the long-context AR decode also pushed the
+    // verify grid up. NINFER_MT_SPLITS caps it independently so the verify width can be swept
+    // without touching the AR path.
+    std::int32_t splits = causal_attention_split_capacity(q_heads, 1, cache.storage, envelope);
+    {
+        static const int mt_splits_override = [] {
+            const char* e = std::getenv("NINFER_MT_SPLITS");
+            return e != nullptr ? std::atoi(e) : 0;
+        }();
+        if (mt_splits_override > 0 && mt_splits_override < splits) {
+            splits = mt_splits_override;
+        }
+    }
+    Tensor partial_acc = allocate_acc(workspace, q_heads, splits, tokens);
+    Tensor partial_m   = allocate_stat(workspace, q_heads, splits, tokens);
+    Tensor partial_l   = allocate_stat(workspace, q_heads, splits, tokens);
     Tensor q_stage     = workspace.alloc(
         DType::U8, {kv_heads * kDecodeWmmaWarpRows *
                     (kDecodeWmmaD + kKVCacheInt8Groups * static_cast<std::int32_t>(sizeof(__half)))});
@@ -895,6 +926,77 @@ bool causal_decode_t1_simt_multi_token_launch(const Tensor& q, const Tensor& k, 
                          static_cast<unsigned>(envelope.max_visible_keys));
             std::fflush(stderr);
         }
+    }
+    // AMD port 2026-11-04: batched verify.
+    //
+    // The per-token loop below re-scanned the whole KV window once per verify column, which cost
+    // ~2x an AR step at 48K (dw2 35.1 t/s against AR 30.3). One launch with grid.z == tokens puts
+    // every column on the SAME KV pass: each column appends only its own fresh row (owns_fresh_row
+    // is evaluated per column) and masks at its own position. Positions are strictly increasing, so
+    // column t reads rows in [0, pos[t]) while columns > t write rows with pos > pos[t] -- no
+    // column ever observes another column's row and there is no write/read overlap in the cache.
+    const std::int64_t acc_token_stride =
+        static_cast<std::int64_t>(kCausalDecodeHeadDim) * q_heads * (static_cast<std::int64_t>(splits) + 8);
+    const std::int64_t stat_token_stride = static_cast<std::int64_t>(q_heads) * splits;
+    static const bool mt_batch = [] {
+        const char* e = std::getenv("NINFER_MT_BATCH");
+        return e == nullptr || e[0] != '0';
+    }();
+    if (mt_batch) {
+        g_simt_batch.tokens      = tokens;
+        g_simt_batch.acc_stride  = static_cast<int>(acc_token_stride);
+        g_simt_batch.stat_stride = static_cast<int>(stat_token_stride);
+        launch_partials_for_storage<CausalAppendInput>(
+            cache.storage, q_heads, splits, kv_heads, q, q_stage, positions, cache, tab_rows,
+            table_stride, scale, input, partial_acc, partial_m, partial_l, out, 0, stream);
+        static bool mt_batch_printed = false;
+        if (!mt_batch_printed && std::getenv("NINFER_MT_BATCH_DBG") != nullptr) {
+            mt_batch_printed = true;
+            std::fprintf(stderr, "[mt-batch] tokens=%d splits=%d acc_stride=%d stat_stride=%d\n",
+                         tokens, splits, g_simt_batch.acc_stride, g_simt_batch.stat_stride);
+            std::fflush(stderr);
+        }
+        g_simt_batch = SimtBatchCtx{};
+        // The reducer owns one column per launch (it writes out[column] and windows the column's
+        // positions[column_begin]), so only the partial slabs move -- by exactly one token stride.
+        for (std::int32_t t = 0; t < tokens; ++t) {
+            float* racc = static_cast<float*>(partial_acc.data) + t * acc_token_stride;
+            float* rp_m = static_cast<float*>(partial_m.data) + t * stat_token_stride;
+            float* rp_l = static_cast<float*>(partial_l.data) + t * stat_token_stride;
+            const std::int32_t* rpos = static_cast<const std::int32_t*>(positions.data);
+            auto* rout               = static_cast<__nv_bfloat16*>(out.data);
+            if (q_heads == CausalD256H24Kv4::QHeads) {
+                constexpr int kDChunkB = 256;
+                const dim3 rs(CausalD256H24Kv4::QHeads, div_up(kCausalHeadDim, kDChunkB), 1);
+                if (t == 0) {
+                    causal_attention_small_t_reduce_output_kernel<CausalD256H24Kv4, kDChunkB, false,
+                                                                  false, false, false>
+                        <<<rs, 256, 0, stream>>>(racc, rp_m, rp_l, rpos, nullptr, 1, 1, 0, 1,
+                                                 splits, rout);
+                } else {
+                    causal_attention_small_t_reduce_output_kernel<CausalD256H24Kv4, kDChunkB, false,
+                                                                  false, false, true>
+                        <<<rs, 256, 0, stream>>>(racc, rp_m, rp_l, rpos, nullptr, 1, 1, t, 1,
+                                                 splits, rout);
+                }
+            } else {
+                constexpr int kDChunkB16 = 64;
+                const dim3 rs(CausalD256H16Kv2::QHeads, div_up(kCausalHeadDim, kDChunkB16), 1);
+                if (t == 0) {
+                    causal_attention_small_t_reduce_output_kernel<CausalD256H16Kv2, kDChunkB16,
+                                                                  false, false, false, false>
+                        <<<rs, 256, 0, stream>>>(racc, rp_m, rp_l, rpos, nullptr, 1, 1, 0, 1,
+                                                 splits, rout);
+                } else {
+                    causal_attention_small_t_reduce_output_kernel<CausalD256H16Kv2, kDChunkB16,
+                                                                  false, false, false, true>
+                        <<<rs, 256, 0, stream>>>(racc, rp_m, rp_l, rpos, nullptr, 1, 1, t, 1,
+                                                 splits, rout);
+                }
+            }
+        }
+        (void)op;
+        return true;
     }
     static int pdbg_calls = 0;
     for (std::int32_t t = 0; t < tokens; ++t) {

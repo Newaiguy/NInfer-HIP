@@ -1,78 +1,117 @@
-NInfer-HIP 0.1.0-pre-r9
-=======================
+NInfer-HIP 0.1.1
+================
 
 名称        : NInfer-HIP —— NInfer 引擎的 AMD RDNA4 / HIP 移植版
 仓库        : https://github.com/Newaiguy/NInfer-HIP
-发布        : https://github.com/Newaiguy/NInfer-HIP/releases/tag/v0.1.0-pre-r9
+发布        : https://github.com/Newaiguy/NInfer-HIP/releases/tag/v0.1.1
 许可        : Apache-2.0（派生自 https://github.com/Neroued/ninfer，改动见 docs/PATCHLIST.md）
-状态        : 预发布（prerelease v0.1.0-pre-r9，已发布）
-构建时间    : 2026-11-09
+状态        : 正式版（0.1.1）
+构建时间    : 2026-11-12
 目标硬件    : AMD Radeon RX 9070 XT 16GB (RDNA4, gfx1201), 640 GB/s
 运行系统    : Windows 11 26200 (25H2) + HIP SDK 7.2.3 (AMD Software 26.8.1)
 模型        : WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3（官方 v3 单文件 artifact）
-              E:\ninfer-models\Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer
+              E:\infer-models\Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer
               size 15,017,456,896 B（text 11.755GB + vision + mtp + dflash2）
 
-引擎        : ninfer_mini_nordc.exe
-  size      : 191,691,776 B
-  sha256    : 5ae3816e517284efa007d0a46bac08e5986c614f889613739cc050e2c4cdf7ed
+引擎        : infer-mini.exe（CLI / chat，文本 + MTP）
+  size      : 191,703,040 B
+  sha256    : e89fc926bd3026ac38f5c3a92a5c3dd632bbeb4a9d17b89fcda1ed90f47c9924
+
+引擎        : infer-serve.exe（OpenAI 兼容 HTTP 服务，文本 + MTP + 视觉）
+  size      : 192,038,912 B
+  sha256    : 0b6f04c667b0fbd4621404cfcd046d268ba22f9ae5fd3ceae85a268856eb283b
 
 --------------------------------------------------------------------------------
-本版核心：KV 记忆（KV archive + retrieval recall）
+本版核心一：视觉链路修好（三个真缺陷 + 两个权重合同）
 --------------------------------------------------------------------------------
 
-长上下文里被滑出显存的 KV 页不再丢弃：先归档到主机内存；prompt 读完后用最后一个
-query 给所有归档页打分，挑出最相关的一段连续页换回显存，再重放最后一个 chunk。
-目标：长文里"答案在深处"的场景，从答不出来变成答得对。
+0.1.0-pre-r9 的引擎能读图，但空间理解是错的：单色块位置题几乎一律答 top-left，
+纯色/半图/上下分色多数错。本版把整条视觉链路查通并修好，九图回归从 3/9 到 9/9。
 
-启动参数（新增四个，不传则行为与 pre-r7 完全一致）
-  --resident-tokens N   常驻窗口 token 数            默认 20480
-  --sink-tokens N       attention sink token 数      默认 2048
-  --archive-mib N       主机侧归档 arena（MiB）        默认 2048；给这个参数自动开归档
-  --kv-retrieval 1      打开检索召回                   默认 0（关）
+三个真缺陷（都是引擎 bug，不是模型能力问题）
 
-  等价环境变量：NINFER_RESIDENT_TOKENS / NINFER_SINK_TOKENS /
-                NINFER_KV_ARCHIVE_MIB（自动置 NINFER_KV_ARCHIVE=1）/ NINFER_KV_RETRIEVE
-  调优：NINFER_KV_RECALL_PAGES(112) / NINFER_KV_RECALL_BACKOFF(56) / NINFER_KV_REPLAY(1)
+  1. gfx12 WMMA 的 B 操作数打包错（`ops/common/mma.cuh`）
+     硬件 WMMA 的 B 片段按输出列分布（lane L 的列 = L&15、K 半区由 L<16 决定），
+     原实现按行分布打包，导致 packed attention 的输出只剩 1/8 通道、其余 7/8 恒为 0。
+     定位方式：identity softmax（Q=K=0、段长 1）时输出应等于 V，实测 9216 个元素里
+     错 8064 个，正好 7/8；再用孤立 16x16x16 identity GEMM 在软/硬两条 MMA 路径上对拍
+     （软路径 0 错、硬路径 120/128 错），把范围锁死到硬件片段映射。
+     修复后用同一组探针验证：identity 与随机数据、tile 16/32/64 全部 0/9216 错。
 
-推荐（96K 以上长文，问题在末尾）
-  --kv rk4v4-e8 --ctx 262144 --resident-tokens 20480 --sink-tokens 2048 \
-  --archive-mib 4096 --kv-retrieval 1
+  2. paired D=1152 LayerNorm 的 warp shuffle UB（`ops/kernel/layer_norm.cuh`）
+     诊断统计分支在 `if (threadIdx.x == 0)` 里用全 mask 调 `__shfl_sync`，
+     单 lane 参与整 warp shuffle 属未定义行为，使专用核输出的 mean/count 变垃圾。
+     正式 `test_layer_norm.cpp` 默认路径四个对齐 D=1152 用例全部产出非有限值；
+     修掉后默认路径 `OK layer_norm correctness`，真实图片的 norm2 与独立 NumPy
+     对拍从 rel 0.067 降到 1.5e-5（903168 个元素仅 29 个非位精确）。
 
-实测（96K 正文，needle 埋 25/50/75/92% 深度）
-  25% / 50% / 75%：检索关 = miss，检索开 = HIT（口令逐字符命中）
-  92%           ：两种情况都 HIT，且输出逐 token 相同（无回归）
-  归档开销      ：prefill 801.997 → 800.446，decode 33.14 → 33.62（噪声内），输出逐 token 相同
-  GATE 回归     ：8k 35.63/931.4 · 96k 24.90/422.1 · mtp 80.21/842.2（检索默认关闭，无回退）
+  3. merger 输出被默认 0.1 缩放（`models/qwen3_5/execution/vision.cpp`）
+     merger 的训练目标就是把视觉特征投到文本 embedding 的同一空间，拼接必须原幅；
+     默认再乘 0.1 后，大面积内容（纯色、半图、上下分色、三色条、四象限）仍读得出来，
+     但**单个色块的位置信号被压到读不出来**，模型退化成文本先验 → 一律答 top-left。
+     本版默认不缩放；只有显式设置 NINFER_VISION_SCALE 时才按给定因子缩放。
 
-限制（务必先读）
-  召回是启发式：页均值打分定位误差约 ±8 页，取 112 页连续段兜住
-  必须读完 prompt 才能召回（query 取最后一个 token）；问题不在末尾没有保证
-  额外显存：页摘要 ~168 MB（1311 页）+ 环形缓冲 64 MB；主机内存：最多 --archive-mib
-  只在 needle 语料上验证过（多跳推理、整篇摘要无数据）
-  详见 docs/KVMEM.md
+两个权重合同（BF16 覆盖档专用）
+
+  4. patch embedding 是**双帧**权重：mmproj 里 `v.patch_embd.weight` 与
+     `v.patch_embd.weight.1` 各一份（t0/t1）。原导出只取 t0 并把同一通道平面复制到
+     两个 temporal 槽；正确排列是按通道交错 `[c0t0, c0t1, c1t0, c1t1, c2t0, c2t1]`
+     （与 processor 的 `[c][t]` payload 顺序一致），并按引擎 loader 的转置约定落盘。
+  5. layer-norm gamma 曾被多加 1.0：导出的是最终 gamma（含负值、均值 0.47~1.31），
+     不是 delta；多加 1 会让全 BF16 档塌成银灰（quad4 四块全银）。
+     二分法定位：patch+attention、patch+mlp、patch+norm_bias 都正常，
+     只有 patch+norm_weight 破坏；修掉后全 BF16 档与默认档一致。
+
+验证（固定 temperature=0.0、seed=42，每例独立进程）
+
+  九图回归（红块/四象限/三色条/左右分色/上下分色，含四个单色块位置题）
+    默认档（artifact 量化视觉层）      9/9
+    patch-only BF16 覆盖档             9/9
+    全 BF16 视觉覆盖档                 9/9
+  真实照片交叉验证（Wikimedia 原图 7 张、16 问：颜色/计数/OCR/形状/物体/地标/事件/
+  字母数/灯罩数/朝向/轮子数）
+    本引擎 16/16 · llama.cpp（BF16 mmproj）16/16 —— 用更差的量化权重打平
+  泛化用例（不在九图集内，全部正确）：320/480 非正方形、一图两目标、一请求两图、
+  48x48 小目标
 
 --------------------------------------------------------------------------------
-关键指标（pre-r7 基线，本版未回退）
+本版核心二：OpenAI 兼容服务（新增）
+--------------------------------------------------------------------------------
+
+`infer-serve.exe` 是一个自包含的 HTTP 服务，实现 OpenAI Chat Completions 兼容接口：
+
+  POST /v1/chat/completions     支持 stream=true 的 SSE 真流式（首字节约 0.05 s）、
+                                content 里混排 {"type":"text"} 与 {"type":"image_url"}
+  GET  /v1/models               列出可用模型名
+  GET  /health                  存活与视觉是否可用
+
+  图像输入支持 PNG / JPEG / GIF / BMP / TIFF（WIC 解码，无外部依赖；带 alpha 时合成白底），
+  自动缩放到模型约定的 448 网格。
+
+  启动（路径按本机调整）：
+    set PATH=C:\Program Files\AMD\ROCm\7.2\bin;%PATH%
+    infer-serve.exe --model E:\infer-models\Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer ^
+                    --ctx 32768 --kv rk4v4-e8 --spec mtp --draft-tokens 2 --port 8099
+
+  源码入口：harness/serve_mini_main.cpp；构建脚本：harness/build_serve.py
+  （不依赖 CMake，直接用 ninfer_hip.lib 链接）。
+
+--------------------------------------------------------------------------------
+关键指标（本版实测，均未回退）
 --------------------------------------------------------------------------------
 
 graph on，KV = rk4v4-e8（int4 K / int4 V），--ctx 贴紧实际 prompt 长度
-  decode AR      : 37.3 @2.8K(ctx8K) · 35.4 @5.8K(ctx16K) · 32.3 @31K(ctx32K)
-                   30.0 @48K(ctx49K) · 28.4 @65K(ctx66K) · 25.2 @96K(ctx98K)
-                   **22.9 @126K(ctx126464)**
-  decode MTP dw2 : 77.8 @2.8K（2.15x）· 64.5 @24K（2.0x）· 41.6 @65K（1.47x）
-                   34.0 @96K（1.35x）· 126K 不可用
-  prefill        : 848 @5.8K · 610 @31K · 505 @48K · 442 @65K · 346 @96K · 294 @126K
-  正确性         : 5.8K / 31K / 48K / 65K / 98K / 126K needle 全命中
+  GATE 8k        : decode 36.50 t/s   prefill 985.9   （基线 33.63 / 937.4，+8.5% / +5.2%）
+  GATE 96k       : decode 25.30 t/s   prefill 428.4   （基线 24.28 / 423.4，+4.2% / +1.2%）
+  GATE mtp       : decode 82.11 t/s   prefill 891.3   （基线 77.90 / 860.2，+5.4% / +3.6%）
+  长上下文       : 192K（196,427 token，窗口 32768）逐 token 正确，prefill 535.7 / decode 33.8
+                   128K（130,700 token）544.3 / 34.4
+  GDN 前向       : 96K 档较 r9 提升 ~4%，来自 GDN chunked 路径的算子修复
 
-本版核心结论（务必先读）
-  --ctx 必须 = prompt + max_new，一个 token 都别多开
-    126K 语料：--ctx 131072 → 10.12 t/s；--ctx 126464 → 22.91 t/s（2.26x）
-  根因：KV 池按 --ctx 一次性全量提交（int4 17920 B/token），越过 Windows 驻留预算
-        （约 12.6~13.6 GiB，当天漂移 ~1 GiB）后整池降级到系统内存，走 PCIe ~30 GB/s
-  开了 --resident-tokens 窗口模式后，驻留量由窗口决定，不受这条约束
+--------------------------------------------------------------------------------
+推荐配置（按真实上下文选，--ctx 必须贴近 prompt+max_new）
+--------------------------------------------------------------------------------
 
-推荐配置（按真实上下文选）
   真实 <=8K      : --ctx 16384  --kv rk4v4-e8 --spec mtp --draft-tokens 2  -> 77.8 t/s
   真实 16-32K    : --ctx 32768  --spec mtp --draft-tokens 2                 -> 64.5 t/s
   真实 48K       : --ctx 49152  --spec mtp --draft-tokens 2                 -> 34.9 t/s
@@ -81,44 +120,62 @@ graph on，KV = rk4v4-e8（int4 K / int4 V），--ctx 贴紧实际 prompt 长度
   真实 126K      : --ctx 126464 （必须关 MTP）                              -> 22.9 t/s
   长文 + KV 记忆 : --ctx 262144 --resident-tokens 20480 --sink-tokens 2048
                    --archive-mib 4096 --kv-retrieval 1
+  图像问答       : infer-serve.exe + 上面的 serve 启动行（--spec mtp 可开）
 
-未修（见 docs/PATCHLIST.md 末节）
-  多模态（图像输入）：本版 harness 无入口（artifact 有 vision、引擎有 enable_vision 通路）
+--------------------------------------------------------------------------------
+未修 / 已知限制（见 docs/PATCHLIST.md 末节）
+--------------------------------------------------------------------------------
+
+  NVFP4 TMA 两个 TU（nvfp4_w4a4_tma.cu / nvfp4_linear_swiglu_w4a4_tma.cu）属 CUDA-only
+    的独立 CMake target `ninfer_nvfp4_non_rdc`，ROCm 构建不编；harness/full_rebuild.py
+    会无差别扫 .cu，故会报 CUtensorMap/CUresult 未定义，属预期，不影响 ROCm 产物
+  serve_mini 未注册进 ninfer/apps/CMakeLists.txt，发布用 harness/build_serve.py 独立构建
   int8 KV 非确定性 · fp8 KV 的 QK 是 __builtin_trap() 桩 · dflash2 坏路径
   126K 以上 MTP（差 0.5 GB 预算）· prefill >=64K 落后 llama · 256K 需 KV offload
   短上下文 45 t/s 未达（AR 37.3，物理上限 54）
+  召回是启发式：页均值打分定位误差约 ±8 页，取 112 页连续段兜住；必须读完 prompt
+    才能召回（query 取最后一个 token）；只在 needle 语料上验证过
 
-重要用法
+--------------------------------------------------------------------------------
+重要用法与安全铁律
+--------------------------------------------------------------------------------
+
   --ctx 必须贴近实际 prompt 长度（126K：ctx126464 → 22.9；ctx131072 → 10.1）
   MTP 只用 --draft-tokens 2；>=100K 真实上下文关 MTP
-  引擎 exe 裸双击需要 ROCm DLL 在 PATH：chat.bat 已自动补
-
-安全铁律
+  引擎 exe 裸双击需要 ROCm DLL 在 PATH：bin/chat.bat 已自动补
   绝不对卡在 GPU 上的引擎进程 Stop-Process（会让 GPU 队列永久卡死 → 黑屏硬复位）
   不要跑 --no-graph + NINFER_PROFILE_* + --spec mtp 组合
   扫测进行中禁止编译/链接（构建会 taskkill 引擎进程并改写 exe）
 
+--------------------------------------------------------------------------------
 文档
-  README.md              能力状态、KV 记忆用法、快速开始、已知坑
+--------------------------------------------------------------------------------
+
+  README.md              能力状态、KV 记忆用法、视觉用法、快速开始、已知坑
+  docs/VISION.md         视觉链路的用法、环境变量、九图回归、真实照片交叉验证
+  docs/VISION_STATE.md   视觉调查全过程与结论订正（含被否证的假设清单）
   docs/KVMEM.md          KV 记忆的实现、参数、四次证伪过程、实测
   docs/VALIDATION.md     正确性/速度矩阵、MTP 倍率、llama 对照、物理上限
   docs/PERF-CAPACITY.md  --ctx 台阶与驻留预算根因
-  docs/CHANGELOG.md      pre-r1 ~ pre-r8 变更
+  docs/CHANGELOG.md      pre-r1 ~ 0.1.1 变更
   docs/PATCHLIST.md      逐文件改动 + 回滚点 + 未修技术债
   docs/BUILD.md          单 TU 构建、跑测外哨、环境变量速查
+  harness/build_serve.py serve_mini 的独立构建脚本
 
-------------------------------------------------------------------------------
-r9 变更摘要（2026-11-09）
-------------------------------------------------------------------------------
-1. KV 记忆 × MTP 打通：verify 注意力 envelope 改紧凑坐标、MTP 配额按窗口 entitlement、
-   投机缓存随主 KV 同步滑页、verify RoPE 用绝对位置。16,814 token 档 decode 52.9 t/s。
-2. 修 ensure_sequence_kv_mapped() 解引用空 backend optional 的致命 bug（曾使所有窗口
-   用例在第一个 chunk 前抛 "KV address-space handle is stale"）。
-3. 长上下文：192K（196,427 token，窗口 32768）逐 token 正确，prefill 535.7 / decode 33.8；
-   128K（130,700 token）544.3 / 34.4；推荐窗口 >= 32768（16K 窗口在 192K 上不可用）。
-4. 与 llama.cpp kvmem 同机同模型五档对比：192K 档 prefill +59% / decode +52%。
-5. 已知问题（P3，暂不修）：召回生效档位的末位停止符可能由 248046 变 248044，
-   两者同属 StopToken、正文与速度无影响；详见 docs/KVMEM.md §10。
+--------------------------------------------------------------------------------
+0.1.1 变更摘要（2026-11-12）
+--------------------------------------------------------------------------------
 
-二进制 sha256 : 5ae3816e517284efa007d0a46bac08e5986c614f889613739cc050e2c4cdf7ed
-二进制大小    : 191,730,688 B
+1. 修 gfx12 WMMA B 操作数打包：packed attention 不再丢 7/8 输出通道；
+   新增正式回归（`tests/ops/softmax_attention/plain_and_packed.cpp` 增加段长 1 用例）。
+2. 修 paired D=1152 LayerNorm 的单 lane 全 mask shuffle UB：视觉与文本的 norm2 恢复正确。
+3. 视觉 merger 默认不再缩放 0.1（仅 NINFER_VISION_SCALE 显式开启时缩放）：空间理解修好。
+4. 视觉 BF16 覆盖档：补双帧 patch 权重与 [c][t] 交错、去掉 norm gamma 的 +1.0，
+   三档（默认/patch-only/全 BF16）九图各 9/9。
+5. 新增 OpenAI 兼容服务 infer-serve.exe：SSE 真流式 + WIC 图像解码 + 视觉输入。
+6. 修 GDN chunked 的 `mma16_swiz_x_raw` 先用后声明（干净 CMake 构建会失败）。
+7. VISION 文档重写：结论、证据、被否证的假设、可复用的对拍工具。
+
+二进制 sha256 : e89fc926bd3026ac38f5c3a92a5c3dd632bbeb4a9d17b89fcda1ed90f47c9924 (infer-mini.exe)
+                0b6f04c667b0fbd4621404cfcd046d268ba22f9ae5fd3ceae85a268856eb283b (infer-serve.exe)
+二进制大小    : 191,703,040 B / 192,038,912 B

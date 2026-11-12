@@ -118,3 +118,57 @@
   （`SequenceCapacityCurve` 要求 pages 落在 [minimum, maximum] 区间），模型 curve 里 pool 与 envelope 绑死。
 - 后置牺牲品显存（`NINFER_DUMMY_MB`）：不改变快态、也不救慢态。
 - cudaEvent 分段 profile 表（`NINFER_PROFILE_DECODE` 的 per-op 行）：数值不可信，只用 `[prof-decode] ... layers/norm+lmhead/step-total`。
+## 0.1.1 追加（2026-11-12）
+
+### src/ops/common/mma.cuh
+- **gfx12 WMMA 的 B 操作数打包修正**：硬件 WMMA 的 B 片段按**输出列**分布——lane L 持有列
+  `L & 15`，K 半区由 `L < 16`（K[0:8]）还是 `L >= 16`（K[8:16]）决定。原实现按行打包，
+  导致 packed attention 的输出只有 1/8 通道非零。现为
+  `col = L & 15; src = 4 * (col & 7) + i;` 取 `b0`/`b1` 后按 `L < 16` 选择，
+  并把逻辑 n8 之外的列（`col >= 8`）置零以保持 dummy 列不引入额外 gather。
+- C 片段的 seed/read 保持原文档映射（`D(i + 8*(L>=16), L%16)`）不变；
+  另有一版「按替代 C 映射」的实验已完整回退，不要再用。
+- 验证：孤立 16×16×16 identity GEMM（软 MMA 0 错 / 硬 WMMA 120 错）→ 修复后两者 0 错；
+  链接型 packed attention identity 探针 tile 16/32/64 全 `mismatches=0/9216`；
+  非零 Q/K/V 8-token 双段对拍 `rel_l2=0.00186 / max_error=0.00516`。
+
+### src/ops/kernel/layer_norm.cuh
+- **paired D=1152 专用核的 shuffle UB**：诊断统计分支原为
+  `if (threadIdx.x == 0) { g_ln_stat[3] = __shfl_sync(0xffffffffu, local.count, 0); }`，
+  单 lane 参与全 mask shuffle 属未定义行为，使专用核输出的统计量变垃圾。
+  改为 lane 0 直接读已约简的 `local.count`。
+
+### src/models/qwen3_5/execution/vision.cpp
+- **merger 输出默认不再缩 0.1**：改为仅当显式设置 `NINFER_VISION_SCALE` 且因子有效时缩放。
+  原因：merger 的输出本就与文本 embedding 同空间，压 1/10 后单色块的位置信号被压没，
+  模型退化成文本先验（位置题一律答 top-left）。
+- **BF16 覆盖加载器**：patch embedding 支持双帧权重（`[c][t]` 交错 + loader 转置约定）；
+  layer-norm 与 post_ln 的 gamma/beta 改为**逐位拷贝、不加偏移**（此前多加 1.0，
+  使全 BF16 档塌成银灰）。实验开关 `NINFER_VISION_NORM_PLUS_ONE` 删除。
+
+### src/models/qwen3_5/frontend/processor.cpp
+- `swap_hw` 默认改成与参考实现一致（`swap_env != nullptr && swap_env[0] != '0'`），
+  此前未设置环境变量时默认交换 h/w。
+
+### src/ops/linear_attention/gated_delta_net/chunked/prepare_wy_wu.cuh
+- dispatcher `mma16_swiz_x_raw_d` 引用其后才定义的 `mma16_swiz_x_raw`，补前向声明。
+  干净 CMake 构建此前会直接失败（`use of undeclared identifier 'mma16_swiz_x_raw'`），
+  增量构建因为用着陈旧 obj 而看不出来。
+
+### src/models/qwen3_5/program/storage/{kv_archive.h,kv_archive.cpp,kv_retrieval.h,kv_retrieval.cu,context.cpp}
+- KV 归档 + 检索召回（r9 已发布，本版未改语义），仅随视觉/服务一起发布。
+
+### src/media/decode/decode_stub.cpp
+- 换成 WIC 实现：PNG / JPEG / GIF / BMP / TIFF；带 alpha 时合成白底；无外部依赖
+  （不再需要 FFmpeg / zlib）。
+
+### src/ops/linear/bf16/bf16_generic.cu、bf16_dispatch.cpp
+- BF16 视觉覆盖档的通用 GEMM 回退路径（白名单未命中时走它）。
+
+### harness/serve_mini_main.cpp、harness/build_serve.py
+- 新增 OpenAI 兼容服务源码与独立构建脚本（不注册进 CMake，见 docs/PATCHLIST 之外的说明）。
+
+### harness/full_rebuild.py
+- 归档改用 llvm-ar 响应文件（对象数量会触发 `WinError 206 文件名或扩展名太长`）。
+- 注意：**必须**用 `build/_rearchive_current.py` 归档，`full_rebuild.py` 的"归档全部 obj"
+  路径会把探针/重复 obj 一起进库，导致 `duplicate symbol: ternary_dispatch_basis…`。

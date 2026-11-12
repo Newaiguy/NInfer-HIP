@@ -11,3 +11,4 @@ build/
 *.ninfer
 *.gguf
 *.safetensors
+MANIFEST.sha256

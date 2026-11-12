@@ -4,6 +4,8 @@
 #include "core/device.h"
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
@@ -17,7 +19,7 @@ void layer_norm_launch(const Tensor& x, const Tensor& weight, const Tensor& bias
     if (rows > std::numeric_limits<unsigned>::max()) {
         throw std::overflow_error("layer_norm: launch grid exceeds CUDA limit");
     }
-    const bool paired = x.ne[0] == 1152 && ((reinterpret_cast<std::uintptr_t>(x.data) |
+    const bool paired = std::getenv("NINFER_LN_GENERIC") == nullptr && x.ne[0] == 1152 && ((reinterpret_cast<std::uintptr_t>(x.data) |
                                              reinterpret_cast<std::uintptr_t>(weight.data) |
                                              reinterpret_cast<std::uintptr_t>(bias.data) |
                                              reinterpret_cast<std::uintptr_t>(out.data)) &
@@ -31,6 +33,15 @@ void layer_norm_launch(const Tensor& x, const Tensor& weight, const Tensor& bias
                                                 static_cast<const __nv_bfloat162*>(bias.data),
                                                 static_cast<__nv_bfloat162*>(out.data), rows, eps);
         CUDA_CHECK(cudaGetLastError());
+    if (std::getenv("NINFER_LN_TRACE") != nullptr) {
+        static int calls = 0;
+        float stat[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+        hipStreamSynchronize(stream);
+        hipMemcpyFromSymbol(stat, g_ln_stat, sizeof(stat));
+        std::fprintf(stderr, "[ln] #%d rows=%lld var=%.2f mean=%.3f v0=%.4f cnt=%.0f\n",
+                     calls++, static_cast<long long>(rows), stat[0], stat[1], stat[2], stat[3]);
+        std::fflush(stderr);
+    }
         return;
     }
     layer_norm_kernel<block><<<static_cast<unsigned>(rows), block, 0, stream>>>(

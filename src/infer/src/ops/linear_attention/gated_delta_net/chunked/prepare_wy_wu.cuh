@@ -236,6 +236,11 @@ __device__ __forceinline__ void mma16_raw_x_swiz_d(float D[8], int lane,
 #endif
 }
 
+// Defined below; declared here because the dispatcher above it cites it.
+__device__ __forceinline__ void mma16_swiz_x_raw(float D[8], int lane, SmemTile<BT> M_view,
+                                                 int M_row_off, int M_col_off,
+                                                 const float* __restrict__ B_buf);
+
 __device__ __forceinline__ void mma16_swiz_x_raw_d(float D[8], int lane, SmemTile<BT> M_view,
                                                    int M_row_off, int M_col_off,
                                                    const float* __restrict__ B_buf) {

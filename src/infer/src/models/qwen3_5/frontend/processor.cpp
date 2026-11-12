@@ -248,6 +248,23 @@ void append_patch(const std::vector<const media::decode::Image*>& frames, int gr
         throw std::logic_error("Vision patch writer exceeded its allocation");
     }
     const auto& lut            = normalization_lut();
+    // The tower reads the three payload channels in a rotated order; the permutation below restores
+    // a straight R, G, B source order and is enabled when the caller asks for it.
+    int channel_source[3] = {0, 1, 2};
+    if (const char* mode = std::getenv("NINFER_MEDIA_CHANNEL"); mode != nullptr) {
+        // Each digit names the source channel that lands in that payload slot, so "bgr" writes the
+        // source blue plane into slot 0. Sweeping all six permutations finds the order the tower
+        // actually expects without touching the maths.
+        static const char* const kPermutations[6] = {"rgb", "rbg", "grb", "gbr", "brg", "bgr"};
+        for (const char* candidate : kPermutations) {
+            if (std::strncmp(mode, candidate, 3) == 0) {
+                for (int slot = 0; slot < 3; ++slot) {
+                    channel_source[slot] = candidate[slot] == 'r' ? 0 : (candidate[slot] == 'g' ? 1 : 2);
+                }
+                break;
+            }
+        }
+    }
     std::uint16_t* destination = out.data() + cursor;
     std::size_t local          = 0;
     for (int channel = 0; channel < 3; ++channel) {
@@ -259,7 +276,7 @@ void append_patch(const std::vector<const media::decode::Image*>& frames, int gr
                     (static_cast<std::size_t>(grid_y * kPatch + y) * frame.width +
                      grid_x * kPatch) *
                         3 +
-                    channel;
+                    channel_source[channel];
                 for (int x = 0; x < kPatch; ++x) {
                     destination[local++] = lut[source[static_cast<std::size_t>(x) * 3]];
                 }
@@ -312,6 +329,23 @@ Prepared prepare_image(std::span<const std::uint8_t> bytes, const ProcessorOptio
     resize_bicubic(image, size, control);
     std::size_t cursor = 0;
     const std::vector<const media::decode::Image*> frames{&image, &image};
+    if (std::getenv("NINFER_VISION_TRACE") != nullptr) {
+        // Colours have to survive decode + resize + patchify; a grey payload here means the loss is
+        // before the vision tower, not inside it.
+        double sums[3] = {0.0, 0.0, 0.0};
+        const std::size_t samples = image.rgb.size() / 3U;
+        for (std::size_t index = 0; index < samples; ++index) {
+            for (int channel = 0; channel < 3; ++channel) {
+                sums[channel] += image.rgb[index * 3U + static_cast<std::size_t>(channel)];
+            }
+        }
+        const std::size_t divisor = samples == 0 ? 1 : samples;
+        std::fprintf(stderr, "[vision] grid=%dx%d resized=%dx%d rgb_mean=%.1f/%.1f/%.1f\n", gh, gw,
+                     size.h, size.w, sums[0] / static_cast<double>(divisor),
+                     sums[1] / static_cast<double>(divisor),
+                     sums[2] / static_cast<double>(divisor));
+        std::fflush(stderr);
+    }
     for (int block_y = 0; block_y < gh / kMerge; ++block_y) {
         check_preparation_control(control);
         for (int block_x = 0; block_x < gw / kMerge; ++block_x) {
@@ -324,6 +358,21 @@ Prepared prepare_image(std::span<const std::uint8_t> bytes, const ProcessorOptio
         }
     }
     if (cursor != elements) { throw std::logic_error("Vision patch writer left a short payload"); }
+    if (std::getenv("NINFER_VISION_TRACE") != nullptr && !out.payload->mutable_span().empty()) {
+        // Channel-major patch payload: sample pixel 0 of each channel to prove the colours survived
+        // the normalisation LUT rather than collapsing to grey.
+        const std::uint16_t* payload = out.payload->mutable_span().data();
+        float sample[3]              = {0.0F, 0.0F, 0.0F};
+        for (int channel = 0; channel < 3; ++channel) {
+            const std::uint16_t bits =
+                payload[static_cast<std::size_t>(channel) * kPatch * kPatch * kTemporal];
+            std::uint32_t wide = static_cast<std::uint32_t>(bits) << 16;
+            std::memcpy(&sample[channel], &wide, sizeof(float));
+        }
+        std::fprintf(stderr, "[vision-patch] c0=%.4f c1=%.4f c2=%.4f\n", sample[0], sample[1],
+                     sample[2]);
+        std::fflush(stderr);
+    }
     return out;
 }
 
@@ -683,16 +732,39 @@ void assign_positions(ProcessedInput& output,
         std::fill(output.token_types.begin() + static_cast<std::ptrdiff_t>(run.tokens.begin),
                   output.token_types.begin() + static_cast<std::ptrdiff_t>(end),
                   static_cast<std::uint8_t>(run.modality));
-        std::size_t index = run.tokens.begin;
+        // The height/width axes of the multimodal RoPE are relative to the image itself: the text
+        // cursor only seeds the temporal axis. Anchoring them on the cursor shifted every vision
+        // token by the prefix length and left the tower able to see tone but not layout.
+        const char* zero_env = std::getenv("NINFER_VISION_POS_ZERO");
+        const bool pos_zero  = zero_env == nullptr || zero_env[0] != '0';
+        if (std::getenv("NINFER_BUILD_MARKER") != nullptr) { std::fprintf(stderr, "[vision-build] marker v1\n"); }
+        const std::int32_t hw_base = pos_zero ? 0 : current;
+        // Tokens are merged cells in raster order; the axis ids therefore advance by one per cell.
+        // The reference (third_party/upstream-ninfer .../frontend/processor.cpp assign_positions)
+        // writes height to axis 1 and width to axis 2, with width advancing fastest. Keep that as
+        // the default; NINFER_VISION_HW_SWAP=1 exists only for A/B diagnosis.
+        const char* swap_env = std::getenv("NINFER_VISION_HW_SWAP");
+        const bool swap_hw   = swap_env != nullptr && swap_env[0] != '0';
+        std::size_t index    = run.tokens.begin;
         for (int y = 0; y < gh; ++y) {
             for (int x = 0; x < gw; ++x, ++index) {
                 set(0, index, current);
-                set(1, index, current + y);
-                set(2, index, current + x);
-                maximum = std::max({maximum, current, current + y, current + x});
+                set(1, index, hw_base + (swap_hw ? x : y));
+                set(2, index, hw_base + (swap_hw ? y : x));
+                maximum = std::max({maximum, current, hw_base + y, hw_base + x});
             }
         }
-        current += std::max(gh, gw);
+        // Only the temporal axis advances across a media item: the reference indexes the image tokens
+        // at the text cursor and resumes text one temporal step later, not after the whole grid.
+        const char* tstep_env = std::getenv("NINFER_VISION_TSTEP");
+        if (tstep_env != nullptr && std::strcmp(tstep_env, "grid") == 0) {
+            current += std::max(gh, gw);
+        } else {
+            const std::int32_t tstep = tstep_env == nullptr
+                                           ? item.grid.t
+                                           : std::max(1, static_cast<int>(std::strtol(tstep_env, nullptr, 10)));
+            current += tstep;
+        }
         cursor = end;
     }
     assign_text(cursor, length);

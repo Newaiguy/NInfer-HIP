@@ -2589,8 +2589,35 @@ bool ProgramImpl::isolated_request_feasible(const RequestBasePlan& base) const n
                value.host.state_slots <= limit.host.state_slots &&
                value.host.kv_bytes <= limit.host.kv_bytes;
     };
-    return fits(base.impl_->root_demand.physical_peak_additional, capacity) &&
-           fits(base.impl_->root_demand.final_added, capacity);
+    // Resident-window mode (Leg B): a request may outgrow the resident page pool -- the overflow is
+    // served by sliding the window -- so its page demand is bounded by the pool, not by its length.
+    static const bool resident_windowed = [] {
+        const char* env = std::getenv("NINFER_RESIDENT_TOKENS");
+        return env != nullptr && env[0] != '\0';
+    }();
+    const auto clamp_window = [](detail::PhysicalResources value,
+                                 detail::PhysicalResources limit) noexcept {
+        if (resident_windowed) { value.device.main_kv_pages = limit.device.main_kv_pages; }
+        return value;
+    };
+    const auto dump = [&](const char* tag, detail::PhysicalResources v) noexcept {
+        const char* e = std::getenv("NINFER_ADMIT_TRACE");
+        if (e == nullptr || e[0] == '0') { return; }
+        v = clamp_window(v, capacity);
+        std::fprintf(stderr, "[admit] %s %u/%u %u/%u %u/%u %u/%u %u/%u %llu/%llu\n", tag,
+                     v.device.active_lanes, capacity.device.active_lanes,
+                     v.device.state_slots, capacity.device.state_slots,
+                     v.device.main_kv_pages, capacity.device.main_kv_pages,
+                     v.device.backend_kv_pages, capacity.device.backend_kv_pages,
+                     v.host.state_slots, capacity.host.state_slots,
+                     (unsigned long long)v.host.kv_bytes,
+                     (unsigned long long)capacity.host.kv_bytes);
+        std::fflush(stderr);
+    };
+    dump("peak", base.impl_->root_demand.physical_peak_additional);
+    dump("final", base.impl_->root_demand.final_added);
+    return fits(clamp_window(base.impl_->root_demand.physical_peak_additional, capacity), capacity) &&
+           fits(clamp_window(base.impl_->root_demand.final_added, capacity), capacity);
 }
 
 bool ProgramImpl::persistent_backfill_safe(

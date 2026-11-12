@@ -1,5 +1,6 @@
 // ninfer::ops - split-KV causal small-T launcher and unified route dispatcher. INT8 Q/K
 // preparation, including their paired fixed rotation, remains private to the included kernel.
+#include "ops/softmax_attention/dense/causal_cache/key_position_hook.h"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
 #include "core/paged_kv_storage.h"
@@ -189,7 +190,8 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                     : static_cast<const std::int32_t*>(invocation.table_rows->data),
                 cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
                 logical_capacity, scale, static_cast<float*>(partial_acc.data),
-                static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+                static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
+                invocation.key_position_map, invocation.resident_slots);
     };
     if constexpr (TokenTile >= 6) {
         // Small grids need more warps per CTA. From 2K to 8K, Bc=64 halves key
@@ -440,7 +442,9 @@ void causal_attention_small_t_launch(
         .full_width    = q.ne[2],
         .column_begin  = column_begin,
         .width         = width,
-        .batch_size    = q.ne[3],
+        .batch_size       = q.ne[3],
+        .key_position_map = g_attention_key_position_map,
+        .resident_slots   = g_attention_key_slots,
     };
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
         causal_attention_small_t_launch_for<CausalD256H24Kv4>(q, input, pos, scale, cache,
@@ -480,7 +484,9 @@ void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, 
         .full_width    = q.ne[2],
         .column_begin  = 0,
         .width         = q.ne[2],
-        .batch_size    = 1,
+        .batch_size       = 1,
+        .key_position_map = g_attention_key_position_map,
+        .resident_slots   = g_attention_key_slots,
     };
     const PagedKVBatchLayerView batch_cache = single_row_paged_kv_batch_view(cache);
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {

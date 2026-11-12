@@ -539,8 +539,18 @@ PagedKVBatchLayerView windowed_mtp_view(WorkspaceArena& work_, DeviceContext& ct
     window_tables_out    = roots.tables;
     window_rows_out      = roots.rows;
     window_positions_out = roots.positions;
+    // The window kernel walks columns inside the resident row, so it needs compact positions; the
+    // appends elsewhere keep the absolute ones for RoPE.
+    Tensor window_positions = positions;
+    if (g_ninfer_kv_window_base_tokens != 0) {
+        window_positions = work_.alloc(DType::I32, {width});
+        Tensor shift     = work_.alloc(DType::I32, {1});
+        ops::set_i32_scalar(shift, -static_cast<std::int32_t>(g_ninfer_kv_window_base_tokens),
+                            ctx_.stream);
+        ops::offset_i32_positions(positions, shift, window_positions, ctx_.stream);
+    }
     ops::detail::paged_kv_window_rows_launch(
-        base.block_tables, table_rows, positions, valid_columns, 1,
+        base.block_tables, table_rows, window_positions, valid_columns, 1,
         static_cast<std::int32_t>(mtp_attention_window()), window_tables_out, window_rows_out,
         window_positions_out, ctx_.stream);
     PagedKVBatchLayerView narrowed = base;
@@ -2982,6 +2992,39 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             }
 
             const std::int32_t rope_axes = multimodal != nullptr ? 3 : (rope_delta_ != 0 ? 1 : 0);
+            if (std::getenv("NINFER_VISION_TRACE") != nullptr) {
+                std::fprintf(stderr,
+                             "[vision-splice] chunk t0=%u len=%d visual_begin=%d count=%zu "
+                             "first_index=%d\n",
+                             t0, len, visual_begin, local_scatter_indices.size(),
+                             local_scatter_indices.empty() ? -1 : local_scatter_indices.front());
+                if (!local_scatter_indices.empty() && multimodal != nullptr) {
+                    const std::size_t prompt_tokens = multimodal->token_ids.size();
+                    const std::size_t first_column =
+                        static_cast<std::size_t>(prompt_t0) +
+                        static_cast<std::size_t>(local_scatter_indices.front());
+                    const std::size_t last_column =
+                        static_cast<std::size_t>(prompt_t0) +
+                        static_cast<std::size_t>(local_scatter_indices.back());
+                    std::fprintf(stderr,
+                                 "[vision-splice] columns %zu..%zu first_t/h/w=%d/%d/%d "
+                                 "last_t/h/w=%d/%d/%d second_w=%d ids=%d,%d,%d|%d,%d,%d\n",
+                                 first_column, last_column, multimodal->positions[first_column],
+                                 multimodal->positions[prompt_tokens + first_column],
+                                 multimodal->positions[2U * prompt_tokens + first_column],
+                                 multimodal->positions[last_column],
+                                 multimodal->positions[prompt_tokens + last_column],
+                                 multimodal->positions[2U * prompt_tokens + last_column],
+                                 multimodal->positions[2U * prompt_tokens + first_column + 1U],
+                                 first_column >= 2U ? static_cast<int>(multimodal->token_ids[first_column - 2U]) : -1,
+                                 first_column >= 1U ? static_cast<int>(multimodal->token_ids[first_column - 1U]) : -1,
+                                 static_cast<int>(multimodal->token_ids[first_column]),
+                                 static_cast<int>(multimodal->token_ids[last_column]),
+                                 last_column + 1U < prompt_tokens ? static_cast<int>(multimodal->token_ids[last_column + 1U]) : -1,
+                                 last_column + 2U < prompt_tokens ? static_cast<int>(multimodal->token_ids[last_column + 2U]) : -1);
+                }
+                std::fflush(stderr);
+            }
             const auto roots             = workspace::text_prefill_roots(
                 work_, config_, len, rope_axes,
                 static_cast<std::int32_t>(local_scatter_indices.size()));
@@ -3027,12 +3070,37 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
             Tensor x = roots.residual;
             ops::embedding(ids_device, *embed_, x, s);
+            if (std::getenv("NINFER_VISION_TRACE") != nullptr) {
+                // Token-embedding scale the vision merger output has to match; a two-order-of-
+                // magnitude gap makes the image tokens outliers instead of semantics.
+                (void)cudaStreamSynchronize(s);
+                std::uint16_t probe[64] = {};
+                (void)cudaMemcpy(probe, x.data, sizeof(probe), cudaMemcpyDeviceToHost);
+                double sum     = 0.0;
+                double squares = 0.0;
+                for (std::size_t index = 0; index < 64; ++index) {
+                    std::uint32_t wide = static_cast<std::uint32_t>(probe[index]) << 16;
+                    float value        = 0.0F;
+                    std::memcpy(&value, &wide, sizeof(float));
+                    sum += static_cast<double>(value);
+                    squares += static_cast<double>(value) * static_cast<double>(value);
+                }
+                const double mean      = sum / 64.0;
+                const double deviation = std::sqrt(std::max(0.0, squares / 64.0 - mean * mean));
+                std::fprintf(stderr, "[text-embed] std=%.5f mean=%.5f\n", deviation, mean);
+                std::fflush(stderr);
+            }
             if (!local_scatter_indices.empty()) {
-                Tensor indices_device = roots.scatter_indices;
-                copy_i32(local_scatter_indices.data(), indices_device, s);
-                Tensor embeddings = vision_chunk.embeddings.slice(
-                    1, visual_begin, static_cast<std::int32_t>(local_scatter_indices.size()));
-                ops::scatter(embeddings, indices_device, x, s);
+                // Ablation switch: skipping the splice leaves the placeholder token embeddings in
+                // place. If the answer does not move, the text model never looks at the image.
+                const bool skip_splice = std::getenv("NINFER_VISION_NOSPLICE") != nullptr;
+                if (!skip_splice) {
+                    Tensor indices_device = roots.scatter_indices;
+                    copy_i32(local_scatter_indices.data(), indices_device, s);
+                    Tensor embeddings = vision_chunk.embeddings.slice(
+                        1, visual_begin, static_cast<std::int32_t>(local_scatter_indices.size()));
+                    ops::scatter(embeddings, indices_device, x, s);
+                }
             }
             if constexpr (Tap::enabled) { tap.begin(x); }
             run_layers(x, Phase::Prefill, tap);

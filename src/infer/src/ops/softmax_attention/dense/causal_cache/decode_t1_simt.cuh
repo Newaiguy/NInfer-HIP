@@ -77,8 +77,18 @@ __global__ void causal_decode_t1_simt_partial_kernel(
     // token_base = that token's column, so q / fresh K,V / positions all slice to one
     // column and the kernel body stays identical to the T=1 decode path. Default 0 keeps
     // every existing T=1 call site bit-identical.
-    int token_base = 0) {
+    //
+    // AMD port 2026-11-04: batched verify. blockIdx.z now selects the token column directly, so
+    // ONE launch covers every verify token (each column appends only its own fresh K/V row and
+    // masks by its own position, so no column ever observes another column's row). The two
+    // strides slice the token-major partial slabs; both are 0 and gridDim.z is 1 for every
+    // legacy call, which keeps those launches bit-identical.
+    int token_base = 0, int acc_token_stride = 0, int stat_token_stride = 0) {
     using namespace decode_t1_simt_detail;
+    const int z_col      = static_cast<int>(blockIdx.z);
+    const std::int64_t z_off_acc  = static_cast<std::int64_t>(z_col) * acc_token_stride;
+    const std::int64_t z_off_stat = static_cast<std::int64_t>(z_col) * stat_token_stride;
+    token_base += z_col;
     constexpr int D        = kSimtD;
     constexpr int Threads  = kSimtThreads;
     constexpr int Warps    = kSimtThreads / 32;
@@ -99,10 +109,10 @@ __global__ void causal_decode_t1_simt_partial_kernel(
                 // what causal_partial_{stat,acc}_index describes and what the reduce kernel
                 // (causal_attention_small_t_reduce_output_kernel) reads.
                 const std::int64_t stat = (q0 + r) + Geometry::QHeads * static_cast<std::int64_t>(split);
-                partial_m[stat] = -CUDART_INF_F;
-                partial_l[stat] = 0.0f;
+                partial_m[stat + z_off_stat] = -CUDART_INF_F;
+                partial_l[stat + z_off_stat] = 0.0f;
                 for (int d = 0; d < D; ++d) {
-                    partial_acc[stat * D + d] = 0.0f;
+                    partial_acc[stat * D + d + z_off_acc] = 0.0f;
                 }
             }
         }
@@ -122,9 +132,9 @@ __global__ void causal_decode_t1_simt_partial_kernel(
     const auto write_neutral = [&](int qh) {
         // Canonical [split][token][q_head] layout, tokens == 1 (see causal_partial_stat_index).
         const std::int64_t stat = qh + Geometry::QHeads * static_cast<std::int64_t>(split);
-        partial_m[stat] = -CUDART_INF_F;
-        partial_l[stat] = 0.0f;
-        for (int d = 0; d < D; ++d) partial_acc[stat * D + d] = 0.0f;
+        partial_m[stat + z_off_stat] = -CUDART_INF_F;
+        partial_l[stat + z_off_stat] = 0.0f;
+        for (int d = 0; d < D; ++d) partial_acc[stat * D + d + z_off_acc] = 0.0f;
     };
     if (split >= active_split_count) {
         if (tid == 0) {
@@ -554,6 +564,7 @@ __global__ void causal_decode_t1_simt_partial_kernel(
                     for (int u = 0; u < 8; ++u) o[r][u] = o[r][u] * alpha[r] + p[r] * fv_v[u];
             }
         }
+        (void)0;
     } else {
     for (int key = split_start + warp; key < split_end; key += Warps) {
         float s[QR];
@@ -779,9 +790,10 @@ __global__ void causal_decode_t1_simt_partial_kernel(
 #pragma unroll
                 for (int w = 1; w < Warps; ++w) partial += o_stage[w][lane];
                 if constexpr (KFp8) {
-                    partial_acc[acc_base + lane + 32 * u] = partial;  // fp8 owns dims lane+32*u
+                    partial_acc[acc_base + lane + 32 * u + z_off_acc] =
+                        partial;  // fp8 owns dims lane+32*u
                 } else {
-                    partial_acc[acc_base + lane * 8 + u] = partial;
+                    partial_acc[acc_base + lane * 8 + u + z_off_acc] = partial;
                 }
             }
             __syncthreads();
@@ -798,8 +810,8 @@ __global__ void causal_decode_t1_simt_partial_kernel(
             // exp(m_s - max) to nearly uniform: every T=1 decode attention became a wrong split
             // average while the residual magnitude stayed plausible. Here gmax_v[r] is the max
             // over the 8 warp-local states, still in the scaled domain.
-            partial_m[stat] = gmax_v[r];
-            partial_l[stat] = lsum_v[r];
+            partial_m[stat + z_off_stat] = gmax_v[r];
+            partial_l[stat + z_off_stat] = lsum_v[r];
         }
     }
 

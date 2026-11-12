@@ -3,6 +3,10 @@
 #include <cuda_bf16.h>
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+
+__device__ float g_ln_stat[4] = {0.0F, 0.0F, 0.0F, 0.0F};
 
 namespace ninfer::ops {
 
@@ -123,7 +127,12 @@ __launch_bounds__(Block) __global__
     const float mean        = __shfl_sync(mask, local.mean, 0);
     const float m2          = __shfl_sync(mask, local.m2, 0);
     const float inv         = rsqrtf(m2 / static_cast<float>(d) + eps);
-
+    if (threadIdx.x == 0) {
+        g_ln_stat[0] = m2 / static_cast<float>(d);
+        g_ln_stat[1] = mean;
+        g_ln_stat[2] = __bfloat162float(x[base].x);
+        g_ln_stat[3] = static_cast<float>(local.count);
+    }
     for (int pair = lane; pair < pairs; pair += 32) {
         const float2 values = __bfloat1622float2(x[base + pair]);
         const float2 scales = __bfloat1622float2(weight[pair]);

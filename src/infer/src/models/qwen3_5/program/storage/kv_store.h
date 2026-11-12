@@ -6,6 +6,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <optional>
@@ -1530,6 +1532,52 @@ public:
         address.committed_frontier = frontier;
     }
 
+    // Drops the oldest fully committed pages and shifts the remaining slots down. The execution
+    // row is republished so the resident window is the contiguous range [0, page_count) and the
+    // discarded prefix is recorded in window_base_tokens for position bookkeeping. No KV data
+    // moves: only the slot -> physical-page mapping changes.
+    void slide_prefix_pages(KVAddressSpaceHandle handle, std::uint32_t drop_pages,
+                            cudaStream_t stream = nullptr, std::uint32_t keep_prefix_pages = 0) {
+        Address& address = require_active(handle);
+        if (drop_pages == 0) { return; }
+        if (static_cast<std::uint64_t>(drop_pages) + keep_prefix_pages > address.page_count) {
+            throw std::invalid_argument("KV window slide exceeds mapped pages");
+        }
+        const std::uint32_t page_size = static_cast<std::uint32_t>(kPagedKVPageSize);
+        if (static_cast<std::uint64_t>(drop_pages + keep_prefix_pages) * page_size >
+            static_cast<std::uint64_t>(address.committed_frontier)) {
+            throw std::invalid_argument("KV window slide exceeds the committed frontier");
+        }
+        for (std::uint32_t page = keep_prefix_pages; page < keep_prefix_pages + drop_pages; ++page) {
+            if (!pages_->can_dematerialize(membership(address, page))) {
+                throw std::logic_error("KV window slide would partially release a protected page");
+            }
+        }
+        for (std::uint32_t page = keep_prefix_pages; page < keep_prefix_pages + drop_pages; ++page) {
+            const LogicalKVPageHandle released = membership(address, page);
+            pages_->release_active_reference(released);
+            pages_->dematerialize(released, address.reservation);
+        }
+        // The surviving pages keep their relative order: the retained prefix, then the tail. The
+        // row is republished in that order so compact indices stay contiguous.
+        const std::uint32_t remain = address.page_count - drop_pages;
+        for (std::uint32_t page = keep_prefix_pages; page < remain; ++page) {
+            membership(address, page) = membership(address, page + drop_pages);
+        }
+        for (std::uint32_t page = remain; page < address.page_count; ++page) {
+            membership(address, page) = {};
+        }
+        address.page_count = remain;
+        address.committed_frontier -= drop_pages * page_size;
+        address.window_base_tokens += drop_pages * page_size;
+        publish_scratch_.clear();
+        publish_scratch_.reserve(remain);
+        for (std::uint32_t page = 0; page < remain; ++page) {
+            publish_scratch_.push_back(pages_->physical(membership(address, page)));
+        }
+        tables_->publish(address.row->handle(), 0, publish_scratch_, stream);
+    }
+
     [[nodiscard]] bool can_destructive_truncate_inactive(
         KVAddressSpaceHandle handle, std::uint32_t frontier,
         bool tail_host_replica_will_be_released = false) const noexcept {
@@ -1639,6 +1687,10 @@ public:
         return require(handle).committed_frontier;
     }
 
+    [[nodiscard]] std::uint32_t window_base_tokens(KVAddressSpaceHandle handle) const {
+        return require(handle).window_base_tokens;
+    }
+
     [[nodiscard]] std::int32_t bound_row(KVAddressSpaceHandle handle) const noexcept {
         if (!valid(handle) || !addresses_[handle.index_].row) { return -1; }
         return addresses_[handle.index_].row->row_index();
@@ -1741,6 +1793,9 @@ private:
         std::uint32_t page_count          = 0;
         std::uint32_t committed_frontier  = 0;
         std::uint32_t checkpoint_frontier = 0;
+        // Tokens discarded from the front of this address space by a window slide. The resident
+        // range stays [0, committed_frontier) in compact coordinates.
+        std::uint32_t window_base_tokens = 0;
         DeviceKVPageReservation reservation;
         std::optional<KVExecutionRowLease> row;
         bool occupied = false;
@@ -1790,12 +1845,34 @@ private:
     }
 
     [[nodiscard]] Address& require(KVAddressSpaceHandle handle) {
-        if (!valid(handle)) { throw std::invalid_argument("KV address-space handle is stale"); }
+        if (!valid(handle)) {
+            if (std::getenv("NINFER_KV_STALE_TRACE") != nullptr) {
+                const std::uint32_t live =
+                    handle.index_ < addresses_.size() ? addresses_[handle.index_].generation : 0U;
+                std::fprintf(stderr,
+                             "[kv-stale] index=%u size=%zu gen=%u live_gen=%u owner_ok=%d\n",
+                             handle.index_, addresses_.size(), handle.generation_, live,
+                             static_cast<int>(handle.owner_ == this));
+                std::fflush(stderr);
+            }
+            throw std::invalid_argument("KV address-space handle is stale");
+        }
         return addresses_[handle.index_];
     }
 
     [[nodiscard]] const Address& require(KVAddressSpaceHandle handle) const {
-        if (!valid(handle)) { throw std::invalid_argument("KV address-space handle is stale"); }
+        if (!valid(handle)) {
+            if (std::getenv("NINFER_KV_STALE_TRACE") != nullptr) {
+                const std::uint32_t live =
+                    handle.index_ < addresses_.size() ? addresses_[handle.index_].generation : 0U;
+                std::fprintf(stderr,
+                             "[kv-stale] const index=%u size=%zu gen=%u live_gen=%u owner_ok=%d\n",
+                             handle.index_, addresses_.size(), handle.generation_, live,
+                             static_cast<int>(handle.owner_ == this));
+                std::fflush(stderr);
+            }
+            throw std::invalid_argument("KV address-space handle is stale");
+        }
         return addresses_[handle.index_];
     }
 

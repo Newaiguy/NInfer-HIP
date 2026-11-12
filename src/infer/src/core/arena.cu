@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -37,6 +38,88 @@ std::uintptr_t align_up_addr(std::uintptr_t addr, std::size_t align) {
     return with_mask & ~static_cast<std::uintptr_t>(mask);
 }
 
+bool alloc_log_enabled() {
+    static const bool on = [] { const char* e = std::getenv("NINFER_ALLOC_LOG"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+
+void log_alloc(const void* ptr, std::size_t bytes) {
+    if (!alloc_log_enabled()) { return; }
+    const auto a = reinterpret_cast<std::uintptr_t>(ptr);
+    std::fprintf(stdout,
+                 "[alloc] ptr=%p bytes=%zu mod2M=%llu mod16M=%llu mod256M=%llu mod1G=%llu mod4G=%llu\n",
+                 ptr, bytes,
+                 static_cast<unsigned long long>(a % (2u << 20)),
+                 static_cast<unsigned long long>(a % (16u << 20)),
+                 static_cast<unsigned long long>(a % (256u << 20)),
+                 static_cast<unsigned long long>(a % (1ull << 30)),
+                 static_cast<unsigned long long>(a % (4ull << 30)));
+    std::fflush(stdout);
+}
+// gfx1201 long-context port: per-arena read bandwidth probe. The 126k decode step time has
+// been observed to swing 43ms <-> 100ms between identical runs while the standalone d2d probe
+// stays healthy, which points at the physical placement quality of the big arenas rather than at
+// the kernels. This sweep reads the freshly allocated region once and prints the achieved read
+// bandwidth, so every run carries a fingerprint of the memory it actually got.
+__global__ void arena_read_sweep_kernel(const uint4* __restrict__ p, unsigned long long n4,
+                                       unsigned int* __restrict__ sink) {
+    unsigned long long i          = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned long long step = static_cast<unsigned long long>(gridDim.x) * blockDim.x;
+    unsigned int acc              = 0u;
+    for (; i < n4; i += step) {
+        const uint4 v = p[i];
+        acc += v.x ^ v.y ^ v.z ^ v.w;
+    }
+    if (acc == 0xdeadbeefu) { *sink = acc; }
+}
+
+bool alloc_bw_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("NINFER_ALLOC_BW");
+        return e != nullptr && e[0] != '0';
+    }();
+    return on;
+}
+
+void probe_arena_bw(const char* tag, void* ptr, std::size_t bytes) {
+    if (!alloc_bw_enabled() || ptr == nullptr || bytes < (1u << 20)) { return; }
+    static unsigned int* sink = nullptr;
+    if (sink == nullptr) {
+        if (cudaMalloc(reinterpret_cast<void**>(&sink), sizeof(unsigned int)) != cudaSuccess) { return; }
+    }
+    const std::size_t n4 = bytes / sizeof(uint4);
+    cudaEvent_t t0 = nullptr;
+    cudaEvent_t t1 = nullptr;
+    if (cudaEventCreate(&t0) != cudaSuccess || cudaEventCreate(&t1) != cudaSuccess) { return; }
+    // Sweep the region three times: the first pass pays the WDDM residency/commit cost, the
+    // later passes measure steady-state read throughput of whatever the driver actually bound
+    // the allocation to (VRAM vs shared system memory). Both numbers matter.
+    double gbs[3] = {0.0, 0.0, 0.0};
+    cudaError_t err = cudaSuccess;
+    for (int pass = 0; pass < 3; ++pass) {
+        cudaEventRecord(t0);
+        arena_read_sweep_kernel<<<1024, 256>>>(reinterpret_cast<const uint4*>(ptr),
+                                               static_cast<unsigned long long>(n4), sink);
+        cudaEventRecord(t1);
+        err          = cudaEventSynchronize(t1);
+        float ms     = 0.0f;
+        if (err == cudaSuccess) { cudaEventElapsedTime(&ms, t0, t1); }
+        if (err == cudaSuccess && ms > 0.0f) {
+            gbs[pass] = (static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0)) / (ms / 1000.0);
+        }
+    }
+    cudaEventDestroy(t0);
+    cudaEventDestroy(t1);
+    if (err != cudaSuccess) {
+        std::fprintf(stdout, "[alloc-bw] %s bytes=%zu probe_failed\n", tag, bytes);
+        std::fflush(stdout);
+        return;
+    }
+    std::fprintf(stdout, "[alloc-bw] %s ptr=%p bytes=%zu read_GBs=%.1f/%.1f/%.1f\n", tag, ptr, bytes,
+                 gbs[0], gbs[1], gbs[2]);
+    std::fflush(stdout);
+}
+
 void free_device(void*& ptr) noexcept {
     if (ptr != nullptr) {
         log_cuda_error("cudaFree", cudaFree(ptr));
@@ -62,6 +145,8 @@ DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
         throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
     }
     p = ptr;
+    log_alloc(p, bytes);
+    probe_arena_bw("buffer", p, bytes);
 }
 
 DeviceBuffer::~DeviceBuffer() { free_device(p); }
@@ -149,6 +234,8 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
         throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
     }
 
+    log_alloc(ptr, capacity_bytes);
+    probe_arena_bw("arena", ptr, capacity_bytes);
     base_ = ptr;
     cap_  = capacity_bytes;
     off_  = 0;

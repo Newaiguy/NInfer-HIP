@@ -27,19 +27,29 @@ inline constexpr int kRetrievalKVHeads    = 4;
 inline constexpr int kRetrievalQueryHeads = 24;
 inline constexpr int kRetrievalHeadDim    = 256;
 inline constexpr int kRetrievalPageTokens = 64;
-inline constexpr int kRetrievalRingPages  = 512;
+// Must cover the whole resident window: a page's summary is captured while it is resident, and
+// a page that finds no free slot simply never gets scored (its archived copy stays zero, which
+// shows up as "every candidate has the same score" = 1/candidates). 1152 pages = a 65536-token
+// window plus the sink and some slack; the buffer costs 256 KB per slot on the device.
+inline constexpr int kRetrievalRingPages  = 2048;
 
 // A single mean per page dilutes a one-sentence needle to 1/64 of the summary, and the ranking
 // then measures "how typical is this page" instead of "how relevant". Each page is therefore
 // summarized at kRetrievalSubChunks resolutions and a page scores as its BEST sub-chunk.
-inline constexpr int kRetrievalSubChunks = 4;
+inline constexpr int kRetrievalSubChunks = 1;
 inline constexpr int kRetrievalSubTokens = kRetrievalPageTokens / kRetrievalSubChunks;
 
 // Bytes of one page's summary record:
 // 4 sub-chunks x 16 layers x 4 kv heads x 256 dims of bf16.
 inline constexpr std::size_t kRetrievalPageMeanBytes =
-    static_cast<std::size_t>(kRetrievalSubChunks) * kRetrievalLayers * kRetrievalKVHeads *
-    kRetrievalHeadDim * sizeof(std::uint16_t);
+    3U * static_cast<std::size_t>(kRetrievalLayers) * kRetrievalKVHeads * kRetrievalHeadDim *
+    sizeof(std::uint16_t);
+
+// Set when recall_into_tail() actually moved archived pages into the window. The last prefill
+// chunk is replayed only in that case: the replay exists to let the newest tokens attend to the
+// recalled pages, so without a recall it would just re-run work -- and at a window that never
+// slid it re-runs it in the wrong coordinate system.
+inline bool g_kv_recall_loaded = false;
 
 struct RetrievalCandidate {
     std::uint32_t absolute_page;
@@ -75,11 +85,20 @@ public:
 
     // True once the prompt is complete and freeze_query() has snapshotted the question.
     [[nodiscard]] bool prompt_complete() const noexcept { return prompt_complete_; }
+
+    // Copies the frozen query rows to `destination` laid out as [layer][kv_head][dim] floats. The
+    // two-stage rerank decodes archived keys on the host, so it needs the query on the host too.
+    void export_query(float* destination, cudaStream_t stream) const;
+
+    // Two-stage rerank: decode one archived page's int4 keys and contract them with the rotated
+    // query rows ([layer][kv_head][dim] as exported above). Mirrors the device path exactly — the
+    // stored keys are Hadamard-rotated at append time, so the query is rotated here too.
+    static float score_page_keys(const void* page_bytes, const float* query_rows);
     // Scores the given pages against the accumulated query and returns them best-first.
     // `page_means[i]` points at the 32 KB summary of `absolute_pages[i]`; the summaries live in
     // per-block device allocations, so the caller passes one pointer per page instead of a
     // single contiguous array.
-    std::vector<RetrievalCandidate> rank(const std::vector<const void*>& page_means,
+    std::vector<RetrievalCandidate> rank(const void* host_page_means,
                                          const std::vector<std::uint32_t>& absolute_pages,
                                          cudaStream_t stream);
 
@@ -90,6 +109,10 @@ public:
 
     // Releases the ring slot of a page that has left the window without being archived.
     void forget(std::uint32_t absolute_page, cudaStream_t stream);
+
+    // Debug helper: a rk4v4-e8 page holds packed offset-binary int4 keys, so a valid page must show
+    // nibble values centred on 8 (code 0) rather than on 0. Prints a few decoded codes for one page.
+    static void debug_scan_page_keys(const void* page_bytes, std::uint32_t absolute_page);
 
 private:
     KVRetrieval();

@@ -1,5 +1,48 @@
 # 验证记录（0.1.0-pre-r2）
 
+> **0.1.1 追加（2026-11-12）**：本文档主体是 pre-r2 的历史记录，速度结论仍成立。
+> 0.1.1 的门禁与视觉回归单独记录在下面 §0，二进制口径为
+> `infer-mini.exe` 191,703,040 B / `infer-serve.exe` 192,038,912 B（sha256 见 VERSION.txt）。
+>
+> ## 0. 0.1.1 门禁与视觉回归
+>
+> 全部串行、每例独立进程，`temperature=0.0`、`seed=42`、`max_tokens=60`。
+>
+> | 项目 | 命令 | 结果 |
+> |---|---|---|
+> | LayerNorm 正式用例 | `build/_build_layer_norm_test.py` | `OK layer_norm correctness`（默认 paired D=1152 路径；修复前四个对齐用例全部非有限值） |
+> | packed attention 正式用例 | `build/_build_plain_packed_attention_test.py` | `packed_softmax_attention: PASS`（含新增段长 1 用例） |
+> | GATE 8k | `build/_gate.py --arms 8k` | decode **36.50** / prefill **985.9**（+8.5% / +5.2%）PASS |
+> | GATE 96k | `build/_gate.py --arms 96k` | decode **25.30** / prefill **428.4**（+4.2% / +1.2%）PASS |
+> | GATE mtp | `build/_gate.py --arms mtp` | decode **82.11** / prefill **891.3**（+5.4% / +3.6%）PASS |
+>
+> 视觉九图（纯红 / 四象限 / 三色竖条 / 左右分色 / 上下分色 / 左上 / 右上 / 左下 / 右上角小块）：
+>
+> | 权重档 | 结果 | 备注 |
+> |---|---|---|
+> | 默认（artifact 内置量化视觉层） | **9/9** | 发布路径 |
+> | patch-only BF16 覆盖 | **9/9** | 只覆盖 patch embedding |
+> | 全 BF16 视觉覆盖 | **9/9** | 329 张量全覆盖 |
+>
+> 真实照片交叉验证（Wikimedia 原图 7 张；问题覆盖颜色/计数/OCR/形状/物体/地标/事件/
+> 字母数/灯罩数/朝向/轮子数，共 16 问）：
+>
+> | 引擎 | 分数 | 视觉权重 |
+> |---|---|---|
+> | 本引擎（默认档） | **16/16** | artifact `q4/q5/q6_g64_fp16` |
+> | llama.cpp `llama-mtmd-cli` | **16/16** | BF16 mmproj |
+>
+> 结论：两者打平，但本引擎用的是更低的量化精度，所以"打平"不等于数值等价；
+> 量化损失目前没有硬用例能量出来（见 docs/VISION.md §4）。
+>
+> 泛化用例（不在九图集内，全部正确）：320×320 红块右下、480×360 非正方形红块左下、
+> 一图两目标（红左上 + 蓝右下）、一请求两图、48×48 小目标（右上 / 左下）。
+>
+> 复现命令：`python build/_vprobe_cfg.py red big_tl big_tr big_bl corner_tr quad4 bars half tb`；
+> 加覆盖档：`python build/_vprobe_cfg.py NINFER_VISION_WEIGHTS=D:\...\vision-bf16 red ...`。
+> 注意本仓库 blob 以 CRLF 存储，`git diff --check` 会把所有新增行报成 trailing whitespace，
+> 属仓库风格噪声。
+
 全部串行跑，同一时刻只有一个 GPU 作业。引擎 `bin/ninfer_mini_nordc.exe`（193,521,152 B，
 sha256 `011EBBAC…674FB44`），graph on，KV = `rk4v4-e8`（int4 K / int4 V），
 artifact = `Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer`。

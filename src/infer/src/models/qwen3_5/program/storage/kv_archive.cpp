@@ -53,6 +53,16 @@ bool KVArchive::ensure_arena(const HostKVPageLayout& layout) noexcept {
         const HostKVPageLayout layouts[] = {layout};
         arena_ = std::make_unique<HostKVArena>(archive_budget_bytes(), layouts);
         layout_ = layout;
+        if (std::getenv("NINFER_KV_MEANS_TRACE") != nullptr) {
+            std::fprintf(stderr, "[kv-layout] stride=%zu planes=%zu tokens=%d\n", layout.page_stride,
+                         layout.planes.size(), static_cast<int>(kPagedKVPageSize));
+            for (std::size_t index = 0; index < layout.planes.size(); ++index) {
+                std::fprintf(stderr, "[kv-plane] %zu off=%zu page=%zu head=%zu\n", index,
+                             layout.planes[index].offset, layout.planes[index].page_payload_bytes,
+                             layout.planes[index].head_payload_bytes);
+            }
+            std::fflush(stderr);
+        }
         if (trace_enabled()) {
             std::fprintf(stderr,
                          "[kv-archive] arena up: %zu MiB, page_stride=%zu, page_tokens=%d\n",
@@ -71,6 +81,11 @@ bool KVArchive::ensure_arena(const HostKVPageLayout& layout) noexcept {
 void KVArchive::archive(const DeviceKVPagePool& pool, std::span<const DeviceKVPageHandle> pages,
                         std::uint32_t first_absolute_token, cudaStream_t stream) {
     if (pages.empty()) { return; }
+    if (std::getenv("NINFER_KV_MEANS_TRACE") != nullptr) {
+        std::fprintf(stderr, "[kv-arch-entry] begin=%u pages=%zu instance=%p\n", first_absolute_token,
+                     pages.size(), static_cast<void*>(KVRetrieval::instance()));
+        std::fflush(stderr);
+    }
 
     const HostKVPageLayout layout = plan_host_kv_page_layout(pool.geometry());
     if (!ensure_arena(layout)) {
@@ -88,7 +103,7 @@ void KVArchive::archive(const DeviceKVPagePool& pool, std::span<const DeviceKVPa
     // `stream`, so synchronize before the arena hands those bytes back to the allocator.
     while (!arena_->can_allocate(layout, page_count) && !blocks_.empty()) {
         if (stream != nullptr) { (void)cudaStreamSynchronize(stream); }
-        if (blocks_.front().means != nullptr) { (void)cudaFree(blocks_.front().means); }
+        blocks_.front().means_host.clear();
         blocks_.erase(blocks_.begin());
         ++stats_.evicted;
     }
@@ -116,16 +131,25 @@ void KVArchive::archive(const DeviceKVPagePool& pool, std::span<const DeviceKVPa
     // Keep a device copy of the mean key of every page so a later recall pass (W4) can rank
     // archived blocks against the current query without re-reading the window.
     if (KVRetrieval::instance() != nullptr) {
-        void* means = nullptr;
-        const std::size_t mean_bytes =
-            static_cast<std::size_t>(page_count) * kRetrievalPageMeanBytes;
-        if (cudaMalloc(&means, mean_bytes) == cudaSuccess) {
-            KVRetrieval::instance()->copy_page_means(
-                first_absolute_token / static_cast<std::uint32_t>(kPagedKVPageSize), page_count,
-                means, stream);
-            block.means = means;
-        } else {
-            (void)cudaGetLastError();
+        block.means_host.assign(static_cast<std::size_t>(page_count) * kRetrievalPageMeanBytes / 2U,
+                                0U);
+        KVRetrieval::instance()->copy_page_means(
+            first_absolute_token / static_cast<std::uint32_t>(kPagedKVPageSize), page_count,
+            block.means_host.data(), stream);
+        if (std::getenv("NINFER_KV_MEANS_TRACE") != nullptr) {
+            std::uint32_t zero_pages = 0;
+            const std::size_t halves_per_page = kRetrievalPageMeanBytes / 2U;
+            for (std::uint32_t index = 0; index < page_count; ++index) {
+                const std::uint16_t* page = block.means_host.data() + index * halves_per_page;
+                std::size_t non_zero = 0;
+                for (std::size_t half = 0; half < halves_per_page; ++half) {
+                    if (page[half] != 0U) { ++non_zero; }
+                }
+                if (non_zero == 0U) { ++zero_pages; }
+            }
+            std::fprintf(stderr, "[kv-arch] begin=%u pages=%u zero_pages=%u\n", first_absolute_token,
+                         page_count, zero_pages);
+            std::fflush(stderr);
         }
     }
 

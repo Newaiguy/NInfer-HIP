@@ -28,7 +28,13 @@ inline constexpr bool kVecStaticK =
     type == GGML_TYPE_Q4_K || type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ2_XS ||
     type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_Q2_K;
 
-inline constexpr int kVecWarps = 4;
+// Eight warps per CTA: 4 left the weight stream under-covered (measured 33.28 vs 32.70 t/s at
+// 8K, 77.72 vs 75.56 on MTP dw2). Override with -DNINFER_VEC_WARPS=n for experiments.
+#if defined(NINFER_VEC_WARPS)
+inline constexpr int kVecWarps = NINFER_VEC_WARPS;
+#else
+inline constexpr int kVecWarps = 8;
+#endif
 
 namespace vec {
 
@@ -38,8 +44,17 @@ struct Slice {
 };
 
 __device__ __forceinline__ std::uint32_t u32_a2(const std::uint8_t* p) {
+#if defined(NINFER_U32A2_FAST)
+    // One 32-bit load instead of two 16-bit ones. The address is 2 mod 4 for the IQ3_S q/sg
+    // fields, which a scalar global load tolerates on RDNA (only vector loads need alignment);
+    // it halves this decoder's load count per 110-byte block.
+    std::uint32_t v;
+    __builtin_memcpy(&v, p, 4);
+    return v;
+#else
     const auto* h = reinterpret_cast<const std::uint16_t*>(p);
     return std::uint32_t(h[0]) | (std::uint32_t(h[1]) << 16);
+#endif
 }
 
 __device__ __forceinline__ std::uint32_t u32_a4(const std::uint8_t* p) {
@@ -405,8 +420,18 @@ struct Decoder<GGML_TYPE_IQ3_S> {
     __device__ static const std::uint32_t* table() { return iq3s_grid; }
     __device__ __forceinline__ static void decode(const std::uint8_t* b, int u,
                                                   const std::uint32_t* grid, Slice& s) {
+#if defined(NINFER_Q8B)
+        // AMD port: q0 and q1 are one contiguous 8-byte run at b+2+8u, so fetch them with a
+        // single 8-byte load instead of two 4-byte ones (the 110B block is read by 8 lanes,
+        // so this halves the quant-body load instructions per block).
+        std::uint2 qq;
+        __builtin_memcpy(&qq, b + 2 + 8 * u, sizeof(qq));
+        const std::uint32_t q0 = qq.x;
+        const std::uint32_t q1 = qq.y;
+#else
         const std::uint32_t q0 = u32_a2(b + 2 + 8 * u);
         const std::uint32_t q1 = u32_a2(b + 6 + 8 * u);
+#endif
         const std::uint32_t qh = b[66 + u];
         const std::uint32_t sg = u32_a2(b + 74 + 4 * u);
         const int sc           = (b[106 + u / 2] >> (4 * (u & 1))) & 0xF;
@@ -488,20 +513,62 @@ constexpr int vec_rows() {
     // widen every live range by T, and four weight streams on top of that pushed the kernel out of
     // the occupancy it needs to hide the weight loads. Halve the row stream so acc[kRows][T] and
     // a[T][8] both fit, and let the deeper unroll below keep the loads in flight instead.
+#if defined(NINFER_MT_ROWS2)
     return Fused ? 2 : (T > 1 ? 2 : 4);
+#else
+    // Multi-column (speculative verify) drops to one row stream: acc[kRows][T] + a[T][8] for T>1
+    // is what pushes this kernel out of occupancy, and one row in flight beat two by +11% on MTP.
+#if defined(NINFER_FUSED4)
+    return Fused ? (T > 1 ? 2 : 4) : (T > 1 ? 1 : 4);
+#else
+#if defined(NINFER_ROWS8)
+    return Fused ? 2 : (T > 1 ? 1 : 8);
+#else
+#if defined(NINFER_T2ROWS1)
+    return Fused ? 2 : (T > 1 ? 1 : 4);
+#else
+    return Fused ? 2 : (T > 1 ? (T == 2 ? 2 : 1) : 4);
+#endif
+#endif
+#endif
+#endif
 }
 
 // Output rows a warp advances per iteration: the fused [gate; up] parent spends two of its four
 // weight streams on one row, so it advances half as far as the plain projection.
 template <bool Fused, int T = 1>
 constexpr int vec_step() {
+#if defined(NINFER_MT_ROWS2)
     return Fused ? 1 : (T > 1 ? 2 : 4);
+#else
+#if defined(NINFER_FUSED4)
+    return Fused ? (T > 1 ? 1 : 2) : (T > 1 ? 1 : 4);
+#else
+#if defined(NINFER_ROWS8)
+    return Fused ? 1 : (T > 1 ? 1 : 8);
+#else
+#if defined(NINFER_T2ROWS1)
+    return Fused ? 1 : (T > 1 ? 1 : 4);
+#else
+#if defined(NINFER_T1ROWS1)
+    return Fused ? 1 : (T > 1 ? (T == 2 ? 2 : 1) : 1);
+#else
+    return Fused ? 1 : (T > 1 ? (T == 2 ? 2 : 1) : 4);
+#endif
+#endif
+#endif
+#endif
+#endif
 }
 
 // KS: the static K the slice loop unrolls over, or 0 for the runtime K. Fused: the weight is one
 // [gate; up] parent and each output row is silu(gate row) * up row.
 template <ggml_type type, int T, bool Fused, int KS>
+#if defined(NINFER_VEC_NOLB)
+__global__ void kernel(VecArgs p) {
+#else
 __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
+#endif
     using D                 = Decoder<type>;
     constexpr int kTable    = D::kTableWords > 0 ? D::kTableWords : 4;
     constexpr int kPerBlock = D::kBlockElems / 32;
@@ -577,8 +644,21 @@ __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
             // up it multiplies the live range of acc[kRows][T] + the T activation slices and the
             // kernel stops hiding the weight loads behind the int8 dot products. Cap the unroll for
             // T > 1 so the register budget stays inside the occupancy the single-column path gets.
+#define NINFER_PRAGMA_(x) _Pragma(#x)
+#define NINFER_SLICE_UNROLL_(n) NINFER_PRAGMA_(unroll n)
+#define NINFER_SLICE_UNROLL(n) NINFER_SLICE_UNROLL_(n)
+#ifndef NINFER_SLICE_U2
+#define NINFER_SLICE_U2 2
+#endif
             if constexpr (T == 1 && kSlices <= 8) {
+// AMD port: fully unrolling the single-column slice loop doubles the T=1 vector
+            // kernel's instruction count for every block type but IQ3_S and costs 6% of decode
+            // throughput (measured 1K 28.82 -> 27.0 ms/step); two slices is the sweet spot.
+#if defined(NINFER_SLICE_FULLUNROLL)
 #pragma unroll
+#else
+                NINFER_SLICE_UNROLL(NINFER_SLICE_U2)
+#endif
                 for (int it = 0; it < kSlices; ++it) { slice(it); }
             } else if constexpr (T > 1) {
                 // AMD port: the multi-column path lost the load pipelining when the row stream was
@@ -586,11 +666,27 @@ __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
 #pragma unroll 4
                 for (int it = 0; it < kSlices; ++it) { slice(it); }
             } else {
-#pragma unroll 2
+#if defined(NINFER_SLICE_U4)
+                #pragma unroll 4
+#else
+                #pragma unroll 2
+#endif
                 for (int it = 0; it < kSlices; ++it) { slice(it); }
             }
         } else {
-            for (int it = 0; lane + 32 * it < slices; ++it) { slice(it); }
+            for (int it = 0; lane + 32 * it < slices; ++it) {
+                if constexpr (T == 1) {
+                    // Single column only: issue the next block's load ahead of this one's decode so
+                    // the bandwidth-bound weight stream does not stall on a serial load-decode chain.
+                    if (lane + 32 * (it + 1) < slices) {
+#pragma unroll
+                        for (int r = 0; r < kRows; ++r) {
+                            __builtin_prefetch(rowp[r] + std::int64_t(32 / kPerBlock) * (it + 1) * D::kBlockBytes, 0, 3);
+                        }
+                    }
+                }
+                slice(it);
+            }
         }
 #pragma unroll
         for (int r = 0; r < kRows; ++r) {

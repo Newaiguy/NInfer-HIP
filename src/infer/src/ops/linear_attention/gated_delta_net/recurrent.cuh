@@ -10,7 +10,11 @@
 
 namespace ninfer::ops::detail::gated_delta_net {
 
+#if defined(NINFER_GDN_DV2)
+inline constexpr int kDvPerWarp = 2;
+#else
 inline constexpr int kDvPerWarp = 4;
+#endif
 inline constexpr int kNumWarps  = 4;
 inline constexpr int kBlockDv   = kNumWarps * kDvPerWarp;
 inline constexpr int kQkPerLane = kStateDim / kWarpSize;

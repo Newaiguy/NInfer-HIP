@@ -1,3 +1,4 @@
+#include "models/qwen3_5/execution/kv_window.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
@@ -326,8 +327,15 @@ void ProgramImpl::prepare_graphs() {
                 profile.max_execution_frontier = planned.max;
                 profile.topology_class =
                     planned.topology_class * ordinary_batch_limit + (batch_size - 1U);
-                const ops::CausalAttentionExecutionEnvelope envelope{planned.min + 1,
-                                                                     planned.max + 1};
+                // Resident window: graphs bake the key window into their kernel parameters, so the
+                // capture envelope must be expressed in COMPACT coordinates. min(frontier, resident)
+                // is the compact visible count for every absolute frontier.
+                const std::uint32_t window_tokens = ninfer_resident_window_tokens();
+                const auto compact_frontier = [&](std::uint32_t value) {
+                    return window_tokens != 0 && value > window_tokens ? window_tokens : value;
+                };
+                const ops::CausalAttentionExecutionEnvelope envelope{compact_frontier(planned.min + 1),
+                                                                     compact_frontier(planned.max + 1)};
                 execution::capture_ordinary_decode_batch(ordinary_state,
                                                          static_cast<std::int32_t>(batch_size),
                                                          envelope, profile.definition);
@@ -407,10 +415,14 @@ void ProgramImpl::prepare_graphs() {
                 profile.max_execution_frontier = planned.max;
                 profile.topology_class =
                     planned.topology_class * max_concurrency + (batch_size - 1U);
+                const std::uint32_t window_tokens_cap = ninfer_resident_window_tokens();
+                const std::uint32_t target_visible = static_cast<std::uint32_t>(
+                    std::min<std::uint64_t>(capacity,
+                                            static_cast<std::uint64_t>(planned.max) + draft_window +
+                                                1ULL));
                 const ops::CausalAttentionExecutionEnvelope target_envelope{
-                    1,
-                    static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                        capacity, static_cast<std::uint64_t>(planned.max) + draft_window + 1ULL))};
+                    1, window_tokens_cap != 0 && target_visible > window_tokens_cap ? window_tokens_cap
+                                                                                   : target_visible};
 
                 execution::capture_dflash_decode_batch(
                     dflash_state, static_cast<std::int32_t>(batch_size), draft_window,

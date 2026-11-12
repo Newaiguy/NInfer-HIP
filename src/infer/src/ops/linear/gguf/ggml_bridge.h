@@ -55,7 +55,11 @@ struct BlockShape {
 [[nodiscard]] bool has_matrix_kernel(GgmlType type);
 
 // Columns the vector kernel takes in one launch; wider products take the matrix kernel.
+#if defined(NINFER_MAXVEC1)
+inline constexpr int kMaxVectorColumns = 1;  // TEST: route T>1 verify through the wide path
+#else
 inline constexpr int kMaxVectorColumns = 8;
+#endif
 
 // Activation for the vector kernel: q8_1 blocks of 32 values, [columns][k / 32].
 [[nodiscard]] std::size_t vector_activation_bytes(int k, int columns);

@@ -49,7 +49,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t column_begin, std::int32_t logical_capacity, float scale, float* partial_acc,
-        float* partial_m, float* partial_l) {
+        float* partial_m, float* partial_l, const std::int32_t* key_pos,
+        std::int32_t slot_count) {
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles             = (RowCount + 15) / 16;
@@ -162,12 +163,14 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 
     const std::int32_t first_pos = pos[0];
     const std::int32_t last_pos  = pos[TokenTile - 1];
-    if (first_pos < 0 || last_pos < 0 || last_pos >= logical_capacity) {
+    if (first_pos < 0 || last_pos < 0 || (key_pos == nullptr && last_pos >= logical_capacity)) {
         write_neutral();
         return;
     }
 
-    const int window = last_pos + 1;
+    // Recall keeps the retained slots dense but their token positions sparse; in that mode the
+    // scan spans every retained slot and causality is decided per slot from key_pos.
+    const int window = (key_pos != nullptr && slot_count > 0) ? slot_count : (last_pos + 1);
     const int active_split_count =
         causal_small_t_active_splits<Geometry, true>(window, split_count, TokenTile);
     if (split >= active_split_count) { return; }
@@ -463,6 +466,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             causal_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head1, token1);
             const int qabs0 = (row0 < RowCount) ? pos[token0] : -1;
             const int qabs1 = (row1 < RowCount) ? pos[token1] : -1;
+            const auto kpos = [&](int slot) { return key_pos != nullptr ? key_pos[slot] : slot; };
             float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
@@ -471,19 +475,19 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int key0 = k0 + col0;
                 const int key1 = k0 + col1;
                 score[nt][0] =
-                    (row0 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs0)
+                    (row0 < RowCount && key0 >= split_start && key0 < split_end && kpos(key0) <= qabs0)
                         ? score[nt][0] * scale
                         : -CUDART_INF_F;
                 score[nt][1] =
-                    (row0 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs0)
+                    (row0 < RowCount && key1 >= split_start && key1 < split_end && kpos(key1) <= qabs0)
                         ? score[nt][1] * scale
                         : -CUDART_INF_F;
                 score[nt][2] =
-                    (row1 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs1)
+                    (row1 < RowCount && key0 >= split_start && key0 < split_end && kpos(key0) <= qabs1)
                         ? score[nt][2] * scale
                         : -CUDART_INF_F;
                 score[nt][3] =
-                    (row1 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs1)
+                    (row1 < RowCount && key1 >= split_start && key1 < split_end && kpos(key1) <= qabs1)
                         ? score[nt][3] * scale
                         : -CUDART_INF_F;
                 bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));

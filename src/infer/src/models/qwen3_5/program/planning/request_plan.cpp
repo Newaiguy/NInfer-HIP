@@ -259,10 +259,21 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
         base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
                                            ? 0U
                                            : base->summary.effective_output_tokens - 1U);
-    base->text_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
+    // Resident-window mode (Leg B): a request longer than the resident window keeps only the newest
+    // pages; older ones are slid out, so its page entitlement is bounded by the window, not by its
+    // own length. This mirrors the runtime slide in ProgramImpl::ensure_sequence_kv_mapped.
+    std::uint32_t resident_entitlement_tokens = reserved_context_tokens;
+    if (const char* resident_env = std::getenv("NINFER_RESIDENT_TOKENS")) {
+        const std::uint64_t resident = std::strtoull(resident_env, nullptr, 10);
+        if (resident != 0) {
+            resident_entitlement_tokens = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                reserved_context_tokens, std::min<std::uint64_t>(resident, capacity)));
+        }
+    }
+    base->text_kv_page_entitlement = pages_for_tokens(resident_entitlement_tokens);
     if (speculative_backend == SpeculativeBackend::Mtp) {
         const std::uint32_t mtp_tokens    = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-            capacity, static_cast<std::uint64_t>(reserved_context_tokens) + draft_window - 1ULL));
+            capacity, static_cast<std::uint64_t>(resident_entitlement_tokens) + draft_window - 1ULL));
         base->backend_kv_page_entitlement = pages_for_tokens(mtp_tokens);
     } else if (speculative_backend == SpeculativeBackend::DFlash) {
         base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);

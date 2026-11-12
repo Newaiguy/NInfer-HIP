@@ -719,8 +719,10 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         return;
     }
     {
+        // AMD port: route trace, debug only (was unconditional and interleaved with chat output).
+        static const bool attn_trace_on = std::getenv("NINFER_ATTN_TRACE") != nullptr;
         static bool fb_printed = false;
-        if (!fb_printed) {
+        if (attn_trace_on && !fb_printed) {
             fb_printed = true;
             std::fprintf(stderr, "[attn-fallback] prompt_launch width=%d route=%s maxvis=%u%c", width,
                          detail::causal_attention_route_name(route),

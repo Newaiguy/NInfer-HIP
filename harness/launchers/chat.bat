@@ -12,12 +12,15 @@ rem ---------------------------------------------------------------
 set "HERE=%~dp0"
 if "%HERE:~-1%"=="\" set "HERE=%HERE:~0,-1%"
 
+rem  engine name: current releases ship infer-mini.exe; older ones used
+rem  ninfer_mini_nordc.exe. Accept both, prefer the current one.
 set "EXE="
-if exist "%HERE%\ninfer_mini_nordc.exe" set "EXE=%HERE%\ninfer_mini_nordc.exe"
-if not defined EXE if exist "%HERE%\infer_mini_nordc.exe" set "EXE=%HERE%\infer_mini_nordc.exe"
-if not defined EXE if exist "%HERE%\bin\ninfer_mini_nordc.exe" set "EXE=%HERE%\bin\ninfer_mini_nordc.exe"
+for %%N in (infer-mini.exe ninfer_mini_nordc.exe infer_mini_nordc.exe) do (
+  if not defined EXE if exist "%HERE%\%%N" set "EXE=%HERE%\%%N"
+  if not defined EXE if exist "%HERE%\bin\%%N" set "EXE=%HERE%\bin\%%N"
+)
 if not defined EXE (
-  echo [x] cannot find ninfer_mini_nordc.exe next to this script.
+  echo [x] cannot find infer-mini.exe next to this script.
   echo     put the engine next to chat.bat, or in a bin\ subfolder.
   pause
   exit /b 1

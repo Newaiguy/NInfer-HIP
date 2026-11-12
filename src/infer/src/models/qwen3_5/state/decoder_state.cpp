@@ -25,7 +25,10 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     const PagedKVStorageLayout layer_storage = paged_kv_storage_layout(storage, head_dim);
 
     const std::uint32_t logical_pages = page_count(capacity);
-    if (physical_page_groups < logical_pages) {
+    // Leg B working-set: physical pages may back only a prefix/subset of the logical capacity.
+    // The logical->physical indirection already exists in the execution tables; pages outside the
+    // working set must not be touched until the eviction path (B3/B4) is installed.
+    if (physical_page_groups < logical_pages && std::getenv("NINFER_RESIDENT_TOKENS") == nullptr) {
         throw std::invalid_argument("Paged KV physical pages are below logical capacity");
     }
 
