@@ -1916,43 +1916,133 @@ void ProgramImpl::recall_into_tail(SequenceState& sequence) {
         // The ranker peaks near the document that holds the answer rather than exactly on it, so
         // each hit expands forward into its neighbours before the next hit is considered.
         if (!ranked.empty()) {
+            // Two recall strategies. The single centred block is the default and the only one the
+            // documentation describes:
+            //   SingleBlock  take the best scoring page and pull the whole contiguous run of `slots`
+            //                pages centred on it. The ranker peaks a few pages before the document
+            //                that holds the answer (measured on the 98K needle corpus: peak page 760
+            //                for an answer at 768), so the centred full-width run is what absorbs
+            //                that bias.
+            //   MultiPeak    opt-in through NINFER_KV_RECALL_DIV>1: spread the budget over several
+            //                peaks with narrower runs, then spend the remainder page by page
+            //                (NINFER_KV_RECALL_FILL). Only pays off when several unrelated documents
+            //                matter. On the single-document corpus it truncated the answer document:
+            //                pages 732..787 returned the wrong tokens, 704..815 reproduces the
+            //                reference, which is why it is not the default any more.
             const char* div_env = std::getenv("NINFER_KV_RECALL_DIV");
             const std::uint32_t divisor =
                 div_env != nullptr ? std::max<std::uint32_t>(1U, static_cast<std::uint32_t>(
                                                                          std::strtoul(div_env, nullptr, 10)))
-                                   : (archived < 8U * static_cast<std::uint32_t>(slots) ? 4U : 2U);
+                                   : 1U;
+            const bool multi_peak = divisor > 1U;
+            const std::uint32_t budget = static_cast<std::uint32_t>(slots);
             const std::uint32_t block =
-                std::max<std::uint32_t>(16U, static_cast<std::uint32_t>(slots) / divisor);
-            std::vector<std::uint32_t> centres;
+                multi_peak ? std::max<std::uint32_t>(16U, budget / divisor) : budget;
+            // The ranker peaks a few pages BEFORE the document that holds the answer (measured on the
+            // 98K needle corpus: peak page 760 for an answer at 768), so a block has to reach further
+            // forward than backward. `back` is how much of the block sits before the peak.
+            const char* backoff_env = std::getenv("NINFER_KV_RECALL_BACKOFF");
+            const std::uint32_t backoff =
+                backoff_env != nullptr
+                    ? static_cast<std::uint32_t>(std::strtoul(backoff_env, nullptr, 10))
+                    : 0U;
             std::vector<std::uint32_t> taken;
-            for (const auto& candidate : rescored) {
-                if (sources.size() >= slots) { break; }
-                const std::uint32_t page = candidate.absolute_page;
-                bool already = false;
-                for (const std::uint32_t done : taken) {
-                    if (done == page) { already = true; break; }
-                }
-                if (already) { continue; }
-                const std::uint32_t left = static_cast<std::uint32_t>(slots) -
-                                           static_cast<std::uint32_t>(sources.size());
-                const std::uint32_t width = std::max<std::uint32_t>(16U, std::min(block, left));
-                // Centre the block on the peak: a peak that lands a few pages past the needle would
-                // otherwise start the block at the needle and run away from it.
-                const std::uint32_t back  = block / 2U;
+            // Places one run of `width` pages at `page`, spending what is left of the budget.
+            const auto place = [&](std::uint32_t page, std::uint32_t width,
+                                   std::uint32_t default_back) -> bool {
+                const std::uint32_t left = budget - static_cast<std::uint32_t>(sources.size());
+                width = std::min(width, left);
+                if (width == 0U) { return false; }
+                const std::uint32_t back = backoff != 0U ? backoff : std::min(default_back, width);
                 const std::uint32_t begin = page > back ? page - back : 0U;
                 const std::vector<KVArchive::RecallPage> run =
                     archive->recall_pages(begin * kPagedKVPageSize, width);
-                if (run.empty()) { continue; }
-                centres.push_back(page);
+                if (run.empty()) { return false; }
                 sources.insert(sources.end(), run.begin(), run.end());
                 for (std::uint32_t offset = 0; offset < run.size(); ++offset) {
                     taken.push_back(begin + offset);
                 }
+                return true;
+            };
+            if (!multi_peak) {
+                // Default: one run of the whole budget, widened to a second one only when that second
+                // peak is both far away and strong enough to be a real document of its own.
+                //
+                //   * One document, deep: nothing must split. On the 98K needle corpus the runner-up
+                //     scores 0.0104 against 0.6894 (1.5%), so the single centred run is taken and the
+                //     recalled pages are identical to the behaviour that reproduces the reference
+                //     token for token at 25%/50%/75% needle depth.
+                //   * Several unrelated documents: a single run leaves the second document outside the
+                //     restored context, and the model then answers with whatever document it *can*
+                //     see. Measured on the two-document corpus (ATLAS at 25%, BOREAL at 50%, their
+                //     codes 30K tokens apart): asking for ATLAS with only the BOREAL run recalled
+                //     produced NINFER-BOREAL-2222, i.e. confidently the wrong document's code. With a
+                //     second run the model at least quotes the ATLAS project by name. That corpus
+                //     scores the runner-up at 0.1888 against 0.2297 (82%).
+                //
+                // Note the two secrets there are near-identical strings (NINFER-<NAME>-<NNNN>), and the
+                // model tends to merge the name of one with the digits of the other once both are in
+                // context; that is a model limitation, not a retrieval one, and it is why the split is
+                // reported separately in the docs rather than as a free win.
+                constexpr float kSecondPeakRatio = 0.35F;
+                constexpr std::uint32_t kSecondPeakGap = 28U;
+                const char* split_env = std::getenv("NINFER_KV_RECALL_SPLIT");
+                const bool split_on = split_env == nullptr || split_env[0] != '0';
+                const std::uint32_t primary_page = rescored[0].absolute_page;
+                std::uint32_t secondary_page = 0U;
+                bool has_secondary = false;
+                if (split_on && budget >= 64U && rescored.size() > 1U) {
+                    const float top = rescored[0].score;
+                    for (std::size_t index = 1; index < rescored.size(); ++index) {
+                        const std::uint32_t page = rescored[index].absolute_page;
+                        const std::uint32_t gap =
+                            page > primary_page ? page - primary_page : primary_page - page;
+                        if (gap < kSecondPeakGap) { continue; }
+                        if (rescored[index].score < kSecondPeakRatio * top) { break; }
+                        secondary_page = page;
+                        has_secondary = true;
+                        break;
+                    }
+                }
+                if (has_secondary) {
+                    const std::uint32_t secondary_width = budget / 2U;
+                    const std::uint32_t primary_width = budget - secondary_width;
+                    // The two runs are placed differently on purpose, because what is known about
+                    // them differs:
+                    //   * the primary peak is measured to sit a few pages BEFORE its document (760
+                    //     against 768), so three quarters of its width are placed ahead of it. With a
+                    //     half budget that still reaches 42 pages forward, past the 32-page answer
+                    //     zone, and the reference tokens come back exactly (verified with the split
+                    //     forced on the single-document corpus).
+                    //   * the secondary peak has no such measurement, so it stays centred: on the
+                    //     two-document corpus the ATLAS wording sits roughly 28 pages before its peak,
+                    //     and an offset run missed the start of the sentence, which made the model
+                    //     quote the other project's number.
+                    place(primary_page, primary_width, primary_width / 4U);
+                    place(secondary_page, secondary_width, secondary_width / 2U);
+                } else {
+                    place(primary_page, budget, budget / 2U);
+                }
+            } else {
+                // Opt-in only (NINFER_KV_RECALL_DIV>1): spread the budget over several peaks with
+                // narrower runs, then spend the remainder page by page (NINFER_KV_RECALL_FILL).
+                // Only pays off when several unrelated documents matter. On the single-document
+                // corpus it truncated the answer document: pages 732..787 returned the wrong tokens,
+                // 704..815 reproduces the reference, which is why it is not the default.
+                for (std::size_t rank = 0; rank < rescored.size() && sources.size() < slots; ++rank) {
+                    const std::uint32_t page = rescored[rank].absolute_page;
+                    bool already = false;
+                    for (const std::uint32_t done : taken) {
+                        if (done == page) { already = true; break; }
+                    }
+                    if (already) { continue; }
+                    if (!place(page, block, block / 2U)) { break; }
+                }
             }
-            // A small window leaves budget after the wide peaks; spend it on the next ranked pages so a
-            // second peak sitting outside every block still gets pulled in.
+            // Only multi-peak leaves budget behind; spend it on the next ranked pages so a second
+            // peak sitting outside every block still gets pulled in.
             const char* fill_env = std::getenv("NINFER_KV_RECALL_FILL");
-            const bool fill_extra = fill_env == nullptr || fill_env[0] != '0';
+            const bool fill_extra = multi_peak && (fill_env == nullptr || fill_env[0] != '0');
             for (const auto& candidate : rescored) {
                 if (!fill_extra || sources.size() >= slots) { break; }
                 const std::uint32_t page = candidate.absolute_page;

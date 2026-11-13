@@ -63,27 +63,58 @@ prefill chunk 循环
 ### 3.2 页摘要 `kv_retrieval.{h,cu}`
 
 - 16 个全注意力层（索引 3,7,…,63），每层 4 个 KV 头 × 256 维。
-- 每页 64 token，切成 4 个子块（每块 16 token）各求均值，取子块间最大值 —— 把 needle 落在页面
-  中间的情况救回来，避免被整页平均冲淡。
-- 摘要 = 16 层 × 4 头 × 256 维 bf16 = **128 KiB/页**。
-- 环形缓冲 `kRetrievalRingPages = 512`（必须 ≥ 单个 chunk 的最大跨页数 320；降到 128 会出现槽碰撞，
-  表现为**所有候选分数严格相等**，等于 `1/候选数` —— 看到这个数就是摘要全零的指纹）。
-- 采集点：`text.cpp` 的 `attn_mix()`，`qn`/`kn` 经 RMSNorm 之后、`text_rope` 之前。
-- query：只用最后一个 token（`kLastQueryTokens` 的平均在这里等价，实测结果相同）。
+- 每页 64 token，摘要 = 整页 pre-RoPE K 行的均值；`kRetrievalSubChunks = 1`（子块取最大的
+  变体保留在代码里但编译期关闭，归档记录仍按 3 个子块槽位预留，当前只用第 0 个）。
+- 设备侧环形缓冲 `kRetrievalRingPages = 2048` 槽 × 64 KiB（fp32）= **128 MiB**；每页交给归档的
+  bf16 记录是 96 KiB。环形缓冲必须 ≥ 单个 chunk 的最大跨页数，否则槽碰撞会让**所有候选分数严格
+  相等**（= `1/候选数`，看到这个数就是摘要全零的指纹）。
+- 采集点：`text.cpp` 的 `attn_mix()`，`qn`/`kn` 经 RMSNorm 之后、`text_rope` 之前 —— 摘要因此
+  与位置无关，可以在任意槽位上和未来的 query 比较。
+- query：prompt 读完后冻结（`freeze_query()`），只用最后一个 token；召回打分用的是「问题」，
+  不是当时在飞的那一块。
 
-### 3.3 打分 `rank()`
+### 3.3 打分 `rank()` → 两阶段精排
 
 - kernel 输出 **64 个单元**（16 层 × 4 头）的分数。
 - host 侧每个单元跨全部候选做 z-score，然后**每页取 64 个单元的最大值**。
 - 这一步是整个特性能不能用的分水岭。走过的弯路全记在下面 §5。
+- **精排（`NINFER_KV_RERANK`，默认开）**：页均值只是粗筛，所以把排名前 256 的候选页从归档里
+  取出 `rk4v4-e8` 量化 K，在 host 反量化后与「按真实位置旋转过的 query」逐页收缩（`score_page_keys()`，
+  与设备侧同一套数学），排除 sink 页（< 32 页，模板和题目本身对 query 匹配度很高但不含答案）。
+- 实测（98,218 token 中深度 needle 语料）：粗筛峰值页 760（z = 0.689），精排前后 top-1 不变
+  （760 @ 0.689），needle 区 [768,800) 的首个高分页是 #18 的 773。也就是说**精排在这份语料上
+  不移动峰值**，它是一条稳健性保险，不是消偏手段 —— 消偏靠下一节的「以峰值为中心取整段」。
 
 ### 3.4 召回 `context.cpp::recall_into_tail()`
 
 - `want = NINFER_KV_RECALL_PAGES`（默认 **112** 页 = 7168 token）。
-- top-1 页 → `backoff = want/2`（默认 56）→ 取 `[peak - 56, peak + 56)` 连续段。
+- 三条策略，默认是第一条（自适应）：
+  - **自适应单段/两段**（默认，`NINFER_KV_RECALL_SPLIT=0` 可关掉第二段）：先看名次表里的第二名峰值，
+    只有它**同时**满足「离 top-1 ≥ 28 页」且「得分 ≥ 0.35 × top」才算另一份文档，这时把预算切成
+    两段：主峰 `56` 页、次峰 `56` 页。主峰段**前偏**（`backoff = width/4`，吸收实测峰值比文档早
+    约 8 页的偏置），次峰段**居中**（`backoff = width/2`，其次峰与文档的相对位置未测）。
+    不满足条件时退化成「整段 112 页居中」，与 r9 行为逐 token 等价。
+  - **单整段**（强制）：把预算全给 top-1 峰，`begin = peak - slots/2`。r9 的行为。
+  - **多峰窄块**（显式 `NINFER_KV_RECALL_DIV>1`）：把预算切成 `slots / DIV` 宽的窄块，按名次绕多个峰值，
+    再用 `NINFER_KV_RECALL_FILL`（默认开，仅此模式生效）把剩余预算逐页补满。
+  > 反面教训：0.1.1 曾把窄块设成默认（DIV 自动取 2/4），单文档 needle 上块 `[732,787)` 直接丢了
+  > 答案文档，输出 `45 10052 248046` 而不是参考 token；整段 `[704,815)` 逐 token 复现。
+  > 所以缩窄只能是 opt-in，默认必须是整段。
+- 自适应分块的实测依据（`build/_recall_split_check.py`、`build/_recall_real_check.py`）：
+  - 98K 单文档 needle：精排 top3 = `760@0.68942 761@0.01035 978@0.00662`，次峰仅 1.5% ⇒ **不切分**，
+    召回页仍是 `704..815`，32768 / 20480 两档都逐 token 等于 GT。单文档行为零变化。
+  - 双文档语料（ATLAS 在 25%、BOREAL 在 50%，相距 30K token）：top3 = `915@0.23831 449@0.18314`（82%）
+    ⇒ 切分，两段合起来覆盖两份文档。问 ATLAS 时：不切分只召回 `859..970`（BOREAL 所在），模型答成
+    BOREAL 的事实；切分后答对 `NINFER-ATLAS-1111`。
+  - **已知限制**：如果两份文档的口令是近似字符串（`NINFER-<NAME>-<NNNN>`），两段同时在上下文里时
+    模型会把一个名字和另一个的数字拼起来（实测答 `NINFER-ATLAS-2222`）。这是模型行为，不是投递
+    缺陷；判别语料要用不可混淆的事实（例如一份给口令、一份给日期）。
+  - **预算不能加**：`DIV=2` + `PAGES=168`（84+84）反而把 needle 打坏（`45 10052 248046`）。总预算必须
+    维持 112 页 —— 分块是「在同等预算内改覆盖形状」，不是「多召回一些」。
 - `archive->recall_pages(start * 64, want)` → `pool.copy_from_host()` 写到槽位
   `[sink_pages, sink_pages + 112)`。
 - 写之前先把这些槽位原有的页归档（`watermark` 过滤防止重复归档），再更新 watermark。
+- 闸门：`archived < want` 时直接返回（窗口还装得下就不召回），并且只有真的换入了页才重放最后 chunk。
 
 ### 3.5 重放 `prefill.cpp`
 
@@ -102,10 +133,13 @@ prefill chunk 循环
 | `--sink-tokens N` | `NINFER_SINK_TOKENS` | 2048 | attention sink token 数 |
 | `--archive-mib N` | `NINFER_KV_ARCHIVE_MIB` | 2048 | 主机 arena；给这个参数自动开归档 |
 | `--kv-retrieval 1` | `NINFER_KV_RETRIEVE` | 0 | 打开检索召回（同时自动开归档，并按 `--resident-tokens` 推 arena 大小） |
-| `--kv-recall-pages N` | `NINFER_KV_RECALL_PAGES` | 112 | 召回页数（112 页 = 7168 token） |
-| — | `NINFER_KV_RECALL_BACKOFF` | slots/2 | top-1 之前回退页数 |
+| `--kv-recall-pages N` | `NINFER_KV_RECALL_PAGES` | 112 | 召回页数（112 页 = 7168 token）。r9 默认 0（完全 opt-in），0.1.1 起默认 112 |
+| — | `NINFER_KV_RERANK` | 1 | 两阶段精排（top-256 用归档 int4 K 重打分，排除前 32 个 sink 页）；设 0 只用页均值 |
+| — | `NINFER_KV_RECALL_DIV` | 1 | 1 = 单整段（r9 行为）；>1 才切成多峰窄块 |
+| — | `NINFER_KV_RECALL_SPLIT` | 1 | 自适应第二段：次峰够近够强时自动分成两段；`0` = 只用单整段 |
+| — | `NINFER_KV_RECALL_FILL` | 1 | 仅 `DIV>1` 时生效：用剩余预算逐页补满名次靠前的页 |
 | — | `NINFER_KV_REPLAY` | 1 | 设 0 关闭最后 chunk 重放 |
-| — | `NINFER_KV_AGG` | avg | `max` 回退到旧的逐单元取最大聚合 |
+| — | `NINFER_KV_AGG` | max | `avg` 回退到旧的逐单元平均聚合 |
 | — | `NINFER_KV_DETREND` | 0 | 距离去趋势（实测有害，默认关） |
 
 `--kv-retrieval` 的自动档位：不给 `--archive-mib` 时按 `2 × resident × 17920 B` 推算并夹在
@@ -171,8 +205,10 @@ prefill `801.997 → 800.446`，decode `33.14 → 33.62`，噪声内。
 | 32768 | 512 页 | 否（纯召回） | 与 GT **逐 token 相同** |
 | 65536 | 1024 页 | 是 | 与 GT 逐 token 相同 |
 
-GT = `45 669 24312 10846 8006 5434 12 19 19 22 16 248046`；召回段 `112 pages from token 45056`，
-重放 `4 tokens`。`[kv-rank]` 里 needle 页名次 #8、峰值页 760（含 8 页定位误差，112 页段兜住）。
+GT = `45 669 24312 10846 8006 5434 12 19 19 22 16 248046`；召回段 `704..815`（112 页，
+以峰值页 760 为中心）`from token 45056`，重放 `4 tokens`。`[kv-rank]` 里 needle 区
+[768,800) 的最高名次是 #18（页 773），探测页 768 在 #71；峰值页 760 比 needle 区早 8 页 ——
+这正是「以峰值为中心取整段」而不是取单页的原因。
 
 > 注：`tasks_needle_q25/q75/q92` 语料在 needle 之后还夹了一条「列出 1..400 的整数」的指令，
 > 模型会去答那道题，因此**不能**用它们判断召回命中；只有 mid 语料是可信 oracle。
@@ -185,11 +221,12 @@ mtp `80.21 / 842.2` —— 全部在容差内，无回退。
 
 ## 7. 已知限制
 
-- 打分是**启发式**，定位误差约 ±8 页（512 token），所以取 112 页连续段兜住，代价是显存里
-  有 7K token 的「陪跑」。真正消掉误差要靠两阶段精排，而归档页是 `rk4v4-e8` 量化格式
-  （`page_stride = 1146880 B`），主机侧要先写反量化才能做逐 token 精排，暂未做。
-- 摘要是**页均值**，容量上界是 Quest 的 per-channel min/max 上界；后者能把「页内某一维特别
-  突出」的信号留住，是下一步最现实的算法升级。
+- 打分是**启发式但有精排兜底**：页均值粗筛的峰值比文档早约 ±8 页（实测峰值 760 / needle 区
+  768..800），所以召回取「以峰值为中心的整段」而不是单页。两阶段精排（top-256 用归档 int4 K
+  重打分，默认开）在这份语料上不移动 top-1，它保证的是「粗筛把某一页排到前面但内容不符」时
+  不会选错；真正的偏置仍由整段宽度吸收。
+- 摘要是**页均值**（`kRetrievalSubChunks = 1`）。容量上界是 Quest 的 per-channel min/max；
+  子块取最大的变体代码里已有，但编译期关闭，开启前需要重测（早期开着时反而更差）。
 - 摘要环形缓冲 **2048 槽**，一个 chunk 的页数上限就是它（当前 chunk 宽度 = 常驻窗口）。
   窗口 ≥ 131072 token 时会绕回、`tags_` 被覆盖、分数退化成 `1/候选数` —— 要开更大窗口必须
   同步扩大 ring（`kRetrievalRingPages`）。
@@ -297,6 +334,19 @@ error: request reservation exceeds Engine shared KV capacity
 被切碎。**结论：长上下文窗口 ≥ 32768 起步。** 显存按 int4 `17,920 B/token` 估算：32768 → 0.59 GB、
 65536 → 1.17 GB，叠加 MTP 草稿行后 65536 已贴边。
 
+### 9.1 `--ctx` 给大了会静默降速（不是功耗回归）
+
+`--ctx` 决定 KV 池要预留多少。池装不下时引擎**不会报错**，而是退回一条半速路径：prefill 从
+424 掉到 350、decode 从 24.8 掉到 11.8，日志里一个字都没有。实测差异只体现在启动余量：
+
+| ctx | KV 池 | 启动后可用 | 结果 |
+|---|---|---|---|
+| 110000 | 1.97 GB | `avail_after_startup=1,226,964,992` | prefill 350 / decode 11.77（静默降速） |
+| 100000 | 1.79 GB | `avail_after_startup=1,405,878,272` | prefill 424 / decode 24.79（正常） |
+
+同一份 98,155-token 语料、同一二进制，只改 `--ctx`。所以看到"长上下文臂忽然掉一半"，先量
+`avail_after_startup`，别先去翻 kernel。`build/_gate.py` 的 96k 臂因此从 110000 定到 100000。
+
 ## 10. 已知问题：召回后末位停止符可能差 1 个（P3，暂不修）
 
 **现象**：开启召回、且召回真的换入了页的档位（实测 32K@8192、64K@16384），生成的最后一个 token
@@ -319,3 +369,133 @@ argmax 落到同族的另一个停止符上。删掉重放会立刻答错（`991
 ①重放前把末位 logits 那一行存到设备缓冲、重放后 `cudaMemcpyAsync` 还原（KV 用重放的、logits 用重放前的，约十行，不影响速度）；
 ②只重放 KV、不重算末位 logits。
 **正向用途**：末位出现 `248044` 可以作为"这次运行确实走了召回+重放"的快速指纹。
+
+## 11. 深度复核（0.1.2）：196K–261K 精度与速度
+
+复核目的：确认「prefill / decode 不降的前提下，长上下文可用且精度与上游一致」。配置统一为
+`--resident-tokens 32768 --sink-tokens 2048 --kv-retrieval 1`、`NINFER_KV_ARCHIVE_MIB=4096`、
+`--kv rk4v4-e8`，语料是同一套压测文（口令 `NINFER-ZEBRA-4471`，问题问口令）。
+
+| 语料 | 实际 prompt token | `--ctx` | prefill | decode | 命中 |
+|---|---|---|---|---|---|
+| `tasks_hh192k.txt` | 196,423 | 262144 | 540.4 t/s | 29.77 t/s | ✅ 与 GT 逐 token 相同 |
+| `tasks_hh256k_trim.txt` | 251,201 | 262144 | 534.9 t/s | 30.50 t/s | ✅ 同上 |
+| `tasks_hh262k.txt` | 260,909 | 262144 | 534.1 t/s | 29.79 t/s | ✅ 同上 |
+
+深度从 196K 拉到 261K，prefill 变化 1.2%、decode 变化 2.4%，与 r9 的 192K 档（535.7 / 33.8）
+同一水平线。三档 IDS 均为 `45 669 24312 10846 8006 5434 12 19 19 22 16 248046`。
+
+### 11.1 上限 262,144 是模型的 `max_position_embeddings`，不是我们设的
+
+`ninfer/src/models/qwen3_5/program/planning/startup.cpp:752-755`：
+
+```cpp
+if (options.max_context == 0 ||
+    options.max_context > parameters.model.config().text.max_position_embeddings) {
+    throw std::invalid_argument("max_context exceeds the configured position capacity");
+}
+```
+
+所以 `--ctx 393216` 会立刻失败（实测 7.6 s 退出），而 `--ctx 262144` 是合法的最大值。
+原 `tasks_hh256k.txt` 实测约 264K token，**天生超过这个上限**，任何配置都跑不了；要验「接近上限」
+必须按实测比例（这篇语料 3.9995 chars/token，251,201 token ↔ 1,004,983 chars）重新裁一份。
+准确说法是「≤262,144 token 可用，实测到 260,909（99.5%）」。
+
+### 11.2 多文档 A/B：单整段 vs 多峰分块
+
+语料 `tasks_multidoc.txt`：118,235 token，两个互不相关的事实分别埋在 25%（ATLAS）与 50%（BOREAL）
+深度，问题要求同时给出两个口令。两个事实都在 32K 尾部窗口之外，必须靠召回。
+
+| 档 | 实际召回页 | 回答 |
+|---|---|---|
+| 全窗口参照（`--resident-tokens 131072`，不召回） | — | ✅ 两个口令都给出 |
+| 单整段（默认） | `859..970`，中心 915 ≈ BOREAL | ❌「文中没有 ATLAS / BOREAL」 |
+| 多峰（`NINFER_KV_RECALL_DIV=2`） | `887..942`（含 BOREAL）+ `421..476`（含 ATLAS） | ❌ 同上，**逐 token 与单整段相同** |
+| 单整段 + 问题只问 BOREAL | `859..970` | ✅ `NINFER-BOREAL-2222` |
+| 去掉 ATLAS 事实 + 问题只问 BOREAL | `859..970` | ✅ `NINFER-BOREAL-2222` |
+
+结论三条：
+
+1. **召回投递是对的**。`[kv-refine] top3: 915@0.2297 449@0.1888` 精确落在 BOREAL（page 922）与
+   ATLAS（page 459）上；只问一个事实时答案逐 token 正确。
+2. **问「两个都要」时两种策略都无法作答**——模型给的是「文中没有 ATLAS / BOREAL」，两种策略
+   逐 token 相同。这是模型行为限制（上下文只恢复一部分、问题却要求两处），不是投递缺陷，
+   所以**这个问法不能用来评判多峰**。
+3. **多峰的真实收益要问「次峰那个事实」才看得出来**（下表）。单峰只装 top-1 所在的那一段，
+   问题问的是另一个事实时，模型会**自信地答成 top-1 的口令**；多峰把两个峰都装进来才答对。
+
+| 问题 | 单整段（默认，`859..970` 只含 BOREAL） | 多峰（`887..942` + `421..476`） | 真值 |
+|---|---|---|---|
+| ATLAS 的口令？ | ❌ `NINFER-BOREAL-2222`（答成另一个事实） | ✅ `NINFER-ATLAS-1111` | ATLAS |
+| BOREAL 的口令？ | ✅ `NINFER-BOREAL-2222` | ✅（单整段已覆盖） | BOREAL |
+| 两个口令都要？ | ❌ 拒答 | ❌ 拒答（逐 token 相同） | 两条 |
+
+因此 0.1.2 的取舍是：**默认单整段**（单针/单事实永不回归，且实测 98K mid 语料逐 token 对），
+**多峰保留为显式 opt-in**（`NINFER_KV_RECALL_DIV=2`，多事实场景实测能把次峰事实答对）。
+两者不是替代关系：单峰覆盖更深（112 页连续），多峰覆盖更广（两个 56 页段）。
+
+> 历史：多峰最初在 `94b3556` 引入，理由是平均聚合让峰值提前约 8 页，块必须**从峰值向后延伸**
+> 才能盖住 needle 区（top-1 峰 760 的块 `[760,816)` 覆盖 needle `[768,800)`）。后来 `38934cf`
+> 改成「以峰值为中心」，`82b8d88` 又引入 `divisor` 把块缩到 `slots/2`，两个改动叠加后向前只剩
+> 28 页，盖不住 needle 区尾部 → 这就是 0.1.1 的回归来源。
+
+### 11.3 与上游 llama-kvmem 同语料对拍
+
+同机同卡、同一份语料、同一问题、两边都开 MTP2；上游参数见 §8（`--kvmem --kvmem-budget 32768
+--kvmem-gen-reserve 32768 --kvmem-block-tokens 128 --kvmem-query-policy user -ctk q8_0 -ctv q4_0`）。
+
+| 语料 | 上游 prefill | 上游 decode | 本引擎 prefill | 本引擎 decode |
+|---|---|---|---|---|
+| 196K | 336.5 t/s | 24.28 t/s | 540.4 t/s | 29.77 t/s |
+| 250K | 323.2 t/s | 29.15 t/s | 534.9 t/s | 30.50 t/s |
+
+两边都命中口令。prefill 约 1.6×，decode 持平到略快。注意上游 KV 是 `q8_0`/`q4_0` 量化，
+本引擎是 `rk4v4-e8`，两者不是同一个精度档，此表只用于"精度行为对不对"和"速度量级"，不作
+逐 token 等价声明。
+
+### 11.4 准确率对拍：8 例逐条一致（0.1.2）
+
+§11.3 只比了两条长语料，这里补上完整的准确率矩阵。**做法**：8 个用例、同一份 prompt、两边都
+用 32K KV 预算、贪心解码（`temperature=0`），比"答案字符串是否命中语料里的口令"，不比 token 序列
+（两边 KV 精度档不同，逐 token 比较没有意义）。脚本 `build/_accuracy_parity.py`
+（`--ours-only` / `--upstream-only` 两段跑，避免抢 GPU）。
+
+| 用例 | 语料长度 | 我们 | 上游 llama-kvmem |
+|---|---|---|---|
+| q25（needle 25%，页 395） | 32K | PASS `NINFER-ZEBRA-4471` | PASS |
+| q50（页 790） | 32K | PASS `NINFER-KOALA-8823` | PASS |
+| q75（页 1186） | 32K | PASS `NINFER-VIPER-1092` | PASS |
+| q92（页 1454） | 32K | PASS `NINFER-ORCA-7745` | PASS |
+| mid（50%，页 790） | 32K | PASS `NINFER-ZEBRA-4471` | PASS |
+| multi（双文档，页 462） | 32K | PASS `NINFER-ATLAS-1111` | PASS |
+| 196K | 196K | PASS `NINFER-ZEBRA-4471` | PASS |
+| 250K | 250K | PASS `NINFER-ZEBRA-4471` | PASS |
+
+**准确率：8/8 对 8/8，逐例答案一致**（q75/q92 其实落在 32K 常驻窗口内，不走召回，用来验证
+"不召回时也不退化"）。速度**必须在两边都开 MTP2 的前提下比**（第一版我们忘了给自己开
+`--spec mtp --draft-tokens 2`，拿 AR 去比人家的投机解码，得出的"decode 低 10%"是假的）：
+
+| 用例 | 我们 wall / prefill / decode | 上游 wall / prefill / decode |
+|---|---|---|
+| q25 | 191.9s / 557.3 / **41.05** | 256.3s / 384.6 / 25.14* |
+| q50 | 191.0s / 558.7 / **34.78** | 260.6s / 378.2 / 32.85 |
+| q75 | 191.0s / 558.2 / **41.51** | 260.0s / 379.0 / 33.25 |
+| q92 | 191.0s / 559.0 / **35.32** | 259.9s / 379.2 / 32.27 |
+| mid | 191.0s / 558.7 / **35.18** | 260.3s / 378.6 / 33.33 |
+| multi | 239.1s / 550.6 / **41.53** | 328.6s / 361.0 / 33.01 |
+| 196K | 383.2s / 536.6 / **40.01** | 593.4s / 331.9 / 32.99 |
+| 250K | 495.3s / 532.6 / 32.42 | 779.5s / 323.1 / 32.93 |
+
+\* 上游 q25 是它第一例（预热），后面稳定在 32–33，因此以 32–33 为准。
+
+结论：**prefill 1.4–1.6×，decode 除 250K 档基本持平（32.42 vs 32.93）外全部更快（35–42 vs 32–33）**。
+我们 KV 是 int4/int4、上游是 q8_0/q4_0，本引擎每 token 读的 KV 字节更少，这部分优势在 decode 上体现出来了；
+250K 档被归档页的 host↔device 换入换出吃掉，是下一步 decode 优化的重点。
+
+> **评测语料曾经是坏的（2026-11-13 发现）**：`tasks_needle_q*.txt`、`tasks_needle_mid_q.txt`、
+> `tasks_hh*.txt` 末尾的中文问句在生成时被写成了 U+FFFD 替换字符，q 系列里唯一可读的指令是英文
+> 诱饵 `Question: List the integers from 1 to 400 …`。模型照着诱饵列整数**不是召回失败**。
+> 现在回归统一用 `build/_mk_fixed_corpora.py` 重新生成的 `tasks_fix_*.txt`（U+FFFD 计数为 0），
+> 上述 8 例均在这些修好的语料上跑出。教训：**评测语料要先断言"问句可读"，再谈命中率**；以及
+> **对拍两侧的启动参数必须逐项核对**（`--spec`/MTP 一开一不开会让 decode 结论完全反过来）。
+

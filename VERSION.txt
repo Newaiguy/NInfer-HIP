@@ -1,12 +1,12 @@
-NInfer-HIP 0.1.1
+NInfer-HIP 0.1.2
 ================
 
 名称        : NInfer-HIP —— NInfer 引擎的 AMD RDNA4 / HIP 移植版
 仓库        : https://github.com/Newaiguy/NInfer-HIP
-发布        : https://github.com/Newaiguy/NInfer-HIP/releases/tag/v0.1.1
+发布        : https://github.com/Newaiguy/NInfer-HIP/releases/tag/v0.1.2
 许可        : Apache-2.0（派生自 https://github.com/Neroued/ninfer，改动见 docs/PATCHLIST.md）
-状态        : 正式版（0.1.1）
-构建时间    : 2026-11-12
+状态        : 正式版（0.1.2）
+构建时间    : 2026-11-13
 目标硬件    : AMD Radeon RX 9070 XT 16GB (RDNA4, gfx1201), 640 GB/s
 运行系统    : Windows 11 26200 (25H2) + HIP SDK 7.2.3 (AMD Software 26.8.1)
 模型        : WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3（官方 v3 单文件 artifact）
@@ -15,14 +15,64 @@ NInfer-HIP 0.1.1
 
 引擎        : infer-mini.exe（CLI / chat，文本 + MTP）
   size      : 191,703,040 B
-  sha256    : e89fc926bd3026ac38f5c3a92a5c3dd632bbeb4a9d17b89fcda1ed90f47c9924
+  sha256    : 07be07f59a2ef9e19fba367b76e794bac1327622ad8a8fbad2fab25abc85fdbd
 
 引擎        : infer-serve.exe（OpenAI 兼容 HTTP 服务，文本 + MTP + 视觉）
   size      : 192,038,912 B
-  sha256    : 0b6f04c667b0fbd4621404cfcd046d268ba22f9ae5fd3ceae85a268856eb283b
+  sha256    : 5f1e778e1b86d8327fdead084c9cde1dc8180161fb7a8063f1835b76331128d8
 
 --------------------------------------------------------------------------------
-本版核心一：视觉链路修好（三个真缺陷 + 两个权重合同）
+本版核心：KV 召回的宽度回归修好（0.1.1 → 0.1.2）
+--------------------------------------------------------------------------------
+
+0.1.1 在长上下文召回上引入了一个回归：r9 是「以打分最高的页为中心，取召回预算
+（默认 112 页 = 7168 token）那么宽的一整段」；0.1.1 把单段宽度改成 `预算 / divisor`，
+divisor 默认还按归档量在 2 和 4 之间自动取 —— 于是 112 页的预算被切成 56 或 28 页的
+窄块，围绕多个峰值分散放置。
+
+单文档 needle 语料上这直接把答案文档切掉了（98,218 token、needle 在第 768~800 页）：
+
+  窄块（以峰值页 760 为中心、56 页宽）  召回页 732..787   输出 `45 10052 248046`（错）
+  整段（r9 行为）            召回页 704..815   输出与参考逐 token 一致
+
+修复不是改默认参数，而是把「单整段」重新做成两种策略里的默认实现：
+  - 单整段（默认）：取 top-1 页，`begin = peak - 预算/2`，`NINFER_KV_RECALL_BACKOFF`
+    仍可按 r9 的语义覆盖中心偏移。
+  - 多峰（显式 `NINFER_KV_RECALL_DIV>1` 才启用）：把预算切成窄块绕多个峰值，
+    再用 `NINFER_KV_RECALL_FILL`（默认开，仅此模式生效）把剩余预算逐页补满。
+    `DIV=1` 时整段已用满预算，fill 不再参与。
+
+另外两个配套修正：
+
+  * `build/_gate.py` 的默认 exe 还指向 2026-11-09 的旧二进制（`infer_mini_nordc.exe`），
+    导致门禁在过期的可执行文件上测；现在默认 `build/infer_mini.exe`。同一原因也解释了
+    「96k 掉一半」的假警报 —— 那是另一件事：KV 池装不下时引擎会静默降速。
+  * 96k 门禁臂的 ctx 从 110000 降到 100000：prompt 98,155 token、权重占 11.76 GB 后
+    只剩 3.81 GB，110000 的池要 1.97 GB、只留 1.23 GB 启动余量，引擎会**无声地**
+    切到半速路径（prefill 350 / decode 11.8，而不是 424 / 24.8），日志里没有任何报错。
+    池装得下就是正常速度；这条写进 docs/KVMEM.md，避免下次再当成功耗回归。
+
+召回行为验证（默认参数，无额外环境变量）
+
+  98K needle、常驻窗口 32768：needle 深度 25% / 50% / 75% 三档，召回输出与
+  「窗口装得下全文」的完整上下文输出逐 token 一致；92% 那一档 needle 本来就在窗口内，
+  两条路径都答语料里那句干扰指令，内容相同（只有空白 token 的切分方式不同）。
+
+服务端场景矩阵（`build/_serve_matrix.py`，一次起进程跑 9 个场景，9/9 通过）
+
+  models / 普通补全 / SSE 流式（28 chunks）/ 单图视觉 / 两图视觉 / 多轮召回 /
+  content part 缺 type 的降级 / 坏 payload / 超长 prompt
+
+其中两项是本版修掉的 HTTP 语义缺陷（此前都返回 500）：
+
+  * 请求体形状不对（例如 `"messages": "not-a-list"`）现在返回 400
+    `invalid_request_error`，不再是 500；
+  * prompt 超出引擎上下文现在返回 400 `invalid_request_error`，并保留原始
+    `prepared prompt exceeds Engine max_context N` 文本，不再伪装成 500
+    `internal_error`。
+
+--------------------------------------------------------------------------------
+0.1.1 的核心工作（历史，仍然有效）：视觉链路修好
 --------------------------------------------------------------------------------
 
 0.1.0-pre-r9 的引擎能读图，但空间理解是错的：单色块位置题几乎一律答 top-left，
@@ -101,11 +151,23 @@ NInfer-HIP 0.1.1
 --------------------------------------------------------------------------------
 
 graph on，KV = rk4v4-e8（int4 K / int4 V），--ctx 贴紧实际 prompt 长度
-  GATE 8k        : decode 36.50 t/s   prefill 985.9   （基线 33.63 / 937.4，+8.5% / +5.2%）
-  GATE 96k       : decode 25.30 t/s   prefill 428.4   （基线 24.28 / 423.4，+4.2% / +1.2%）
-  GATE mtp       : decode 82.11 t/s   prefill 891.3   （基线 77.90 / 860.2，+5.4% / +3.6%）
-  长上下文       : 192K（196,427 token，窗口 32768）逐 token 正确，prefill 535.7 / decode 33.8
+  GATE 8k        : decode 35.41 t/s   prefill 932.7   （基线 33.63 / 937.4，+5.3% / -0.5%）
+  GATE 96k       : decode 25.01 t/s   prefill 423.6   （基线 24.28 / 423.4，+3.0% / +0.0%）
+  GATE mtp       : decode 79.88 t/s   prefill 854.7   （基线 77.90 / 860.2，+2.5% / -0.6%）
+  长上下文       : 192K（196,423 token，窗口 32768 + 归档 4096 MiB + 召回）逐 token 正确
+                   prefill 540.4 / decode 29.77
+                   250K（251,201 token）逐 token 正确，534.9 / 30.50
+                   261K（260,909 token = 262,144 上限的 99.5%）534.1 / 29.79
+                   深度从 196K 拉到 261K，prefill 变化 1.2%、decode 变化 2.4%
+                   同语料对拍上游 llama-kvmem：196K 上游 336.5 / 24.28，本引擎 540.4 / 29.77
+                   250K 上游 323.2 / 29.15，本引擎 534.9 / 30.50
                    128K（130,700 token）544.3 / 34.4
+  准确率对拍     : 8 例（q25/q50/q75/q92/mid/双文档/196K/250K）本引擎 8/8、上游 llama-kvmem 8/8，
+                   逐例答案一致 ⇒ 准确率不低于上游。双方都开 MTP2 时我们 prefill 1.4–1.6×、
+                   decode 35–42 t/s（上游 32–33），仅 250K 档持平（32.42 vs 32.93）。
+                   两边 KV 精度档不同（我们 int4/int4，上游 q8_0/q4_0），只比答案与速度量级。
+                   评测语料已修好：原 tasks_needle_*/tasks_hh* 的中文问句是 U+FFFD 乱码，
+                   模型只能读英文诱饵，早期判分作废。
   GDN 前向       : 96K 档较 r9 提升 ~4%，来自 GDN chunked 路径的算子修复
 
 --------------------------------------------------------------------------------
@@ -131,10 +193,22 @@ graph on，KV = rk4v4-e8（int4 K / int4 V），--ctx 贴紧实际 prompt 长度
     会无差别扫 .cu，故会报 CUtensorMap/CUresult 未定义，属预期，不影响 ROCm 产物
   serve_mini 未注册进 ninfer/apps/CMakeLists.txt，发布用 harness/build_serve.py 独立构建
   int8 KV 非确定性 · fp8 KV 的 QK 是 __builtin_trap() 桩 · dflash2 坏路径
-  126K 以上 MTP（差 0.5 GB 预算）· prefill >=64K 落后 llama · 256K 需 KV offload
+  126K 以上 MTP（差 0.5 GB 预算）· prefill >=64K 落后 llama
+  256K 可用，但必须开窗口 + 主机归档（裸跑装不下）；--ctx 上限 262,144 是模型的
+    max_position_embeddings（startup.cpp:752-755 直接拒绝更大值），实测到 260,909
   短上下文 45 t/s 未达（AR 37.3，物理上限 54）
-  召回是启发式：页均值打分定位误差约 ±8 页，取 112 页连续段兜住；必须读完 prompt
-    才能召回（query 取最后一个 token）；只在 needle 语料上验证过
+  召回仍需先读完 prompt（query 在 prompt 结束后冻结）；打分是 pre-RoPE 页均值点积，
+    再用归档 int4 K 对 top-256 精排兜底（实测精排不移动峰值，只是稳健性保险）；
+    默认取以峰值页为中心的整段 112 页，已在 25%/50%/75% needle 深度与 196K/250K/261K
+    深度上与完整上下文逐 token 对拍一致
+  多文档场景：默认策略是自适应 —— 次峰同时满足「距 top-1 ≥ 28 页」且「得分 ≥ 0.35×top」
+    时，把 112 页预算切成两段 56/56（主段前偏、次段居中），否则退化为单整段，与 r9 行为
+    逐 token 等价。实测：98K 单针语料次峰仅 1.5% ⇒ 不切分，召回页 704..815 不变、逐 token
+    等于 GT；双文档语料次峰 82% ⇒ 切分，问次峰事实能答对（不切分时答成主峰文档的事实）。
+    已知限制：两份文档的口令若是近似字符串（NINFER-<NAME>-<NNNN>），两段同时在上下文里时
+    模型会把一个名字与另一个的数字拼起来（实测答 NINFER-ATLAS-2222），属模型行为而非投递
+    缺陷，判别语料要用不可混淆的事实（一份口令、一份日期）。另：分块不能靠加预算，
+    DIV=2 + PAGES=168（84+84）反而把 needle 打坏，总预算必须维持 112 页。
 
 --------------------------------------------------------------------------------
 重要用法与安全铁律
@@ -176,6 +250,6 @@ graph on，KV = rk4v4-e8（int4 K / int4 V），--ctx 贴紧实际 prompt 长度
 6. 修 GDN chunked 的 `mma16_swiz_x_raw` 先用后声明（干净 CMake 构建会失败）。
 7. VISION 文档重写：结论、证据、被否证的假设、可复用的对拍工具。
 
-二进制 sha256 : e89fc926bd3026ac38f5c3a92a5c3dd632bbeb4a9d17b89fcda1ed90f47c9924 (infer-mini.exe)
-                0b6f04c667b0fbd4621404cfcd046d268ba22f9ae5fd3ceae85a268856eb283b (infer-serve.exe)
+二进制 sha256 : 07be07f59a2ef9e19fba367b76e794bac1327622ad8a8fbad2fab25abc85fdbd (infer-mini.exe)
+                5f1e778e1b86d8327fdead084c9cde1dc8180161fb7a8063f1835b76331128d8 (infer-serve.exe)
 二进制大小    : 191,703,040 B / 192,038,912 B

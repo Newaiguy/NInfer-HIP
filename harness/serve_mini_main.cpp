@@ -1,4 +1,4 @@
-﻿// Minimal OpenAI-compatible HTTP server for the NInfer->HIP build.
+// Minimal OpenAI-compatible HTTP server for the NInfer->HIP build.
 //
 // The probe harness (mini_main.cpp) already drives the engine, but it only speaks the command line.
 // This entry keeps the same Engine setup and exposes it over HTTP so tools that expect OpenAI's API
@@ -101,6 +101,14 @@ std::string error_body(const std::string& message, const char* type) {
     json body;
     body["error"] = json{{"message", message}, {"type", type}, {"code", nullptr}};
     return body.dump();
+}
+
+// A prompt that does not fit is a client error, not an engine fault: the caller can shorten it.
+// Anything else thrown by prepare()/generate() stays a 500 so real engine faults stay visible.
+bool is_request_too_large(const std::string& message) {
+    return message.find("exceeds") != std::string::npos &&
+           (message.find("max_context") != std::string::npos ||
+            message.find("reservation") != std::string::npos);
 }
 
 // Chunk stream shared between the generation worker and the HTTP writer.
@@ -294,12 +302,37 @@ int main(int argc, char** argv) {
             return;
         }
 
+        // A client mistake must not surface as a 500: everything below reads the body through
+        // json accessors that throw on the wrong shape, and letting those escape turned
+        // "messages": "not-a-list" into "internal_error".
+        if (!body.is_object()) {
+            response.status = 400;
+            response.set_content(error_body("request body must be a JSON object",
+                                            "invalid_request_error"),
+                                 "application/json");
+            return;
+        }
+        if (body.contains("messages") && !body.at("messages").is_array()) {
+            response.status = 400;
+            response.set_content(error_body("messages must be an array of message objects",
+                                            "invalid_request_error"),
+                                 "application/json");
+            return;
+        }
+
         PromptInput input;
         bool think = body.value("enable_thinking", false);
         input.options.enable_thinking = think;
 
         const auto messages = body.value("messages", json::array());
         for (const auto& message : messages) {
+            if (!message.is_object()) {
+                response.status = 400;
+                response.set_content(error_body("each entry of messages must be an object",
+                                                "invalid_request_error"),
+                                     "application/json");
+                return;
+            }
             ChatMessage out;
             out.role = parse_role(message.value("role", "user"));
             const auto& content = message.contains("content") ? message.at("content") : json();
@@ -390,8 +423,12 @@ int main(int argc, char** argv) {
                                                      finish_reason_name(result.finish_reason)}}});
                     queue->push("data: " + tail.dump() + "\n\n");
                 } catch (const std::exception& error) {
+                    const std::string message = error.what();
                     json failure;
-                    failure["error"] = json{{"message", error.what()}, {"type", "internal_error"}};
+                    failure["error"] = json{
+                        {"message", message},
+                        {"type", is_request_too_large(message) ? "invalid_request_error"
+                                                              : "internal_error"}};
                     queue->push("data: " + failure.dump() + "\n\n");
                 }
                 queue->push("data: [DONE]\n\n");
@@ -455,8 +492,15 @@ int main(int argc, char** argv) {
                                                         result.generated_token_ids.size()}};
             response.set_content(answer.dump(), "application/json");
         } catch (const std::exception& error) {
+            const std::string message = error.what();
+            if (is_request_too_large(message)) {
+                response.status = 400;
+                response.set_content(error_body(message, "invalid_request_error"),
+                                     "application/json");
+                return;
+            }
             response.status = 500;
-            response.set_content(error_body(error.what(), "internal_error"), "application/json");
+            response.set_content(error_body(message, "internal_error"), "application/json");
         }
     });
 

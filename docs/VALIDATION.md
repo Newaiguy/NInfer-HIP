@@ -1,5 +1,49 @@
 # 验证记录（0.1.0-pre-r2）
 
+> **0.1.2 追加（2026-11-13，最高优先级）**：0.1.1 的发布二进制带着一个 KV 召回回归，
+> 0.1.2 修好并重新跑完全部门禁与场景测试。二进制口径为
+> `infer-mini.exe` 191,703,040 B / `infer-serve.exe` 192,038,912 B（sha256 见 VERSION.txt）。
+>
+> ## 0.0 0.1.2 门禁、召回与场景矩阵
+>
+> | 项目 | 命令 | 结果 |
+> |---|---|---|
+> | LayerNorm 正式用例 | `build/_build_layer_norm_test.py` | `OK layer_norm correctness` |
+> | packed attention 正式用例 | `build/_build_plain_packed_attention_test.py` | `packed_softmax_attention: PASS` |
+> | GATE 8k | `build/_gate.py --arms 8k` | decode **35.41** / prefill **932.7**（+5.3% / −0.5%）PASS |
+> | GATE 96k | `build/_gate.py --arms 96k` | decode **25.01** / prefill **423.6**（−0.5% / −0.4%）PASS |
+> | GATE mtp | `build/_gate.py --arms mtp` | decode **79.88** / prefill **854.7**（+2.5% / −0.7%）PASS |
+> | 服务端场景矩阵 | `build/_serve_matrix.py` | **9/9**（含两处 500→400 修复） |
+> | 视觉九图 | 三档各 **9/9**；真实照片 **4/4** 抽检 | 与 0.1.1 一致 |
+>
+> 长上下文（`build/_longctx_verify.py`，resident 32768 + archive 4096 MiB + 召回 + MTP2，
+> 默认自适应分块）：**196K `540.4 / 29.77`、250K `534.9 / 30.50`、261K `534.1 / 29.79`，三档全部
+> HIT**，ids 与参考逐 token 相同。同机同卡对上游 llama-kvmem：196K `336.5 / 24.28`、250K
+> `323.2 / 29.15`，prefill 约为 1.6×，decode 持平到略快。
+>
+> 自适应召回分块（`build/_recall_split_check.py`、`build/_recall_real_check.py`）：
+>
+> | 场景 | 次峰比例 | 是否切分 | 结果 |
+> |---|---|---|---|
+> | 98K 单文档 needle（32768 与 20480 两档） | 1.5% | 否 | 召回页 704..815，逐 token 等于 GT |
+> | 双文档，问次峰事实（切分开） | 82% | 是 | `NINFER-ATLAS-1111` PASS |
+> | 双文档，问次峰事实（`SPLIT=0`） | 82% | 否 | 召回只剩 859..970，答成另一份文档的事实 |
+> | 双文档，两台相似口令（`NINFER-<NAME>-<NNNN>`） | 82% | 是 | 答 `NINFER-ATLAS-2222`（模型拼接，已知限制） |
+>
+> 召回一致性（`build/_kvmatrix2.py`，oracle = 同 prompt 用装得下全文的窗口跑出的 token 序列）：
+>
+> | needle 深度 | 召回档（resident 32768 + archive）vs 完整上下文 | 说明 |
+> |---|---|---|
+> | 25% | 逐 token MATCH | `NINFER-ZEBRA-4471` |
+> | 50% | 逐 token MATCH | `NINFER-KOALA-8823` |
+> | 75% | 逐 token MATCH | `NINFER-VIPER-1092` |
+> | 92% | 语义一致、空白切分不同 | needle 本就在窗口内，两条路径都答干扰指令 |
+> | 98K mid（数字口令） | GT `45 669 24312 10846 8006 5434 12 19 19 22 16 248046`，召回页 704..815 | resident 20480 与 32768 两档均通过 |
+>
+> 96k 门禁臂的 ctx 从 110000 降到 100000：prompt 98,155 token、权重占 11.76 GB 后只剩
+> 3.81 GB，110000 的池要 1.97 GB，引擎会**静默**切到半速路径（350 / 11.8 而不是 424 / 24.8）。
+> 这不是功耗回归，池装得下就正常。
+>
 > **0.1.1 追加（2026-11-12）**：本文档主体是 pre-r2 的历史记录，速度结论仍成立。
 > 0.1.1 的门禁与视觉回归单独记录在下面 §0，二进制口径为
 > `infer-mini.exe` 191,703,040 B / `infer-serve.exe` 192,038,912 B（sha256 见 VERSION.txt）。
@@ -53,9 +97,11 @@ artifact = `Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer`。
 命令模板：
 
 ```bat
-python probe_rebuilt\run_capture.py build\infer_mini_nordc.exe %ART% ^
+python probe_rebuilt\run_capture.py build\infer_mini.exe %ART% ^
   --tasks tasks_<x>.txt --ctx <N> --max-new <M> --kv rk4v4-e8 [--spec mtp --draft-tokens 2]
 ```
+
+> 0.1.2 起 CLI 引擎叫 `build\infer_mini.exe`（旧名 `infer_mini_nordc.exe` 仅存在于历史目录）。
 
 | # | 语料 | prompt tokens | --ctx | prefill t/s | decode t/s | 判定 |
 |---|---|---|---|---|---|---|
@@ -85,6 +131,56 @@ python probe_rebuilt\run_capture.py build\infer_mini_nordc.exe %ART% ^
 
 **Q 是 MTP 的越线反例**：MTP 固定多提交 0.57 GB（mtp 权重 348 MB + draft state 190 MB + verify 图 73 MB），
 126K 时总提交 14.12 GiB 越线 ⇒ 每轮 3 token 全接受（2/2）却只有 10.59 t/s，比 AR 的 22.91 慢一倍。
+
+## 1.1 长上下文深度矩阵（0.1.2 复核）
+
+目的：确认「不开 MTP、开窗口+归档+召回」时，196K 与接近 262K 上限的深度是否仍然**速度不降、精度不变**。
+配置 `--resident-tokens 32768 --sink-tokens 2048 --kv-retrieval 1`、`NINFER_KV_ARCHIVE_MIB=4096`。
+
+| 语料 | prompt tokens | --ctx | prefill t/s | decode t/s | 判定 |
+|---|---|---|---|---|---|
+| tasks_hh192k | 196,423 | 262144 | 540.4 | 29.77 | ✅ 与 GT 逐 token 相同 |
+| tasks_hh256k_trim | 251,201 | 262144 | 534.9 | 30.50 | ✅ 同上 |
+| tasks_hh262k | **260,909** | 262144 | 534.1 | 29.79 | ✅ 同上 |
+
+三档 IDS 均为 `45 669 24312 10846 8006 5434 12 19 19 22 16 248046`。深度 196K→261K，
+prefill 变化 1.2%、decode 变化 2.4% ⇒ **长上下文不是靠牺牲速度换来的**。
+
+上限说明：`--ctx` 不能超过模型 `text.max_position_embeddings`（本模型 262,144），
+超了在 `startup.cpp:752-755` 直接抛 `max_context exceeds the configured position capacity`。
+所以「262K 可用」的准确口径是 **≤262,144 token，实测到 260,909（99.5%）**；原始
+`tasks_hh256k.txt` 约 264K token，天生超限，必须按 3.9995 chars/token 重新裁剪才能测。
+
+同语料与上游 llama-kvmem 对拍（同机同卡、都开 MTP2）：196K 上游 336.5 / 24.28，本引擎 540.4 / 29.77；
+250K 上游 323.2 / 29.15，本引擎 534.9 / 30.50；两边都命中口令。详见 `KVMEM.md` §11.3。
+
+### 1.2 准确率对拍：8/8 对 8/8（0.1.2）
+
+问题："性能好但准确率会不会低于上游？" 做法：8 个用例、同 prompt、双方同 32K KV 预算、贪心解码，
+判"答案是否命中语料口令"（不做逐 token 比较，因为上游 KV 是 `q8_0`/`q4_0`、本引擎 `rk4v4-e8`）。
+
+| 用例 | 我们 | 上游 llama-kvmem | 我们 prefill/decode | 上游 prefill/decode |
+|---|---|---|---|---|
+| q25 | PASS | PASS | 557.3 / **41.05** | 384.6 / 25.14* |
+| q50 | PASS | PASS | 558.7 / **34.78** | 378.2 / 32.85 |
+| q75（窗口内，不召回） | PASS | PASS | 558.2 / **41.51** | 379.0 / 33.25 |
+| q92（窗口内，不召回） | PASS | PASS | 559.0 / **35.32** | 379.2 / 32.27 |
+| mid（50%） | PASS | PASS | 558.7 / **35.18** | 378.6 / 33.33 |
+| multi（双文档） | PASS | PASS | 550.6 / **41.53** | 361.0 / 33.01 |
+| 196K | PASS | PASS | 536.6 / **40.01** | 331.9 / 32.99 |
+| 250K | PASS | PASS | 532.6 / 32.42 | 323.1 / 32.93 |
+
+\* 上游 q25 是它的预热例，后续稳定 32–33。
+
+**8/8 对 8/8，逐例答案一致 ⇒ 准确率不低于上游**。速度**双方都开 MTP2**：prefill 1.4–1.6×，
+decode 除 250K 档持平（32.42 vs 32.93）外全部更快（35–42 vs 32–33）。我们 KV 是 int4/int4、
+上游 q8_0/q4_0，每 token 读的 KV 字节更少，decode 优势由此而来；250K 档被归档页换入换出吃掉，
+是下一步 decode 优化的重点。
+
+> 对拍坑：①`tasks_needle_q*` / `tasks_needle_mid_q` / `tasks_hh*` 的中文问句原本是 U+FFFD 乱码，
+> 模型只能读英文诱饵 `List the integers 1..400`，早期把这种回答误判成召回失败；回归现统一用
+> `build/_mk_fixed_corpora.py` 生成的 `tasks_fix_*.txt`。②第一版对拍只给上游开了 MTP2、没给我们开，
+> 得出的"decode 比上游低 10%"是配置不对称造成的假象 —— **对拍必须逐项核对两侧启动参数**。
 
 ## 2. MTP 倍率（必须用同语料的 AR 基准算）
 
