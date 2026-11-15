@@ -1,5 +1,29 @@
 # CHANGELOG
 
+## 0.1.3 - 2026-11-15
+
+MTP 深度自适应 + 一个"看起来像产品崩溃、实际是构建污染"的挂死修复。
+
+### 新增
+- `--draft-tokens 0` 表示自动：`ctx <= 65536` 取 5，`ctx > 65536` 取 4
+  （`program/planning/startup.cpp` 解析，MTP 校验放宽为允许 0）。
+
+### 修复
+- 撤掉 0.1.2 引入的"`ctx > 65536` 且 draft 5/6 拒绝启动"。根因是过期目标文件导致
+  `MtpDecodeEgress` 布局在翻译单元之间不一致：host 侧读到 `next_extents = -1112430859`，
+  强转 uint32 后驱动约 3.2e9 次越界拷贝，表现为静默挂死（GPU 利用率 0%）。全量一致
+  重建后同一场景读出 4，65537/81920/100000 × draft 5/6 六个组合全部通过。
+- 加固：`resolve_pending_raw` 在拷贝草稿前校验 extent 范围，越界即抛
+  `MTP round reported an out-of-range draft extent`。
+
+### 发布二进制
+- `infer-mini.exe` 191,981,568 B `f545e1402be4deb2ac8eeb400016233adb32e3c89f564d79dd66c04d5a2f4fb9`
+- `infer-serve.exe` 192,317,952 B `ce75a12ca1c6b5c0a3a8014c8c40f20d8b5bf4a5613331731d96c9eda90fceee`
+
+### 校验
+- 门禁: 8k 35.69/948.4、96k 25.26/423.3、mtp 105.53/848.2 —— GATE: PASS
+- 视觉三档九图: 各 9/9
+
 ## 0.1.1 - 2026-11-12
 
 第一个正式版。视觉链路从"能读图但答错"修到"九图回归三档全 9/9"，并新增 OpenAI 兼容服务。

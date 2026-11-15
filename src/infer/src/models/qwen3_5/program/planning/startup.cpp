@@ -795,10 +795,15 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         }
         break;
     case SpeculativeBackend::Mtp:
-        if (options.speculative.draft_tokens == 0 ||
-            options.speculative.draft_tokens > kMaximumMtpDraftTokens) {
-            throw std::invalid_argument("MTP draft window must be in [1,15]");
+        // 0 means "choose for me": the planner resolves it from the context budget below, so an
+        // omitted --draft-tokens is still auto instead of an error.
+        if (options.speculative.draft_tokens > kMaximumMtpDraftTokens) {
+            throw std::invalid_argument("MTP draft window must be in [0,15]");
         }
+        // Draft depths 5 and 6 were once believed to fault above 65536 context. That turned out to be
+        // a stale-object rebuild of this tree, not a product defect: a fully consistent rebuild runs
+        // 5/6 at 65537, 81920 and 100000 (prefill ~760 t/s, decode ~63-66 t/s). Keep the window value
+        // untouched here; the copy loop below clamps the per-round extent defensively.
         break;
     case SpeculativeBackend::DFlash:
     case SpeculativeBackend::DFlash2:
@@ -910,7 +915,9 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .capacity            = options.max_context,
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
-        .draft_window        = options.speculative.draft_tokens,
+        .draft_window        = options.speculative.draft_tokens != 0
+                                   ? options.speculative.draft_tokens
+                                   : (options.max_context > 65536U ? 4U : 5U),
         .speculative_backend = options.speculative.backend,
         .kv_storage          = options.kv_cache,
         .proposal_head       = options.speculative.proposal_head,

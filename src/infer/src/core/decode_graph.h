@@ -6,6 +6,12 @@
 
 namespace ninfer {
 
+// NINFER_DECODE_GRAPH=0 turns CUDA-graph capture and replay off for the decode step. The body
+// issues the very same kernels either way, so results do not change; the difference is that the
+// launches reach the stream from the host, which is what the NINFER_PROFILE_* timers need (they
+// synchronise, and synchronising inside a captured body is illegal).
+[[nodiscard]] bool decode_graph_disabled();
+
 class DecodeGraphDefinition {
 public:
     DecodeGraphDefinition() = default;

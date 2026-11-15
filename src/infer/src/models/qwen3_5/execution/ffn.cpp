@@ -92,11 +92,25 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
         // both occupy gu.n rows and the dual-weight route projects them independently.
         // (No MTP on GGUF artifacts.)
         Tensor activation = workspace.alloc(DType::BF16, {gu.n, columns});
+        // Split timing for the two halves of the GGUF MLP: gate+up (dual-weight vector product) and
+        // down (single product). Inference from bytes and kernel microbenchmarks disagreed by 2x, so
+        // time the calls themselves. NINFER_FFN_PROF=1 only; averages over 64 calls.
+        const bool prof = std::getenv("NINFER_FFN_PROF") != nullptr;
+        static cudaEvent_t prof_ev[3] = {nullptr, nullptr, nullptr};
+        static float prof_gu = 0.0F, prof_down = 0.0F;
+        static long long prof_calls = 0;
+        if (prof) {
+            if (prof_ev[0] == nullptr) {
+                for (auto& e : prof_ev) { CUDA_CHECK(cudaEventCreate(&e)); }
+            }
+            CUDA_CHECK(cudaEventRecord(prof_ev[0], stream));
+        }
         {
             auto call = workspace.scope();
             ops::linear_swiglu(hidden, gu, p.up.weight, activation, p.gate_up.policy, workspace,
                                stream);
         }
+        if (prof) { CUDA_CHECK(cudaEventRecord(prof_ev[1], stream)); }
         if (std::getenv("NINFER_FFN_ACT_PROBE") != nullptr) {
             static int dump_taken = 0;
             const bool take = dump_taken == 0;
@@ -119,6 +133,22 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
             std::fflush(stderr);
         }
         ops::linear_add(activation, down, residual, p.down.policy, workspace, stream);
+        if (prof) {
+            CUDA_CHECK(cudaEventRecord(prof_ev[2], stream));
+            CUDA_CHECK(cudaEventSynchronize(prof_ev[2]));
+            float a = 0.0F, b = 0.0F;
+            CUDA_CHECK(cudaEventElapsedTime(&a, prof_ev[0], prof_ev[1]));
+            CUDA_CHECK(cudaEventElapsedTime(&b, prof_ev[1], prof_ev[2]));
+            prof_gu += a;
+            prof_down += b;
+            if (++prof_calls % 64 == 0) {
+                std::fprintf(stderr, "[ffnprof] n=%lld gate_up=%.4f down=%.4f ms/call\n",
+                             prof_calls, prof_gu / 64.0F, prof_down / 64.0F);
+                std::fflush(stderr);
+                prof_gu = 0.0F;
+                prof_down = 0.0F;
+            }
+        }
         return;
     }
     if (mtp) {

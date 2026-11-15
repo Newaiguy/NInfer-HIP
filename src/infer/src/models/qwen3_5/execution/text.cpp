@@ -1457,11 +1457,12 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         LARGE_INTEGER t3;
         QueryPerformanceCounter(&t3);
         dtimer.step_ms += dtimer.elapsed_ms(dtimer.t0, t3);
-        if (++dtimer.steps % 64 == 0) {
+        if (++dtimer.steps % 16 == 0) {
+            const double n = 16.0;
             std::fprintf(stderr, "[prof-decode] %d steps: layers %.1f ms/step, "
                                  "norm+lmhead %.1f ms/step, step-total %.1f ms/step\n",
-                         dtimer.steps, dtimer.layers_ms / 64.0, dtimer.head_ms / 64.0,
-                         dtimer.step_ms / 64.0);
+                         dtimer.steps, dtimer.layers_ms / n, dtimer.head_ms / n,
+                         dtimer.step_ms / n);
             std::fflush(stderr);
             dtimer.layers_ms = dtimer.head_ms = dtimer.step_ms = 0.0;
         }

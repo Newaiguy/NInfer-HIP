@@ -402,6 +402,18 @@ void vector_swiglu(GgmlType type, const void* weight, std::int64_t row_bytes, in
         true, stream);
 }
 
+void vector_swiglu_pair(GgmlType type, const void* gate, std::int64_t gate_row_bytes, const void* up,
+                        std::int64_t up_row_bytes, int rows, int k, const void* activation,
+                        int columns, __nv_bfloat16* out, std::int64_t out_column_stride,
+                        cudaStream_t stream) {
+    const detail::VecStore store{out, nullptr, out_column_stride, Epilogue::Store, nullptr, 0};
+    detail::VecArgs args =
+        detail::vector_args(gate, gate_row_bytes, rows, k, activation, columns, store);
+    args.up_weight     = static_cast<const std::uint8_t*>(up);
+    args.up_row_bytes  = up_row_bytes;
+    detail::vector_launch(type)(args, columns, true, stream);
+}
+
 int matrix_activation_layout(GgmlType type) {
     return static_cast<int>(mmq_get_q8_1_ds_layout(detail::to_ggml(type)));
 }

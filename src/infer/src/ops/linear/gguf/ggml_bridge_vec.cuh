@@ -601,7 +601,9 @@ __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
             for (int pr = 0; pr < kPairs; ++pr) {
                 const int r     = min(row0 + pr, p.rows - 1);
                 rowp[2 * pr + 0] = p.weight + std::int64_t(r) * p.row_bytes + lane_offset;
-                rowp[2 * pr + 1] = p.weight + std::int64_t(p.rows + r) * p.row_bytes + lane_offset;
+                rowp[2 * pr + 1] = (p.up_weight != nullptr)
+                                       ? p.up_weight + std::int64_t(r) * p.up_row_bytes + lane_offset
+                                       : p.weight + std::int64_t(p.rows + r) * p.row_bytes + lane_offset;
             }
         } else {
 #pragma unroll
@@ -743,6 +745,31 @@ void launch(const VecArgs& args, cudaStream_t stream) {
     const int groups    = (args.rows + per_block - 1) / per_block;
     const int blocks    = std::min(groups, resident * device_facts().sm_count);
     kernel<type, T, Fused, KS><<<blocks, kVecWarps * 32, 0, stream>>>(args);
+    // NINFER_VEC_GRID_TRACE=1 prints the realised grid once, so occupancy can be checked against
+    // sm_count without a profiler (ROCm 7.2 here ships no rocprof).
+    if (std::getenv("NINFER_VEC_GRID_TRACE") != nullptr) {
+        // One line per distinct shape/path, so the coverage of the fused contract is visible.
+        static int seen[32][3] = {};
+        static int count = 0;
+        bool fresh = true;
+        for (int i = 0; i < count; ++i) {
+            if (seen[i][0] == args.rows && seen[i][1] == args.k && seen[i][2] == int(Fused)) {
+                fresh = false;
+                break;
+            }
+        }
+        if (fresh && count < 32) {
+            seen[count][0] = args.rows;
+            seen[count][1] = args.k;
+            seen[count][2] = int(Fused);
+            ++count;
+            std::fprintf(stderr,
+                         "[vecgrid] rows=%d k=%d fused=%d resident=%d sm=%d groups=%d blocks=%d warps=%d\n",
+                         args.rows, args.k, int(Fused), resident, device_facts().sm_count, groups, blocks,
+                         kVecWarps);
+            std::fflush(stderr);
+        }
+    }
     check(cudaGetLastError(), "vector product launch");
 }
 

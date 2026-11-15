@@ -61,6 +61,10 @@ struct VecArgs {
     const std::int8_t* qs; // [columns][k]
     const half2* ds;       // [columns][k / 32]
     VecStore out;
+    // When set, the fused up row comes from this buffer at r * up_row_bytes instead of from the
+    // second half of `weight`. Lets a dual-binding artifact run the fused kernel in one launch.
+    const std::uint8_t* up_weight = nullptr;
+    std::int64_t up_row_bytes = 0;
 };
 
 // Byte offset of the scales inside a planar vector activation of `columns` x `k`.

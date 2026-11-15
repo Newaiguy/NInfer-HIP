@@ -45,6 +45,9 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
     if (family.profiles.empty()) {
         throw std::logic_error(std::string(label) + " CUDA Graph family has no profiles");
     }
+    // NINFER_DECODE_GRAPH=0: no capture happened, so there is no definition to validate,
+    // instantiate or upload; the decode path takes the eager body instead.
+    if (decode_graph_disabled()) { return; }
 
     for (std::size_t i = 0; i < family.profiles.size(); ++i) {
         DecodeGraphProfile& profile = family.profiles[i];

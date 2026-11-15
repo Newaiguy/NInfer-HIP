@@ -341,7 +341,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         ops::CausalAttentionExecutionEnvelope envelope{
             maximum_frontier + 1 - g_ninfer_kv_window_base_tokens,
             maximum_frontier + 1 - g_ninfer_kv_window_base_tokens};
-        if (use_cuda_graph) {
+        if (use_cuda_graph && !ninfer::decode_graph_disabled()) {
             DecodeGraphProfile& profile =
                 select_graph_profile(ordinary_graphs, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "ordinary batch");
@@ -454,6 +454,10 @@ runtime::BatchedGeneratedRound
 ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                               std::span<const runtime::RoundBudget> budgets,
                               runtime::ExecutionTiming* failed_timing) {
+    if (std::getenv("NINFER_MTP_TRACE") != nullptr) {
+        std::fprintf(stderr, "[mtp-round] entry lanes=%zu", lanes.size());
+        std::fflush(stderr);
+    }
     nvtx::ScopedRange round_range(nvtx::Name::DecodeMtpRound, nvtx::Category::Mtp,
                                   static_cast<std::uint64_t>(lanes.size()));
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
@@ -500,7 +504,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         DecodeGraphExecutable* executable = nullptr;
         execution::MtpCausalAttentionEnvelopes envelopes =
             mtp_causal_attention_envelopes(maximum_frontier, draft_window, capacity);
-        if (use_cuda_graph) {
+        if (use_cuda_graph && !ninfer::decode_graph_disabled()) {
             DecodeGraphProfile& profile =
                 select_graph_profile(mtp_graphs, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "MTP batch");
@@ -762,7 +766,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         DecodeGraphExecutable* executable    = nullptr;
         execution::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier, draft_window);
         ops::CausalAttentionExecutionEnvelope target_envelope{1, maximum_target_tokens};
-        if (use_cuda_graph) {
+        if (use_cuda_graph && !ninfer::decode_graph_disabled()) {
             DecodeGraphProfile& profile =
                 select_graph_profile(dflash_graphs, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "DFlash batch");

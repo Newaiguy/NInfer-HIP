@@ -970,7 +970,13 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                 if (terminal[row]) {
                     sequence.mtp_draft_count = 0;
                 } else {
+                    // The extent is produced on device and copied back as a raw int32. Clamp it here:
+                    // a bad value used to reach the loop below as ~3.2e9 and turned a four-element
+                    // copy into a near-infinite out-of-bounds walk that looked like a hang.
                     const std::int32_t next  = mtp_host_egress->next_extents[row];
+                    if (next < 0 || static_cast<std::uint32_t>(next) > kMaximumMtpDraftTokens) {
+                        throw std::runtime_error("MTP round reported an out-of-range draft extent");
+                    }
                     sequence.mtp_draft_count = static_cast<std::uint32_t>(next);
                     for (std::uint32_t step = 0; step < sequence.mtp_draft_count; ++step) {
                         sequence.mtp_drafts[step] =

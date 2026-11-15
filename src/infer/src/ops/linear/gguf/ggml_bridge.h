@@ -94,6 +94,13 @@ void vector_swiglu(GgmlType type, const void* weight, std::int64_t row_bytes, in
                    const void* activation, int columns, __nv_bfloat16* out,
                    std::int64_t out_column_stride, cudaStream_t stream);
 
+// Same product, but gate and up live in two independent buffers (artifacts that store them as
+// separate bindings). One launch streams both weights; no fp32 gate plane and no second pass.
+void vector_swiglu_pair(GgmlType type, const void* gate, std::int64_t gate_row_bytes, const void* up,
+                        std::int64_t up_row_bytes, int rows, int k, const void* activation,
+                        int columns, __nv_bfloat16* out, std::int64_t out_column_stride,
+                        cudaStream_t stream);
+
 // Activation for the matrix kernel, laid out for the type's scale/sum schedule. Types that share a
 // schedule share an activation, see matrix_activation_layout().
 [[nodiscard]] int matrix_activation_layout(GgmlType type);

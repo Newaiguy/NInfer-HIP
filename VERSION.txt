@@ -1,12 +1,12 @@
-NInfer-HIP 0.1.2
+NInfer-HIP 0.1.3
 ================
 
 名称        : NInfer-HIP —— NInfer 引擎的 AMD RDNA4 / HIP 移植版
 仓库        : https://github.com/Newaiguy/NInfer-HIP
-发布        : https://github.com/Newaiguy/NInfer-HIP/releases/tag/v0.1.2
+发布        : https://github.com/Newaiguy/NInfer-HIP/releases/tag/v0.1.3
 许可        : Apache-2.0（派生自 https://github.com/Neroued/ninfer，改动见 docs/PATCHLIST.md）
-状态        : 正式版（0.1.2）
-构建时间    : 2026-11-13
+状态        : 正式版（0.1.3）
+构建时间    : 2026-11-15
 目标硬件    : AMD Radeon RX 9070 XT 16GB (RDNA4, gfx1201), 640 GB/s
 运行系统    : Windows 11 26200 (25H2) + HIP SDK 7.2.3 (AMD Software 26.8.1)
 模型        : WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3（官方 v3 单文件 artifact）
@@ -14,15 +14,40 @@ NInfer-HIP 0.1.2
               size 15,017,456,896 B（text 11.755GB + vision + mtp + dflash2）
 
 引擎        : infer-mini.exe（CLI / chat，文本 + MTP）
-  size      : 191,703,040 B
-  sha256    : 07be07f59a2ef9e19fba367b76e794bac1327622ad8a8fbad2fab25abc85fdbd
+  size      : 191,981,568 B
+  sha256    : f545e1402be4deb2ac8eeb400016233adb32e3c89f564d79dd66c04d5a2f4fb9
 
 引擎        : infer-serve.exe（OpenAI 兼容 HTTP 服务，文本 + MTP + 视觉）
-  size      : 192,038,912 B
-  sha256    : 5f1e778e1b86d8327fdead084c9cde1dc8180161fb7a8063f1835b76331128d8
+  size      : 192,317,952 B
+  sha256    : ce75a12ca1c6b5c0a3a8014c8c40f20d8b5bf4a5613331731d96c9eda90fceee
 
 --------------------------------------------------------------------------------
-本版核心：KV 召回的宽度回归修好（0.1.1 → 0.1.2）
+本版核心：MTP 深度自适应 + 3.2e9 次拷贝循环的根因修复（0.1.2 → 0.1.3）
+--------------------------------------------------------------------------------
+1. `--draft-tokens 0`（或不传）现在表示"由引擎决定"：上下文 <= 65536 取 5，> 65536 取 4。
+   位置 `program/planning/startup.cpp`；MTP 校验从"必须 1..15"放宽为"0 = 自动"。
+   实测 ctx 8192 → decode 66.07，ctx 100000 → decode 71.01，两档均正常退出。
+
+2. 撤掉 0.1.2 加的"`ctx > 65536` 且 draft 5/6 直接拒绝"。那条 guard 防的是一个
+   **过期目标文件造成的假象**：昨晚的树里 `MtpDecodeEgress` 的 sizeof/offset 在不同
+   翻译单元之间不一致，host 侧读到 `next_extents = -1112430859`，被强转成 uint32 后
+   驱动了约 3.2e9 次越界拷贝，表现成"静默挂死"。全量一致重建后该字段读出 4，
+   且 65537 / 81920 / 100000 × draft 5/6 六个组合全部跑通（prefill ~760、decode 62–66）。
+
+3. 真实的加固（保留）：读回 extent 后先校验再进循环
+   `if (next < 0 || (uint32)next > kMaximumMtpDraftTokens) throw std::runtime_error(...)`，
+   坏值立刻报错，不再退化成巨型循环。
+
+4. 门禁（发布二进制）：8k 35.69 / 948.4（+6.1% / +1.2%）、96k 25.26 / 423.3
+   （+0.5% / -0.4%）、mtp 105.53 / 848.2（+0.1% / +1.8%），GATE: PASS。
+
+5. 视觉三档九图各 9/9（artifact / patch-only BF16 / 全 BF16），本版未改动视觉路径。
+
+注意：0.1.2 发布出来的 exe 带有 KV 召回宽度回归（已在源码修好，见 0.1.2 说明）；
+本版是那一修复之后的第一份正式二进制。
+
+--------------------------------------------------------------------------------
+历史版本核心：KV 召回的宽度回归修好（0.1.1 → 0.1.2）
 --------------------------------------------------------------------------------
 
 0.1.1 在长上下文召回上引入了一个回归：r9 是「以打分最高的页为中心，取召回预算

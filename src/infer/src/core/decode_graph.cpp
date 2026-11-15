@@ -4,10 +4,20 @@
 #include "core/nvtx.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
 namespace ninfer {
+
+bool decode_graph_disabled() {
+    static const bool disabled = [] {
+        const char* value = std::getenv("NINFER_DECODE_GRAPH");
+        return value != nullptr && value[0] == '0';
+    }();
+    return disabled;
+}
+
 namespace {
 
 void log_cuda_error(const char* op, cudaError_t err) noexcept {
@@ -57,6 +67,8 @@ DecodeGraphDefinition& DecodeGraphDefinition::operator=(DecodeGraphDefinition&& 
 }
 
 void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<void()>& body) {
+    // NINFER_DECODE_GRAPH=0: skip capture entirely; callers fall back to the eager body.
+    if (decode_graph_disabled()) { return; }
     nvtx::ScopedRange capture_range(nvtx::Name::CudaGraphCapture, nvtx::Category::Graph);
     reset();
 
@@ -101,6 +113,8 @@ DecodeGraphExecutable& DecodeGraphExecutable::operator=(DecodeGraphExecutable&& 
 }
 
 void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition) {
+    // NINFER_DECODE_GRAPH=0 leaves every executable empty; the eager path never uses one.
+    if (decode_graph_disabled()) { return; }
     nvtx::ScopedRange instantiate_range(nvtx::Name::CudaGraphInstantiate, nvtx::Category::Graph);
     if (!definition.ready()) {
         throw std::logic_error("cannot instantiate an empty CUDA Graph definition");
@@ -117,6 +131,8 @@ void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition)
 }
 
 void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
+    // NINFER_DECODE_GRAPH=0: nothing was captured or instantiated, so there is nothing to patch.
+    if (decode_graph_disabled()) { return; }
     nvtx::ScopedRange update_range(nvtx::Name::CudaGraphUpdate, nvtx::Category::Graph);
     if (!ready() || !definition.ready()) {
         throw std::logic_error("CUDA Graph update requires a definition and executable");

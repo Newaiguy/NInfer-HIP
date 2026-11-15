@@ -82,6 +82,14 @@ std::vector<GraphExecutionProfile> mtp_graph_profiles(std::uint32_t capacity,
         for (const std::uint32_t visible_end : {128U, 160U, 2054U, 8198U}) {
             add_shifted(visible_end, draft_window + 1);
         }
+    } else if (draft_window == 6 || draft_window == 7) {
+        // T=7 and T=8 need their own entry points for the same reason T=4/5/6 do: without them the
+        // runtime lands on a range with no specialised implementation once the resident window is wide
+        // enough to reach those frontiers (observed as a host access violation at ctx > 65536 with
+        // draft-tokens 5 and 6).
+        for (const std::uint32_t visible_end : {128U, 160U, 2054U, 8198U}) {
+            add_shifted(visible_end, draft_window + 1);
+        }
     }
     std::sort(ends.begin(), ends.end());
     ends.erase(std::unique(ends.begin(), ends.end()), ends.end());

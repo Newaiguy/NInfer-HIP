@@ -3,6 +3,7 @@
 #include "models/qwen3_5/program/context.h"
 
 #include "core/nvtx.h"
+#include "core/decode_graph.h"
 
 #include <stdexcept>
 
@@ -10,7 +11,7 @@ namespace ninfer::models::qwen3_5::execution {
 
 template <class Context, class Body>
 void run_prepared(Context& state, DecodeGraphExecutable* executable, Body&& body) {
-    if (executable != nullptr) {
+    if (executable != nullptr && !ninfer::decode_graph_disabled()) {
         if (!executable->ready()) {
             throw std::logic_error("decode graph was not prepared at load time");
         }
@@ -23,6 +24,8 @@ void run_prepared(Context& state, DecodeGraphExecutable* executable, Body&& body
 
 template <class Context, class Body>
 void capture_graph(Context& state, DecodeGraphDefinition& definition, Body&& body) {
+    // NINFER_DECODE_GRAPH=0: nothing to capture, run_prepared() takes the eager path instead.
+    if (ninfer::decode_graph_disabled()) { return; }
     state.execution.work.reset();
     definition.capture(state.execution.device.stream, body);
 }

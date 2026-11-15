@@ -387,6 +387,94 @@ void gguf_swiglu(const Tensor& x, const Weight& gate, const Weight* up, Tensor& 
         if (gate.n != rows || up->n != rows || up->k != gate.k) {
             throw std::invalid_argument("gguf swiglu: gate and up must both be [N,K]");
         }
+        // Dual bindings: one fused launch streaming both weights. The two-product form below costs
+        // an extra launch and an fp32 gate plane; measured 0.192 vs 0.205 ms per call. This is also
+        // the only way the [gate;up] fused kernel contract is reachable for a dual-binding artifact.
+        if (t <= gguf::kMaxVectorColumns && gguf_type(up->qtype) == gguf_type(gate.qtype)) {
+            // NINFER_GGUF_COPYTEST=1 times the same launch twice: once on the artifact's mapped
+            // weights and once on a plain cudaMalloc copy. It decides whether the in-engine 2x
+            // slowdown lives in the mapping or in the kernel. Runs once; needs eager decode.
+            if (std::getenv("NINFER_GGUF_COPYTEST") != nullptr) {
+                static bool done = false;
+                if (!done) {
+                    done = true;
+                    const std::size_t gate_bytes = std::size_t(rows) * row_bytes(gate);
+                    const std::size_t up_bytes   = std::size_t(rows) * row_bytes(*up);
+                    void* g2 = nullptr;
+                    void* u2 = nullptr;
+                    CUDA_CHECK(cudaMalloc(&g2, gate_bytes));
+                    CUDA_CHECK(cudaMalloc(&u2, up_bytes));
+                    CUDA_CHECK(cudaMemcpy(g2, gate.qdata, gate_bytes, cudaMemcpyDeviceToDevice));
+                    CUDA_CHECK(cudaMemcpy(u2, up->qdata, up_bytes, cudaMemcpyDeviceToDevice));
+                    void* probe_act =
+                        workspace.alloc_bytes(gguf::vector_activation_bytes(gate.k, t)).data;
+                    gguf::quantize_vector_activation(static_cast<const __nv_bfloat16*>(x.data), gate.k,
+                                                     t, nullptr, probe_act, stream);
+                    cudaEvent_t ev0 = nullptr;
+                    cudaEvent_t ev1 = nullptr;
+                    CUDA_CHECK(cudaEventCreate(&ev0));
+                    CUDA_CHECK(cudaEventCreate(&ev1));
+                    const auto time_once = [&](const void* gp, const void* upp) {
+                        CUDA_CHECK(cudaEventRecord(ev0, stream));
+                        gguf::vector_swiglu_pair(
+                            gguf_type(gate.qtype), gp, row_bytes(gate), upp, row_bytes(*up), rows,
+                            gate.k, probe_act, t, static_cast<__nv_bfloat16*>(out.data), rows, stream);
+                        CUDA_CHECK(cudaEventRecord(ev1, stream));
+                        CUDA_CHECK(cudaEventSynchronize(ev1));
+                        float ms = 0.0F;
+                        CUDA_CHECK(cudaEventElapsedTime(&ms, ev0, ev1));
+                        return ms;
+                    };
+                    const float t_artifact = time_once(gate.qdata, up->qdata);
+                    const float t_copy     = time_once(g2, u2);
+                    // 200 back-to-back reps of the artifact pair: steady state without any other
+                    // kernel in between. If this reaches the standalone bench number the data is
+                    // fine and the decode-time 0.19 ms comes from interleaving, not from the weights.
+                    double total = 0.0;
+                    float best = 1.0e9F;
+                    for (int rep = 0; rep < 200; ++rep) {
+                        const float ms = time_once(gate.qdata, up->qdata);
+                        total += double(ms);
+                        if (ms < best) { best = ms; }
+                    }
+                    const double mean = total / 200.0;
+                    // Second arm: the real decode does quantize -> GEMV as two launches. Timing the
+                    // pair back-to-back isolates what one extra launch costs.
+                    cudaEvent_t q0 = nullptr;
+                    cudaEvent_t q1 = nullptr;
+                    CUDA_CHECK(cudaEventCreate(&q0));
+                    CUDA_CHECK(cudaEventCreate(&q1));
+                    CUDA_CHECK(cudaEventRecord(q0, stream));
+                    for (int rep = 0; rep < 200; ++rep) {
+                        gguf::quantize_vector_activation(static_cast<const __nv_bfloat16*>(x.data),
+                                                         gate.k, t, nullptr, probe_act, stream);
+                        gguf::vector_swiglu_pair(
+                            gguf_type(gate.qtype), gate.qdata, row_bytes(gate), up->qdata,
+                            row_bytes(*up), rows, gate.k, probe_act, t,
+                            static_cast<__nv_bfloat16*>(out.data), rows, stream);
+                    }
+                    CUDA_CHECK(cudaEventRecord(q1, stream));
+                    CUDA_CHECK(cudaEventSynchronize(q1));
+                    float pair_ms = 0.0F;
+                    CUDA_CHECK(cudaEventElapsedTime(&pair_ms, q0, q1));
+                    std::fprintf(stderr,
+                                 "[ggufcopy] first=%.4f copy=%.4f | 200 reps mean=%.4f best=%.4f ms "
+                                 "(%.1f GB/s) | 200x(quantize+fused) mean=%.4f ms -> gap/launch=%.4f\n",
+                                 t_artifact, t_copy, mean, double(best),
+                                 2.0 * double(gate_bytes) / (mean * 1e-3) / 1e9,
+                                 double(pair_ms) / 200.0,
+                                 (double(pair_ms) / 200.0) - mean);
+                    std::fflush(stderr);
+                }
+            }
+            void* activation = workspace.alloc_bytes(gguf::vector_activation_bytes(gate.k, t)).data;
+            gguf::quantize_vector_activation(static_cast<const __nv_bfloat16*>(x.data), gate.k, t,
+                                             nullptr, activation, stream);
+            gguf::vector_swiglu_pair(gguf_type(gate.qtype), gate.qdata, row_bytes(gate), up->qdata,
+                                     row_bytes(*up), rows, gate.k, activation, t,
+                                     static_cast<__nv_bfloat16*>(out.data), rows, stream);
+            return;
+        }
         up_rows = *up;
     }
     auto* gate_plane =
