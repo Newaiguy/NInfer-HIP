@@ -65,7 +65,7 @@ bin\infer-mini.exe  E:\ninfer-models\Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer 
 
 - **长上下文**：262K 上下文，KV 记忆自动把旧页归档到内存/主机，召回时按 query 打分挑页
 - **MTP 投机解码**：draft 深度自适应（≤64K 用 5，>64K 用 4），8K 场景 3× 提速
-- **视觉**：PNG/JPEG/GIF/BMP/TIFF，单图/多图/图文混排，空间位置与颜色可判读
+- **视觉**：PNG/JPEG/GIF/BMP/TIFF，单图/多图/图文混排，空间位置与颜色可判读。这是**理解型多模态（VLM）**——看图说话、OCR、计数、判位置，**不生成图片/视频**；与 llama.cpp 走 mmproj 属同一类能力、同一套权重。
 - **OpenAI 兼容服务**：`/v1/chat/completions`（含 SSE 流式）、`/v1/models`、`/health`
 - **思考控制**：开/关 + 三档强度 + 预算（默认不限）
 
