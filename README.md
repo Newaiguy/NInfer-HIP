@@ -1,13 +1,13 @@
-# NInfer-HIP `0.1.3r2`
+# NInfer-HIP `0.1.3r3`
 
 **在 AMD RX 9070 XT (RDNA4) + ROCm 7.2 for Windows 上运行 Qwen3.8-27B 的本地推理引擎。**
 纯 HIP/C++ 实现，自带 KV 记忆（超长上下文）、MTP 投机解码、视觉多模态、OpenAI 兼容服务端。
 
-> 一句话：单卡 16 GB 的 Windows 游戏卡，能跑 27B 模型，**262K 上下文**，8K 对话 **35.7 tok/s**，开 MTP 到 **105 tok/s**，还能看图。
+> 一句话：单卡 16 GB 的 Windows 游戏卡，能跑 27B 模型，**262K 上下文**，8K 对话 **35.7 tok/s**，开 MTP 到 **105 tok/s（关思考）/ 71–82 tok/s（开思考）**，还能看图。
 
 ---
 
-## 这一版（0.1.3r2）改了什么
+## 这一版（0.1.3r3）改了什么
 
 | 变化 | 说明 |
 |---|---|
@@ -48,12 +48,17 @@ bin\infer-mini.exe  E:\ninfer-models\Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer 
 
 | 场景 | 上下文 | prefill (tok/s) | decode (tok/s) |
 |---|---|---|---|
-| 短对话 AR | 8K | 948.4 | 35.69 |
-| 短对话 **MTP draft 5** | 8K | 848.2 | **105.53** |
-| 中长文档 AR | 96K | 423.3 | 25.26 |
-| 长文档 + KV 记忆 | 196K | 540.4 | 29.77 |
-| 长文档 + KV 记忆 | 250K | 534.9 | 30.50 |
-| 长文档 + KV 记忆 | 261K | 534.1 | 29.79 |
+| 短对话 AR（think 关） | 8K | 948.4 | 35.69 |
+| 短对话 MTP d5（think 关） | 8K | 848.2 | **105.53** |
+| 短对话 MTP d5（think 开） | 567 | — | **82.1** |
+| 短对话 MTP d5（think 开） | 8K | 936 | 64.1 |
+| 中上下文 MTP d5（纯 MTP） | 32K | 740 | 46.5 |
+| 中长文档 AR（纯 MTP） | 96K | 423.3 | 25.26 |
+| 长文档 + KV 记忆 + MTP d2 | 64K | 583 | **44.3** |
+| 长文档 + KV 记忆 + MTP d2 | 96K | 560 | **40.4** |
+| 长文档 + KV 记忆 + MTP d2 | 250K | 532 | **40.4** |
+| 长文档 + KV 记忆（纯 AR） | 196K | 540.4 | 29.77 |
+| 长文档 + KV 记忆（纯 AR） | 261K | 534.1 | 29.79 |
 
 - 262,144 token 是模型位置编码硬顶；靠 **KV 记忆**（sink + 常驻窗口 + 主机归档 + 自适应召回）把 192K/250K/261K 塞进 16 GB 显存。
 - 与上游 `llama.cpp + kvmem` 同机对比：8 例长上下文问答**准确率 8/8 对 8/8**，prefill 快 **1.4–1.6×**，decode 持平到更快。
@@ -82,7 +87,7 @@ bin\infer-mini.exe  E:\ninfer-models\Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer 
 | [`docs/BUILD.md`](docs/BUILD.md) | 从源码构建 |
 | [`docs/VALIDATION.md`](docs/VALIDATION.md) | 门禁与验证矩阵 |
 | [`VERSION.txt`](VERSION.txt) | 版本、二进制校验和、完整变更记录 |
-| [`RELEASE_NOTES_0.1.3.md`](RELEASE_NOTES_0.1.3.md) / [`RELEASE_NOTES_0.1.3r2.md`](RELEASE_NOTES_0.1.3r2.md) | 发布说明 |
+| [`RELEASE_NOTES_0.1.3.md`](RELEASE_NOTES_0.1.3.md) / [`RELEASE_NOTES_0.1.3r3.md`](RELEASE_NOTES_0.1.3r3.md) | 发布说明 |
 
 ---
 

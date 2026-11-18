@@ -1,7 +1,7 @@
 @echo off
 chcp 936 >nul
 setlocal EnableExtensions
-title NInfer-HIP 0.1.3r2
+title NInfer-HIP 0.1.3r3
 set "HERE=%~dp0"
 if "%HERE:~-1%"=="\" set "HERE=%HERE:~0,-1%"
 set "PATH=C:\Program Files\AMD\ROCm\7.2\bin;%PATH%"
@@ -31,7 +31,7 @@ set "LONG=--ctx 262144 --resident-tokens 32768 --sink-tokens 2048 --kv-retrieval
 cls
 echo.
 echo   ============================================================
-echo    NInfer-HIP 0.1.3r2       RX 9070 XT / ROCm 7.2
+echo    NInfer-HIP 0.1.3r3       RX 9070 XT / ROCm 7.2
 echo   ============================================================
 echo    Ä£ÐÍ: %MODEL%
 echo.

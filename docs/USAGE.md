@@ -26,14 +26,14 @@
 1) CLI 聊天 8K+MTB自动        ← 日常对话，最快
 2) API 服务 262K+KV记忆 端口8099  ← 给程序/客户端调用
 3) CLI 聊天 262K+KV记忆        ← 超长文档问答
-4) 思考等级  当前: auto
+4) 思考等级  xhigh（模板默认）
 5) 改模型路径
 0) 退出
 ```
 
 - 选项 **1** 会以 `--ctx 16384 --spec mtp --draft-tokens 0 --max-new 8192` 启动聊天，MTP 自动挑草稿深度。
 - 选项 **2** 后台常驻 HTTP 服务，按 `Ctrl+C` 停止。
-- 选项 **4** 写 `effort.txt`：`auto` / `low` / `medium` / `xhigh` / `none`，对 CLI 和 API 同时生效。
+- 选项 **4** 写 `effort.txt`：`xhigh`（默认）/ `medium` / `low` / `none`，对 CLI 和 API 同时生效。
 
 > `启动.bat` 是 GBK + CRLF 编码。用编辑器改它时要保持这两点，否则 cmd 会报 `'leExtensions' is not recognized`。
 
@@ -64,7 +64,7 @@ you > _
 | `/clear` | 清空对话历史（重新开始，KV 复用） |
 | `/stats` | 打印上一轮的 token 数与速度 |
 | `/think on` / `/think off` | 开/关思考（立即生效，下一轮起） |
-| `/effort low|medium|xhigh|none|auto` | 思考强度；`auto` 回到模板默认（xhigh） |
+| `/effort low|medium|xhigh|none` | 思考强度；`xhigh` 即模板默认（最深层） |
 | `/system <文本>` | 设置 system prompt |
 | `/help` | 命令列表 |
 
@@ -85,9 +85,9 @@ you > /effort bogus
 | `--max-new N` | 8192 | 每轮生成预算（思考 + 正文合计） |
 | `--think` / `--no-think` | 开 | 是否思考 |
 | `--think-budget N` | **0 = 不限** | 思考段上限；>0 时到顶会强制收尾并提示 |
-| `--effort LEVEL` | auto(xhigh) | low / medium / xhigh / none |
+| `--effort LEVEL` | xhigh（默认） | low / medium / xhigh / none |
 | `--temp T` | 0.7 | 采样温度 |
-| `--spec mtp --draft-tokens N` | 关闭 / 0=自动 | 投机解码；0 时 ≤64K 用 5、>64K 用 4 |
+| `--spec mtp --draft-tokens N` | 关闭 / 0=自动 | 投机解码；0 时 ≤64K 用 5、>64K 用 1 |
 | `--resident-tokens N` | 按 ctx | 常驻 KV 窗口（长上下文必配） |
 | `--sink-tokens N` | 2048 | 开头固定的 sink 段 |
 | `--kv-retrieval 1` | 关 | 开启 KV 记忆召回 |
@@ -224,35 +224,69 @@ curl http://127.0.0.1:8099/v1/chat/completions \
 
 ---
 
-## 5. 三套推荐配置
+## 5. 三套推荐配置（2026-11-16 实测）
 
-### A. 日常对话（快）
+> 口径：同一语料、口令埋在 prompt 50% 处、`--max-new 384`、贪心解码、每格都校验答案命中（HIT）。
+> 三个配置的区别只在「要不要 KV 记忆」；上下文越大，KV 记忆的收益越明显。
 
-```bat
-bin\infer-mini.exe model.ninfer --chat --ctx 16384 --spec mtp --draft-tokens 0 --think --max-new 8192
-```
-8K：prefill 948 / decode 35.7，开 MTP 105.5。
-
-### B. 中长文档（96K）
+### A. 短文 / 日常对话（≤16K，纯 MTP，不占主机归档内存）
 
 ```bat
-bin\infer-mini.exe model.ninfer --tasks doc.txt --ctx 100000 ^
-    --spec mtp --draft-tokens 4 --max-new 256
+bin\infer-mini.exe model.ninfer --chat --ctx 24576 --spec mtp --draft-tokens 5 --think --max-new 8192
 ```
-96K：423 / 25.3。
 
-> `--ctx` 不要无脑给大：98K prompt 时 ctx 110000 会让显存池超过可用量，引擎会**静默降速**（350 / 11.8）。给 100000 才正常。
+| prompt | prefill | decode（think 开） | decode（think 关） |
+|---|---|---|---|
+| 8K | 936 | **64.1** | ~106 |
+| 16K | 891 | **57.4** | — |
 
-### C. 超长上下文（192K–262K）
+### B. 中上下文（≤32K，纯 MTP）
+
+```bat
+bin\infer-mini.exe model.ninfer --tasks doc.txt --ctx 40960 --spec mtp --draft-tokens 5 --max-new 384
+```
+
+| prompt | prefill | decode（think 开） |
+|---|---|---|
+| 32K | 740 | **46.5** |
+| 40K | 684 | 41.6 |
+
+> 32K 以上不要再单用 MTP：64K 时纯 MTP 只有 35.5，而开 KV 记忆是 44.3（+25%）。
+
+### C. 长上下文（32K–262K，KV 记忆 + MTP，深度自动：>64K 为 1）
 
 ```bat
 bin\infer-mini.exe model.ninfer --tasks long.txt --ctx 262144 ^
     --resident-tokens 32768 --sink-tokens 2048 --kv-retrieval 1 ^
-    --archive-mib 4096 --spec mtp --draft-tokens 4 --max-new 256
+    --archive-mib 4096 --spec mtp --max-new 384
 ```
-196K 540 / 29.8；250K 535 / 30.5；261K 534 / 29.8。
 
-同一套参数用于 API 时把 `--tasks` 去掉、换成 `--port 8099`。
+| prompt | prefill | decode（think 开） | 说明 |
+|---|---|---|---|
+| 64K | 583 | **44.3** | 稳态窗口速度 |
+| 96K | 560 | **40.4** | |
+| 250K | 532 | **40.4** | 稳态窗口的 91% |
+| 196K（纯 AR） | 540 | 29.8 | 不开 MTP |
+| 250K（纯 AR） | 535 | 30.5 | |
+
+> 窗口模式的 decode 只扫 `sink 2048 + 窗口 32768` 个 key，所以 250K 与 96K 同速；比 32K prompt（尚未滑动）的 51.2 低 21%，那 21% 是「窗口装满后多扫 2K sink 页」的固定开销，不是长度惩罚。
+
+### 关于思考开关（重要）
+
+同一个 2,845-token prompt、同一个 `--draft-tokens 5`：
+
+| 模式 | decode |
+|---|---|
+| `--think`（默认） | **70.8** |
+| `--no-think` | **106.5** |
+
+思维链文本比正文难预测，草稿命中率低，所以 MTP 收益从 105 掉到 71。**引用速度时必须同时说明是否开思考。**
+
+### 自动档规则
+
+`--draft-tokens 0`（或不传）时：`--ctx ≤ 16384 → 5`；`16384 < --ctx ≤ 65536 → 2`；`--ctx > 65536 → 1`。
+长上下文用 1 是因为 verify 批次（T=深度+1）会按 token 重扫整个窗口，窗口一旦装满这个成本就恒定了：实测 32K 44.27/44.77（平）、63K 43.77/42.36、95K 43.96/36.10、195K 41.57/33.69、251K 36.77/32.64/25.94（深度 1/2/3）。没有 KV 记忆、上下文又短时窗口等于 prompt 本身，深度 5 仍然最快（8K 106、16K 57.4）。
+自动值按 `--ctx` 而不是单次 prompt 长度决定，所以短请求跑在 262K 部署里仍取 2；想要深草稿就显式传 `--draft-tokens 5`。
 
 ---
 
@@ -276,8 +310,8 @@ bin\infer-mini.exe model.ninfer --tasks long.txt --ctx 262144 ^
 
 | 想更快 | 做法 |
 |---|---|
-| 短对话 | 开 MTP：`--spec mtp --draft-tokens 0`（自动 5/4） |
-| 已知固定深度 | `--draft-tokens 5`（≤64K）或 `4`（>64K） |
+| 短对话 | 开 MTP：`--spec mtp --draft-tokens 5`（ctx≤16K） |
+| 已知固定深度 | `--draft-tokens 5`（≤64K）、`1`（>64K，长上下文） |
 | 不要太长思考 | `/effort low` 或 `/think off` |
 | 少占显存 | 降 `--ctx`、降 `--resident-tokens`、`--archive-mib 2048` |
 | 确定性复现 | `--temp 0 --ids`，API 侧传 `"temperature":0,"seed":42` |
