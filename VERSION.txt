@@ -1,15 +1,43 @@
-NInfer-HIP 0.1.3r3
+NInfer-HIP 0.1.3r4
 ==================
 
 名称        NInfer-HIP
-版本        0.1.3r3（0.1.3 的长上下文修订版）
-日期        2026-11-18
+版本        0.1.3r4（0.1.3 的长上下文修订版）
+日期        2026-11-19
 仓库        https://github.com/Newaiguy/NInfer-HIP
-发布页      https://github.com/Newaiguy/NInfer-HIP/releases/tag/v0.1.3r3
+发布页      https://github.com/Newaiguy/NInfer-HIP/releases/tag/v0.1.3r4
 许可证      Apache-2.0（见 LICENSE / NOTICE）
 状态        稳定：文本 / 长上下文 / KV 记忆 / MTP / 视觉 / OpenAI 服务 全部可用
 
-0. 0.1.3r3 改了什么（相对 0.1.3r2）
+0. 0.1.3r4 改了什么（相对 0.1.3r3）
+----------------------------------
+
+两件事：服务端换成完整实现，默认思考等级降到 medium。
+
+1. infer-serve.exe 换成完整 OpenAI 服务端（此前发的是自写的迷你版，只认 messages）
+   - 标准 tool_calls：非流式、流式分片、多轮回传都可用，finish_reason 为 "tool_calls"
+   - 路由：/v1/chat/completions、/v1/responses、/v1/messages、/v1/models
+   - 图片输入：data URL / http(s) / 本地文件（--vision）
+   - 声明 tools 后模板自动注入 Qwen3 工具段，聊天模板不再被降级
+
+2. 默认思考等级 medium（此前模板默认 xhigh）
+   - 启动器加 --chat-template chat_template_medium.jinja（只改 default('xhigh') 一个词）
+   - 请求里显式给 reasoning_effort 仍然优先：实测 默认 576 思考 token、xhigh 945、low 388
+   - 想回 xhigh：启动命令删掉 --chat-template 即可
+
+3. 新文档 docs/SERVE_TOOLS.md（启动参数、Hermes 接入、已验证项、已知限制）
+
+实测（RX 9070 XT，greedy）
+  服务端协议矩阵  10/10：models / chat / SSE（首字节 0.018 s）/ tools / 视觉单图 / 视觉双图 / 多轮召回 / 三个 400 用例
+  门禁 8k         36.05 decode / 946.7 prefill
+  门禁 96k        25.34 / 421.2
+  门禁 mtp        105.88 / 846.4
+
+已知限制
+  - MTP 草稿深度仍按 --ctx 分档（64K 以下 5、以上 1），逐请求自适应尚未实现
+  - 视觉九图回归待补（本轮只验了服务端图通路）
+
+1. 0.1.3r3 改了什么（相对 0.1.3r2）
 ----------------------------------
 
 只改一件事：MTP 草稿深度的自动档。长上下文里 verify 批次的列数是「深度+1」，

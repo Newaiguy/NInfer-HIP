@@ -73,7 +73,7 @@ goto done
 echo.
 echo [API ·þÎñ] http://127.0.0.1:8099/v1     °´ Ctrl+C Í£Ö¹
 chcp 65001 >nul
-"%SERVE%" "%MODEL%" %COMMON% %LONG% --port 8099 %SEFF%
+"%SERVE%" "%MODEL%" --host 127.0.0.1 --port 8099 --model-id ninfer-qwen3 --max-context 65536 --kv-dtype rk4v4-e8 --spec mtp --draft-tokens 5 --host-kv-mib 2048 --greedy --chat-template "%~dp0chat_template_medium.jinja"
 chcp 936 >nul
 goto done
 

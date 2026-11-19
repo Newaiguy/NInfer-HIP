@@ -1,4 +1,4 @@
-# NInfer-HIP `0.1.3r3`
+# NInfer-HIP `0.1.3r4`
 
 **在 AMD RX 9070 XT (RDNA4) + ROCm 7.2 for Windows 上运行 Qwen3.8-27B 的本地推理引擎。**
 纯 HIP/C++ 实现，自带 KV 记忆（超长上下文）、MTP 投机解码、视觉多模态、OpenAI 兼容服务端。
@@ -7,7 +7,7 @@
 
 ---
 
-## 这一版（0.1.3r3）改了什么
+## 这一版（0.1.3r4）改了什么
 
 | 变化 | 说明 |
 |---|---|
@@ -87,7 +87,7 @@ bin\infer-mini.exe  E:\ninfer-models\Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer 
 | [`docs/BUILD.md`](docs/BUILD.md) | 从源码构建 |
 | [`docs/VALIDATION.md`](docs/VALIDATION.md) | 门禁与验证矩阵 |
 | [`VERSION.txt`](VERSION.txt) | 版本、二进制校验和、完整变更记录 |
-| [`RELEASE_NOTES_0.1.3.md`](RELEASE_NOTES_0.1.3.md) / [`RELEASE_NOTES_0.1.3r3.md`](RELEASE_NOTES_0.1.3r3.md) | 发布说明 |
+| [`RELEASE_NOTES_0.1.3.md`](RELEASE_NOTES_0.1.3.md) / [`RELEASE_NOTES_0.1.3r4.md`](RELEASE_NOTES_0.1.3r4.md) | 发布说明 |
 
 ---
 
