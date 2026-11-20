@@ -1,58 +1,87 @@
-# 视频可用数据（截至 2026-11-18，均本机实测）
+# 视频可用数据（0.1.3r5，2026-11-20 本机实测）
 
-> 只放能对得上号、可复现的数字；每条都注明了条件。凡标“单次”的，是只跑过一次的样本。
+ > 只放能对得上号、可复现的数字，每条都写清条件与二进制。凡标"单次"的只跑过一次。
 
-## 1. 单流解码速度
+## 0. 一句话
 
-| 场景 | decode | prefill | 条件 |
+一个 `infer-serve.exe` / `infer-mini.exe` 同时具备：256K 上下文 + KV 记忆（分页滑窗 + 归档召回）、
+MTP 投机解码、视觉、OpenAI 兼容 API，且**原生 tool_calls**（非流式/流式/多轮回传都已验证）。
+
+## 1. 三档常规配置（都实测过，可直接照抄）
+
+| 档位 | 参数要点 | decode 实测 | 适用 |
 |---|---|---|---|
-| 8K 纯自回归 | 35.7–36.6 t/s | ~950 t/s | greedy，关思考 |
-| 8K + MTP 深度 5 | **105.5 t/s** | ~850 t/s | 关思考 |
-| 8K + MTP 深度 5 + 开思考 | 71–82 t/s | — | 短对话 567/1983 token 两档 |
-| 32K + KV 记忆 + MTP | 46.5 t/s | — | 32K 窗口 + 4096 MiB 归档，单次 |
-| 64K + KV 记忆 + MTP | 44.3 t/s | — | 同上 |
-| 96K + KV 记忆 + MTP | 40.4 t/s | — | 同上 |
-| 196K + KV 记忆 + MTP | 40.0 t/s | — | 同上 |
-| 250K + KV 记忆 + MTP（自动深度 1） | 37.1 t/s | 532 t/s | ctx 262144、32K 窗口 + 4096 MiB 归档 |
-| 196K 纯自回归 | 29.8 t/s | 540 t/s | 对照组 |
-| 250K 纯自回归 | 30.5 t/s | 534 t/s | 对照组 |
+| 短 ≤16K | `--kv bf16 --draft-tokens 5 --ctx 16384` | 8K **92.7**、16K **81.8** t/s | 日常对话、代码片段、agent 短会话 |
+| 中 ≤80K | `--kv rk4v4-e8 --ctx 81920 --resident-tokens 32768 --sink-tokens 2048 --archive-mib 4096 --kv-retrieval 1 --draft-tokens 5` | 63K **45.8**、79K **45.4** t/s | 单仓代码阅读、中等文档问答 |
+| 长 ≤256K | 同上但 `--ctx 262144 --draft-tokens 1` | 196K **41.6**、250K **40.3** t/s | 全仓/长文档、超长历史 |
 
-要点：**105 t/s 只在关思考的短上下文成立**；开了思考按 71–82 报，长文按 40–44 报。
-上下文越长越贴近 40 t/s，这是 32K 窗口 + 召回的开销，不是抖动。
+prefill 全程 530–620 t/s。硬件 RX 9070 XT（16 GB）/ ROCm 7.2；模型 Qwen3.5-27B IQ3_S。
 
-## 2. 与上游 llama-kvmem 对拍（同机同卡同 prompt，双方都开 MTP2）
+## 2. 为什么三档要分（可讲的机制）
 
-| 项目 | 本引擎 | 上游 llama-kvmem |
+- MTP 每步要重扫窗口里所有列：深度 5 在 ≤80K 有净收益，到 95K 崩（26.5 vs 深度 1 的 42.9），
+  所以长档固定深度 1。
+- KV 量化只改"每 token 占多少"：bf16 65,536 B/token，int4 17,920 B/token。
+  短对话 KV 扫描可忽略，bf16 少一层反量化反而更快；长档必须 int4 才装得下。
+
+## 3. 容量（无窗口，纯文本）
+
+| dtype | 可用上限 | 依据 |
+|---|---|---|
+| bf16 | 约 **49,974** token | 52,288 起报 `largest capacity ... about 49974` |
+| int4（rk4v4-e8） | 约 **181,849** token | 188,000 起失败；180,000 正常 |
+
+开 KV 窗口后 int4 可到 262,144 上下文（常驻 32K + 归档 4 GiB）；bf16 开窗口只能到约 128K，
+196K 起 `hipErrorLaunchFailure`。`--kv int8` **未实现**（4.7–6.6 t/s 且答错），不要用。
+
+## 4. 与上游 llama-kvmem 对拍（同机同卡同 prompt，双方都开 MTP）
+
+| 项目 | 本引擎 | 上游 |
 |---|---|---|
 | 准确率（8 例） | 8/8 | 8/8 |
-| prefill（196K） | 537.9 t/s | 331.9 t/s |
-| prefill（250K） | 533.5 t/s | 323.1 t/s |
-| decode（250K） | **37.1 t/s** | 32.9 t/s |
+| prefill 196K | 537.9 t/s | 331.9 t/s |
+| prefill 250K | 533.5 t/s | 323.1 t/s |
+| decode 250K | **40.3 t/s** | 32.9 t/s |
 
-结论口径：**prefill 快 1.4–1.6 倍；decode 全面更快（多数档 35–42 vs 上游 32–33，250K 档 37.1 vs 32.9，+12.6%）**。
+口径：**prefill 快 1.4–1.6×；decode 全面更快，250K 档 +22.4%**。
 
-## 3. 视觉能力
+## 5. 工具调用（r5 新增，可现场演示）
 
-- 九图空间/颜色回归：artifact / patch-only BF16 / 全 BF16 **三档各 9/9**。
-- 真实照片 16 问（颜色/计数/OCR/物体/地标/朝向/轮子数）：**16/16**，与 llama.cpp + mmproj 的 16/16 打平。
-- 视觉四缺陷（WMMA 输出、LayerNorm 精度、patch 双帧权重、merger 缩放）已全部修复并写进文档。
+请求带 `tools` → 返回：
 
-## 4. 长思考收敛（鹈鹕 SVG 测试题）
+```json
+{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,
+ "tool_calls":[{"id":"call_0","type":"function",
+   "function":{"name":"get_building_count","arguments":"{\"park\":\"熙街\"}"}}]}}
+```
 
-- 条件：64K ctx + MTP + xhigh + 官方采样（temp 0.6 / top_p 0.95 / top_k 20）。
-- 结果：**3 次运行 3 次都产出完整 HTML**（274 KB / 274 KB / 278 KB），耗时 800 / 800 / 752 秒。
-- 反例（不要放进视频结论）：262K ctx 下同题 29 分钟仍在思考、未出正文 —— ctx 更大反而更慢，原因待查。
+把 `role:"tool"` 结果回传，模型续答「熙街共有 **46** 栋楼（另外还有 12 家店铺）」。
+流式响应同样给出 `tool_calls`，`finish_reason` 一致。sils 的 Hermes / 任何 OpenAI 客户端直接可用。
 
-## 5. 引用注意
+## 6. 视觉
 
-- 不要把“105 t/s”当成默认档宣传：默认开思考时是 71–82。
-- 250K 档的 37.1 来自 2026-11-18 的自适应深度改动：长上下文下 verify 批次会按 token 重扫整个窗口，深度 1（T=2）比深度 2（T=3）快 12.6%，改动前该档是 32.4（−1.6%）。
+- 九图空间/颜色回归：artifact / patch-only BF16 / 全 BF16 **三档各 9/9**（r7 二进制复验 9/9）。
+- 真实照片 16 问：**16/16**，与 llama.cpp + mmproj 的 16/16 打平。
+- 已知：视觉开启会多占约 1.3 GB，长档建议 `--no-vision`，可多出约 30K 上下文容量。
 
-原始记录（可复核）：
-- 本引擎：`build\_acc3_ours_mtp.txt` —— 196K decode 40.01、250K decode 32.42（MTP draft 2）。
-- 上游：`build\_acc2_upstream.txt` —— 196K decode 32.99、250K decode 32.93（同一份 `llama-kvmem-server`，同样开 `--spec-draft-n-max 2`）。
-- 逐例对比（深度 2 的旧记录）：q25–q92 与 multi 我们 34.8–41.5、上游 32.3–33.3；196K 我们 40.01 vs 32.99（+21%）。
-- 深度扫描（2026-11-18，ctx 262144 + 32K 窗口，`tasks_rk_*` 同族语料）：8K d5 62.2 / 24K d5 52.2 / 31K d5 47.6 / 63K d5 45.6 深度 5 仍最快；80K d2 42.6 ≈ d1 42.1 > d5 34.0；95K d1 44.0 > d2 36.1 > d3 29.2 > d5 22.0；127K 43.3 > 41.7；195K 41.6 > 33.7；251K 36.8 > 32.6（d3 25.9）。深度 5 的拐点落在 63K 与 80K 之间（63K 45.6 → 80K 34.0 → 95K 22.0），阈值取 64K。
-- “上游”专指 llama.cpp 的 **kvmem 分支**（`kvmem-rocm-beta2` 的 `llama-kvmem-server.exe`），不是 llama.cpp 主线。
+## 7. 长思考收敛（鹈鹕 SVG）
 
-- 九图 9/9 是合成图；16/16 才是真实照片，两个数字一起给才准确。
+- 64K ctx + MTP + xhigh + 官方采样：**3 次全部产出完整 HTML**（274/274/278 KB），800/800/752 秒。
+- 反例：262K ctx 下同题 29 分钟未出正文 —— 不要拿它当证据。
+
+## 8. 引用注意
+
+- 旧文档里的 **105 t/s** 是 r3 二进制在 ctx 8192 短预设下的数字；r5 同档（16K、bf16、深度 5）是 **92.7**。
+  视频统一用 r5 的数，别混用。
+- 深度 5 只在 ≤80K 成立；长上下文一律深度 1。
+- `--max-context` / `--kv-dtype` / `--host-kv-mib` 是 r4 的旧参数，r5 不认（会被忽略，不报错）——演示前务必确认。
+
+## 9. 复现命令
+
+CLI：`infer-mini.exe model.ninfer --chat --kv bf16 --ctx 16384 --spec mtp --draft-tokens 5 --effort medium`
+
+API：`infer-serve.exe model.ninfer --host 127.0.0.1 --port 8099 --model-name ninfer-qwen3 --ctx 65536 --resident-tokens 32768 --sink-tokens 2048 --archive-mib 2048 --kv rk4v4-e8 --spec mtp --draft-tokens 5 --effort medium`
+
+原始记录：`build\_window_sweep.json`、`build\_midctx_sweep.json`、`build\_speed_matrix.json`、
+`build\_capacity_text_only.json`、`build\_acc3_ours_mtp.txt`、`build\_acc2_upstream.txt`。
+版本基线：0.1.3r5，源码 `da6a473`，`infer-mini.exe` sha `d689a367…`、`infer-serve.exe` sha `ad71a07f…`。

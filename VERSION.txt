@@ -1,15 +1,30 @@
-NInfer-HIP 0.1.3r4
+NInfer-HIP 0.1.3r5
 ==================
 
 名称        NInfer-HIP
-版本        0.1.3r4（0.1.3 的长上下文修订版）
-日期        2026-11-19
+版本        0.1.3r5（0.1.3 的长上下文修订版）
+日期        2026-11-20
 仓库        https://github.com/Newaiguy/NInfer-HIP
-发布页      https://github.com/Newaiguy/NInfer-HIP/releases/tag/v0.1.3r4
+发布页      https://github.com/Newaiguy/NInfer-HIP/releases/tag/v0.1.3r5
 许可证      Apache-2.0（见 LICENSE / NOTICE）
 状态        稳定：文本 / 长上下文 / KV 记忆 / MTP / 视觉 / OpenAI 服务 全部可用
 
-0. 0.1.3r4 改了什么（相对 0.1.3r3）
+0. 0.1.3r5 改了什么（相对 0.1.3r4）
+
+· 一个二进制同时支持 256K 上下文、KV 记忆与原生 tool_calls：请求带 tools 时返回标准 tool_calls 与
+  finish_reason="tool_calls"（非流式、流式、多轮回传都已验证）。
+· CLI 与 API 共用一套参数解析：--ctx / --kv / --draft-tokens 等两端口径一致，非法值直接报错并列出可选值。
+  此前 API 的 --kv 只写了一个没人读取的环境变量，实际一直按 bf16 跑。
+· --kv 真正生效后，无窗口容量从约 49K 提到约 181K；256K 窗口档 decode 稳定 40+ t/s。
+· MTP 深度按实测重定：ctx <= 32K 用 5，> 32K 用 1（此前按 64K 分界）。
+· 三档常规配置（均为实测值）：
+    短 <=16K   bf16 + 深度 5              8K 92.7 / 16K 81.8 t/s
+    中 <=80K   int4 + 32K 窗口 + 深度 5   63K 45.8 / 79K 45.4 t/s
+    长 <=256K  int4 + 32K 窗口 + 深度 1   196K 41.6 / 250K 40.3 t/s
+· Windows 原生补齐：logging / request_log / HTTP server / media_acquire，不再依赖 POSIX 头。
+· 已知限制：--kv int8 未实现（慢且答错）；bf16 在 196K 起会 hipErrorLaunchFailure；视觉仍是实验特性。
+
+1. 0.1.3r4 改了什么（相对 0.1.3r3）
 ----------------------------------
 
 两件事：服务端换成完整实现，默认思考等级降到 medium。
