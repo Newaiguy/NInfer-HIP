@@ -129,7 +129,7 @@ echo    1) CLI 聊天      16K 上下文 + bf16, 深度 5（短对话最快）
 
 
 
-echo    2) API 服务      64K / 80K / 256K 可选, 端口 8099/8100/8101
+echo    2) API 服务      64K / 128K / 256K 可选, 端口 8099/8100/8101
 
 
 
@@ -258,7 +258,7 @@ goto done
 :midcli
 echo.
 chcp 65001 >nul
-"%MINI%" "%MODEL%" --chat --kv rk4v4-e8 --ctx 81920 --resident-tokens 32768 --sink-tokens 2048 --archive-mib 4096 --kv-retrieval 1 --spec mtp --draft-tokens 5 %EFF% --think --max-new 8192
+"%MINI%" "%MODEL%" --chat --kv rk4v4-e8 --ctx 131072 --spec mtp --draft-tokens 1 %EFF% --think --max-new 8192
 chcp 936 >nul
 goto done
 
@@ -272,7 +272,7 @@ if defined RUNNING (
 echo.
 echo [API 服务] 选择上下文档（直接回车 = 1）
 echo   1) 64K  + KV 窗口, 深度 5, 端口 8099
-echo   2) 80K  + KV 窗口, 深度 5, 端口 8100
+echo   2) 128K, 深度 1, 无窗口, 端口 8100
 echo   3) 256K + KV 窗口, 深度 1, 端口 8101
 set "ASEL="
 set /p "ASEL=请选择 [1-3]: "
@@ -290,9 +290,9 @@ goto done
 
 :apimid
 echo.
-echo [API 服务] http://127.0.0.1:8100/v1   80K, 深度 5   按 Ctrl+C 停止
+echo [API 服务] http://127.0.0.1:8100/v1   128K, 深度 1   按 Ctrl+C 停止
 chcp 65001 >nul
-"%SERVE%" "%MODEL%" --host 127.0.0.1 --port 8100 --model-name ninfer-qwen3 --ctx 81920 --resident-tokens 32768 --sink-tokens 2048 --archive-mib 4096 --kv-retrieval 1 --kv rk4v4-e8 --spec mtp --draft-tokens 5 --effort medium
+"%SERVE%" "%MODEL%" --host 127.0.0.1 --port 8100 --model-name ninfer-qwen3 --ctx 131072 --kv rk4v4-e8 --spec mtp --draft-tokens 1 --cache-mib 4096 --no-vision --effort medium
 chcp 936 >nul
 goto done
 

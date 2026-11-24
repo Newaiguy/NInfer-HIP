@@ -1,4 +1,4 @@
-# NInfer-HIP `0.1.3r5`
+# NInfer-HIP `0.1.3r5fix`
 
 **在 AMD RX 9070 XT (RDNA4) + ROCm 7.2 for Windows 上运行 Qwen3.8-27B 的本地推理引擎。**
 纯 HIP/C++ 实现，自带 KV 记忆（超长上下文）、MTP 投机解码、视觉多模态、OpenAI 兼容服务端。
@@ -7,7 +7,10 @@
 
 ---
 
-## 这一版（0.1.3r5）改了什么
+## 这一版（0.1.3r5fix）改了什么
+
+> r5fix 相对 r5 只做增量修复：新增 `--vision-lazy`（视觉工作区按需分配，ctx 131072 视觉可用上限 129,934 → 166,670 token）、
+> 修正 lazy 下的工作区统计、删除从未生效的 `--vision-idle-seconds`。详见 [`RELEASE_NOTES_0.1.3r5fix.md`](RELEASE_NOTES_0.1.3r5fix.md)。
 
 | 变化 | 说明 |
 |---|---|

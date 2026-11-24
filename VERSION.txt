@@ -1,15 +1,24 @@
-NInfer-HIP 0.1.3r5
+NInfer-HIP 0.1.3r5fix
 ==================
 
 名称        NInfer-HIP
-版本        0.1.3r5（0.1.3 的长上下文修订版）
-日期        2026-11-20
+版本        0.1.3r5fix（0.1.3 的长上下文修订版）
+日期        2026-11-24
 仓库        https://github.com/Newaiguy/NInfer-HIP
-发布页      https://github.com/Newaiguy/NInfer-HIP/releases/tag/v0.1.3r5
+发布页      https://github.com/Newaiguy/NInfer-HIP/releases/tag/v0.1.3r5fix
 许可证      Apache-2.0（见 LICENSE / NOTICE）
 状态        稳定：文本 / 长上下文 / KV 记忆 / MTP / 视觉 / OpenAI 服务 全部可用
 
-0. 0.1.3r5 改了什么（相对 0.1.3r4）
+0. 0.1.3r5fix 改了什么（相对 0.1.3r5）
+
+- 新增 `--vision-lazy`：视觉工作区不再启动时预留，带图请求按需分配。
+  实测 ctx 131072 视觉可用上限 129,934 → 166,670 token（+28.4%），启动 8.1 s 就绪、不再回退纯文本；九图 9/9。
+- 修正 lazy 下的工作区统计（此前上报峰值虚高 626,170,625 B ≈ 597 MiB）。
+- 删除从未生效的 `--vision-idle-seconds` 死参数。
+- 文档口径纠正：视觉不占常驻显存（权重 bf16 在主机内存约 0.91 GB，显存只有 96 MB 复用缓冲）；
+  真实代价是工作区预留 597 MiB，加 `--vision-lazy` 即可让给 KV。
+
+0b. 0.1.3r5 改了什么（相对 0.1.3r4）
 
 · 一个二进制同时支持 256K 上下文、KV 记忆与原生 tool_calls：请求带 tools 时返回标准 tool_calls 与
   finish_reason="tool_calls"（非流式、流式、多轮回传都已验证）。
